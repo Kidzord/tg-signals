@@ -1,0 +1,7 @@
+InpSwingLen=20||20||0||20||N
+InpFvgWindow=20||20||0||20||N
+InpRetestLook=40||40||0||40||N
+InpStopBufATR=0.25||0.25||0||1||N
+InpTpR=3.0||3.0||0||10||N
+InpMaxBars=120||120||0||1000||N
+InpRiskPct=0.5||0.5||0||10||N

@@ -1,0 +1,12 @@
+fastapi>=0.110
+uvicorn[standard]>=0.27
+requests>=2.31
+APScheduler>=3.10,<4
+python-dotenv>=1.0
+matplotlib>=3.8
+numpy>=1.26
+psutil>=5.9
+
+# Опционально: только Windows и только если есть запущенный терминал MT5.
+# Без него карточка рисуется по CSV или демо-данным.
+# MetaTrader5>=5.0.45

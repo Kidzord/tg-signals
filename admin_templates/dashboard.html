@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KidzordFX Admin</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        .header { background: #2563eb; color: white; padding: 20px; margin-bottom: 20px; border-radius: 8px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin-bottom: 20px; }
+        .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .card h3 { color: #1e40af; margin-bottom: 10px; }
+        .stat-value { font-size: 2em; font-weight: bold; color: #2563eb; }
+        .stat-label { color: #6b7280; font-size: 0.9em; }
+        .status-healthy { color: #10b981; }
+        .status-degraded { color: #f59e0b; }
+        .status-unhealthy { color: #ef4444; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>KidzordFX Admin Panel</h1>
+            <p>Управление пользователями, мониторинг, A/B тесты</p>
+        </div>
+
+        <div class="grid">
+            <div class="card">
+                <h3>Пользователи</h3>
+                <div class="stat-value" id="users-total">-</div>
+                <div class="stat-label">Всего</div>
+            </div>
+            <div class="card">
+                <h3>Активные подписки</h3>
+                <div class="stat-value" id="users-active">-</div>
+                <div class="stat-label">Премиум</div>
+            </div>
+            <div class="card">
+                <h3>Сделки</h3>
+                <div class="stat-value" id="trades-total">-</div>
+                <div class="stat-label">Всего</div>
+            </div>
+            <div class="card">
+                <h3>Winrate</h3>
+                <div class="stat-value" id="trades-winrate">-</div>
+                <div class="stat-label">% прибыльных</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3>Health Status</h3>
+            <div id="health-status">Загрузка...</div>
+        </div>
+    </div>
+
+    <script>
+        async function loadStats() {
+            const token = localStorage.getItem('adminToken') || prompt('Enter admin token:');
+            if (!token) return;
+            localStorage.setItem('adminToken', token);
+
+            try {
+                const res = await fetch('/api/stats', {
+                    headers: { 'X-Admin-Token': token }
+                });
+                const data = await res.json();
+
+                document.getElementById('users-total').textContent = data.users.total;
+                document.getElementById('users-active').textContent = data.users.active_subs;
+                document.getElementById('trades-total').textContent = data.trades.total;
+                document.getElementById('trades-winrate').textContent = (data.trades.winrate * 100).toFixed(1) + '%';
+
+                const healthDiv = document.getElementById('health-status');
+                const health = data.health;
+                const statusClass = `status-${health.status}`;
+                healthDiv.innerHTML = `
+                    <span class="${statusClass}">${health.status.toUpperCase()}</span>
+                    <ul>
+                        ${health.checks.map(c => `
+                            <li>
+                                <strong>${c.name}</strong>: ${c.status}
+                                (${c.duration_ms.toFixed(0)}ms) - ${c.message}
+                            </li>
+                        `).join('')}
+                    </ul>
+                `;
+            } catch (e) {
+                console.error(e);
+                alert('Failed to load stats');
+            }
+        }
+
+        loadStats();
+        setInterval(loadStats, 30000); // Обновлять каждые 30 секунд
+    </script>
+</body>
+</html>

@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KidzordFX Admin</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; }
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+        .header { background: linear-gradient(135deg, #2563eb, #7c3aed); color: white; padding: 30px; margin-bottom: 20px; border-radius: 12px; }
+        .header h1 { margin-bottom: 10px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin-bottom: 20px; }
+        .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .card h3 { color: #1e40af; margin-bottom: 15px; font-size: 1.1em; }
+        .metric-value { font-size: 2em; font-weight: bold; color: #2563eb; }
+        .metric-label { color: #6b7280; font-size: 0.9em; margin-top: 5px; }
+        .status-healthy { color: #10b981; font-weight: bold; }
+        .status-degraded { color: #f59e0b; font-weight: bold; }
+        .status-unhealthy { color: #ef4444; font-weight: bold; }
+        .section { background: white; padding: 25px; border-radius: 12px; margin-bottom: 20px; }
+        .section h2 { color: #1e40af; margin-bottom: 20px; }
+        .table { width: 100%; border-collapse: collapse; }
+        .table th, .table td { padding: 12px; text-align: left; border-bottom: 1px solid #e5e7eb; }
+        .table th { background: #f9fafb; font-weight: 600; }
+        .loading { color: #6b7280; }
+        .error { color: #ef4444; }
+        .login-form { max-width: 400px; margin: 100px auto; }
+        .login-form input { width: 100%; padding: 12px; margin-bottom: 10px; border: 1px solid #d1d5db; border-radius: 8px; }
+        .login-form button { width: 100%; padding: 12px; background: #2563eb; color: white; border: none; border-radius: 8px; cursor: pointer; }
+        .login-form button:hover { background: #1d4ed8; }
+        .nav { display: flex; gap: 10px; margin-bottom: 20px; }
+        .nav button { padding: 10px 20px; background: white; border: 1px solid #d1d5db; border-radius: 8px; cursor: pointer; }
+        .nav button.active { background: #2563eb; color: white; border-color: #2563eb; }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+    <div id="loginForm" class="login-form card">
+        <h2 style="margin-bottom: 20px; color: #1e40af;">KidzordFX Admin</h2>
+        <input type="password" id="tokenInput" placeholder="Admin Token">
+        <button onclick="login()">Войти</button>
+        <p id="loginError" class="error" style="margin-top: 10px;"></p>
+    </div>
+
+    <div id="dashboard" class="container hidden">
+        <div class="header">
+            <h1>KidzordFX Admin Panel</h1>
+            <p>Управление пользователями, мониторинг, аналитика</p>
+        </div>
+
+        <div class="nav">
+            <button onclick="showSection('stats')" class="active" id="nav-stats">Статистика</button>
+            <button onclick="showSection('users')" id="nav-users">Пользователи</button>
+            <button onclick="showSection('health')" id="nav-health">Health</button>
+            <button onclick="showSection('gallery')" id="nav-gallery">Галерея</button>
+            <button onclick="showSection('analytics')" id="nav-analytics">Аналитика</button>
+            <button onclick="showSection('gamification')" id="nav-gamification">Геймификация</button>
+            <button onclick="showSection('ai')" id="nav-ai">AI функции</button>
+            <button onclick="showSection('advanced')" id="nav-advanced">Расширенная</button>
+        </div>
+
+        <div id="section-stats">
+            <div class="grid">
+                <div class="card">
+                    <h3>Пользователи</h3>
+                    <div class="metric-value" id="users-total">-</div>
+                    <div class="metric-label">Всего</div>
+                </div>
+                <div class="card">
+                    <h3>Активные подписки</h3>
+                    <div class="metric-value" id="users-active">-</div>
+                    <div class="metric-label">Премиум</div>
+                </div>
+                <div class="card">
+                    <h3>Сделки</h3>
+                    <div class="metric-value" id="trades-total">-</div>
+                    <div class="metric-label">Всего</div>
+                </div>
+                <div class="card">
+                    <h3>Winrate</h3>
+                    <div class="metric-value" id="trades-winrate">-</div>
+                    <div class="metric-label">% прибыльных</div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2>Health Status</h2>
+                <div id="health-status">Загрузка...</div>
+            </div>
+        </div>
+
+        <div id="section-users" class="hidden">
+            <div class="section">
+                <h2>Пользователи</h2>
+                <div id="users-list">Загрузка...</div>
+            </div>
+        </div>
+
+        <div id="section-health" class="hidden">
+            <div class="section">
+                <h2>Детальный Health Check</h2>
+                <div id="health-detailed">Загрузка...</div>
+            </div>
+        </div>
+
+        <div id="section-gallery" class="hidden">
+            <div class="section">
+                <h2>Галерея сделок</h2>
+                <div style="margin-bottom: 15px;">
+                    <label>Дней: </label>
+                    <input type="number" id="galleryDays" value="30" min="1" max="365">
+                    <button onclick="loadGallery()">Загрузить</button>
+                </div>
+                <div id="gallery-content">Загрузка...</div>
+            </div>
+        </div>
+
+        <div id="section-analytics" class="hidden">
+            <div class="section">
+                <h2>Аналитика</h2>
+                <div style="margin-bottom: 15px;">
+                    <label>Дней: </label>
+                    <input type="number" id="analyticsDays" value="30" min="1" max="365">
+                    <button onclick="loadAnalytics()">Загрузить</button>
+                </div>
+                <div id="analytics-content">Загрузка...</div>
+            </div>
+        </div>
+
+        <div id="section-gamification" class="hidden">
+            <div class="section">
+                <h2>🎮 Геймификация</h2>
+                <div id="gamification-content">Загрузка...</div>
+            </div>
+        </div>
+
+        <div id="section-ai" class="hidden">
+            <div class="section">
+                <h2>🤖 AI функции</h2>
+                <div style="margin-bottom: 15px;">
+                    <label>Часов: </label>
+                    <input type="number" id="aiHours" value="24" min="1" max="168">
+                    <button onclick="loadAiAlerts()">Загрузить</button>
+                </div>
+                <div id="ai-content">Загрузка...</div>
+            </div>
+        </div>
+
+        <div id="section-advanced" class="hidden">
+            <div class="section">
+                <h2>📊 Расширенная аналитика</h2>
+                <div style="margin-bottom: 15px;">
+                    <label>Дней: </label>
+                    <input type="number" id="advancedDays" value="30" min="1" max="365">
+                    <button onclick="loadAdvanced()">Загрузить</button>
+                </div>
+                <div id="advanced-content">Загрузка...</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://localhost:8081';
+        let adminToken = localStorage.getItem('adminToken');
+
+        function login() {
+            const token = document.getElementById('tokenInput').value;
+            if (!token) {
+                document.getElementById('loginError').textContent = 'Введите токен';
+                return;
+            }
+            localStorage.setItem('adminToken', token);
+            adminToken = token;
+            loadDashboard();
+        }
+
+        function apiCall(endpoint) {
+            return fetch(`${API_BASE}${endpoint}`, {
+                headers: { 'X-Admin-Token': adminToken }
+            }).then(r => r.json());
+        }
+
+        function loadDashboard() {
+            document.getElementById('loginForm').classList.add('hidden');
+            document.getElementById('dashboard').classList.remove('hidden');
+            loadStats();
+        }
+
+        function showSection(section) {
+            document.querySelectorAll('[id^="section-"]').forEach(el => el.classList.add('hidden'));
+            document.getElementById(`section-${section}`).classList.remove('hidden');
+
+            document.querySelectorAll('.nav button').forEach(btn => btn.classList.remove('active'));
+            document.getElementById(`nav-${section}`).classList.add('active');
+
+            if (section === 'stats') loadStats();
+            if (section === 'users') loadUsers();
+            if (section === 'health') loadHealth();
+            if (section === 'gallery') loadGallery();
+            if (section === 'analytics') loadAnalytics();
+            if (section === 'gamification') loadGamification();
+            if (section === 'ai') loadAiAlerts();
+            if (section === 'advanced') loadAdvanced();
+        }
+
+        async function loadStats() {
+            try {
+                const data = await apiCall('/api/stats');
+
+                document.getElementById('users-total').textContent = data.users.total;
+                document.getElementById('users-active').textContent = data.users.active_subs;
+                document.getElementById('trades-total').textContent = data.trades.total;
+                document.getElementById('trades-winrate').textContent = (data.trades.winrate * 100).toFixed(1) + '%';
+
+                const healthDiv = document.getElementById('health-status');
+                const health = data.health;
+                const statusClass = `status-${health.status}`;
+                healthDiv.innerHTML = `
+                    <span class="${statusClass}">${health.status.toUpperCase()}</span>
+                    <ul style="margin-top: 10px;">
+                        ${health.checks.map(c => `
+                            <li>
+                                <strong>${c.name}</strong>: ${c.status}
+                                (${c.duration_ms.toFixed(0)}ms) - ${c.message}
+                            </li>
+                        `).join('')}
+                    </ul>
+                `;
+            } catch (e) {
+                console.error(e);
+                document.getElementById('health-status').innerHTML = '<span class="error">Ошибка загрузки</span>';
+            }
+        }
+
+        async function loadUsers() {
+            try {
+                const data = await apiCall('/api/users');
+                const users = data.users;
+
+                let html = `<table class="table">
+                    <thead><tr><th>ID</th><th>Подписка до</th><th>Депозит</th><th>Риск</th></tr></thead>
+                    <tbody>`;
+                for (const [id, user] of Object.entries(users)) {
+                    html += `<tr>
+                        <td>${id}</td>
+                        <td>${user.paid_until || '-'}</td>
+                        <td>${user.deposit || '-'}</td>
+                        <td>${user.risk_pct || '-'}%</td>
+                    </tr>`;
+                }
+                html += '</tbody></table>';
+                document.getElementById('users-list').innerHTML = html;
+            } catch (e) {
+                document.getElementById('users-list').innerHTML = '<span class="error">Ошибка загрузки</span>';
+            }
+        }
+
+        async function loadHealth() {
+            try {
+                const data = await apiCall('/api/health');
+                let html = `<table class="table">
+                    <thead><tr><th>Компонент</th><th>Статус</th><th>Сообщение</th><th>Время</th></tr></thead>
+                    <tbody>`;
+                for (const check of data.checks) {
+                    const statusClass = `status-${check.status}`;
+                    html += `<tr>
+                        <td>${check.name}</td>
+                        <td><span class="${statusClass}">${check.status}</span></td>
+                        <td>${check.message}</td>
+                        <td>${check.duration_ms.toFixed(0)}ms</td>
+                    </tr>`;
+                }
+                html += '</tbody></table>';
+                document.getElementById('health-detailed').innerHTML = html;
+            } catch (e) {
+                document.getElementById('health-detailed').innerHTML = '<span class="error">Ошибка загрузки</span>';
+            }
+        }
+
+        async function loadGallery() {
+            const days = document.getElementById('galleryDays').value;
+            try {
+                const data = await apiCall(`/api/gallery?days=${days}`);
+                const stats = data.stats;
+
+                let html = `
+                    <div class="grid" style="margin-bottom: 20px;">
+                        <div class="card">
+                            <h3>Всего сделок</h3>
+                            <div class="metric-value">${stats.total}</div>
+                        </div>
+                        <div class="card">
+                            <h3>Winrate</h3>
+                            <div class="metric-value">${(stats.winrate * 100).toFixed(1)}%</div>
+                        </div>
+                        <div class="card">
+                            <h3>Сумма R</h3>
+                            <div class="metric-value">${stats.total_r.toFixed(2)}</div>
+                        </div>
+                    </div>
+                    <h3>Последние сделки</h3>
+                    <table class="table">
+                        <thead><tr><th>Символ</th><th>Сторона</th><th>Тип</th><th>R</th><th>Время</th></tr></thead>
+                        <tbody>`;
+                for (const trade of data.trades.slice(0, 20)) {
+                    const rClass = trade.r >= 0 ? 'status-healthy' : 'status-unhealthy';
+                    html += `<tr>
+                        <td>${trade.symbol}</td>
+                        <td>${trade.side}</td>
+                        <td>${trade.kind}</td>
+                        <td class="${rClass}">${trade.r.toFixed(2)}</td>
+                        <td>${trade.when.slice(5, 16)}</td>
+                    </tr>`;
+                }
+                html += '</tbody></table>';
+                document.getElementById('gallery-content').innerHTML = html;
+            } catch (e) {
+                document.getElementById('gallery-content').innerHTML = '<span class="error">Ошибка загрузки</span>';
+            }
+        }
+
+        async function loadAnalytics() {
+            const days = document.getElementById('analyticsDays').value;
+            try {
+                const data = await apiCall(`/api/analytics?days=${days}`);
+                const metrics = data.metrics;
+
+                let html = `
+                    <div class="grid" style="margin-bottom: 20px;">
+                        <div class="card">
+                            <h3>Всего сделок</h3>
+                            <div class="metric-value">${metrics.total_trades}</div>
+                        </div>
+                        <div class="card">
+                            <h3>Winrate</h3>
+                            <div class="metric-value">${(metrics.winrate * 100).toFixed(1)}%</div>
+                        </div>
+                        <div class="card">
+                            <h3>Profit Factor</h3>
+                            <div class="metric-value">${metrics.profit_factor.toFixed(2)}</div>
+                        </div>
+                        <div class="card">
+                            <h3>Max Drawdown</h3>
+                            <div class="metric-value">${metrics.max_drawdown.toFixed(2)}R</div>
+                        </div>
+                        <div class="card">
+                            <h3>Sharpe Ratio</h3>
+                            <div class="metric-value">${metrics.sharpe_ratio.toFixed(2)}</div>
+                        </div>
+                        <div class="card">
+                            <h3>Сумма R</h3>
+                            <div class="metric-value">${metrics.total_r.toFixed(2)}</div>
+                        </div>
+                    </div>
+                    <h3>Сравнение с прошлым периодом</h3>
+                    <table class="table">
+                        <thead><tr><th>Метрика</th><th>Текущий</th><th>Прошлый</th><th>Изменение</th></tr></thead>
+                        <tbody>`;
+                const comp = data.comparison;
+                html += `<tr>
+                    <td>Сделок</td>
+                    <td>${comp.current.total_trades}</td>
+                    <td>${comp.previous.total_trades}</td>
+                    <td class="${comp.change.total_trades >= 0 ? 'status-healthy' : 'status-unhealthy'}">${comp.change.total_trades >= 0 ? '+' : ''}${comp.change.total_trades}</td>
+                </tr>`;
+                html += `<tr>
+                    <td>Winrate</td>
+                    <td>${(comp.current.winrate * 100).toFixed(1)}%</td>
+                    <td>${(comp.previous.winrate * 100).toFixed(1)}%</td>
+                    <td class="${comp.change.winrate >= 0 ? 'status-healthy' : 'status-unhealthy'}">${comp.change.winrate >= 0 ? '+' : ''}${(comp.change.winrate * 100).toFixed(1)}%</td>
+                </tr>`;
+                html += `<tr>
+                    <td>Сумма R</td>
+                    <td>${comp.current.total_r.toFixed(2)}</td>
+                    <td>${comp.previous.total_r.toFixed(2)}</td>
+                    <td class="${comp.change.total_r >= 0 ? 'status-healthy' : 'status-unhealthy'}">${comp.change.total_r >= 0 ? '+' : ''}${comp.change.total_r.toFixed(2)}</td>
+                </tr>`;
+                html += '</tbody></table>';
+                document.getElementById('analytics-content').innerHTML = html;
+            } catch (e) {
+                document.getElementById('analytics-content').innerHTML = '<span class="error">Ошибка загрузки</span>';
+            }
+        }
+
+        async function loadGamification() {
+            try {
+                const data = await apiCall('/api/gamification');
+                const leaderboard = data.leaderboard;
+                
+                let html = '<h3>🏆 Leaderboard</h3><table class="table"><thead><tr><th>#</th><th>ID</th><th>Очки</th><th>Уровень</th><th>Сделок</th><th>Winrate</th></tr></thead><tbody>';
+                leaderboard.forEach((user, i) => {
+                    html += `<tr>
+                        <td>${i + 1}</td>
+                        <td>${user.user_id}</td>
+                        <td>${user.points}</td>
+                        <td>${user.level_name}</td>
+                        <td>${user.total_trades}</td>
+                        <td>${(user.winrate * 100).toFixed(1)}%</td>
+                    </tr>`;
+                });
+                html += '</tbody></table>';
+                document.getElementById('gamification-content').innerHTML = html;
+            } catch (e) {
+                document.getElementById('gamification-content').innerHTML = '<span class="error">Ошибка загрузки</span>';
+            }
+        }
+
+        async function loadAiAlerts() {
+            const hours = document.getElementById('aiHours').value;
+            try {
+                const data = await apiCall(`/api/ai-alerts?hours=${hours}`);
+                const alerts = data.alerts;
+                
+                if (alerts.length === 0) {
+                    document.getElementById('ai-content').innerHTML = '<p>Нет алертов за указанный период</p>';
+                    return;
+                }
+                
+                let html = '<h3>🤖 AI Alerts</h3><table class="table"><thead><tr><th>Время</th><th>Символ</th><th>Тип</th><th>Серьёзность</th><th>Сообщение</th></tr></thead><tbody>';
+                alerts.forEach(alert => {
+                    const severityClass = alert.severity === 'high' ? 'status-unhealthy' : alert.severity === 'critical' ? 'status-unhealthy' : 'status-healthy';
+                    html += `<tr>
+                        <td>${new Date(alert.timestamp * 1000).toLocaleString()}</td>
+                        <td>${alert.symbol}</td>
+                        <td>${alert.alert_type}</td>
+                        <td class="${severityClass}">${alert.severity}</td>
+                        <td>${alert.message}</td>
+                    </tr>`;
+                });
+                html += '</tbody></table>';
+                document.getElementById('ai-content').innerHTML = html;
+            } catch (e) {
+                document.getElementById('ai-content').innerHTML = '<span class="error">Ошибка загрузки</span>';
+            }
+        }
+
+        async function loadAdvanced() {
+            const days = document.getElementById('advancedDays').value;
+            try {
+                const data = await apiCall(`/api/advanced-metrics?days=${days}`);
+                
+                let html = `
+                    <div class="grid" style="margin-bottom: 20px;">
+                        <div class="card"><h3>Expectancy</h3><div class="metric-value">${data.expectancy.toFixed(3)}R</div></div>
+                        <div class="card"><h3>SQN</h3><div class="metric-value">${data.sqn.toFixed(2)}</div></div>
+                        <div class="card"><h3>Calmar Ratio</h3><div class="metric-value">${data.calmar_ratio.toFixed(2)}</div></div>
+                        <div class="card"><h3>Kelly %</h3><div class="metric-value">${(data.kelly_criterion * 100).toFixed(1)}%</div></div>
+                        <div class="card"><h3>Sortino</h3><div class="metric-value">${data.sortino_ratio.toFixed(2)}</div></div>
+                        <div class="card"><h3>Ulcer Index</h3><div class="metric-value">${data.ulcer_index.toFixed(2)}</div></div>
+                    </div>
+                `;
+                document.getElementById('advanced-content').innerHTML = html;
+            } catch (e) {
+                document.getElementById('advanced-content').innerHTML = '<span class="error">Ошибка загрузки</span>';
+            }
+        }
+
+        if (adminToken) {
+            loadDashboard();
+        }
+    </script>
+</body>
+</html>

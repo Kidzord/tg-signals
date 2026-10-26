@@ -1,0 +1,30 @@
+.env
+__pycache__/
+*.pyc
+renders/
+bin/
+tunnel*.log
+# состояние бота и локальные артефакты
+logs/
+*.log
+lt.log
+url.txt
+owner.json
+users.json
+bot_state_*.json
+hb_*.json
+daily_risk.log
+trades.jsonl
+signals_queue.jsonl
+threads_used.json
+x_used.json
+month_post/
+ocr_texts/
+ocr/
+preview/
+samples/
+/
+mt5_ea/*.log
+# сборки EA и временные файлы
+*.ex5
+Ict2022EA_tmp.*
