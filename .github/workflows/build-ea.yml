@@ -39,23 +39,33 @@ jobs:
       - name: Bootstrap terminal (first run populates MQL5 standard library)
         shell: pwsh
         run: |
-          $need = "C:\Program Files\MetaTrader 5\MQL5\Include\Trade\Trade.mqh"
-          if (Test-Path $need) { Write-Host "библиотека уже на месте"; exit 0 }
+          $pf = "C:\Program Files\MetaTrader 5\MQL5\Include\Trade\Trade.mqh"
+          $ad = Get-ChildItem "$env:APPDATA\MetaQuotes\Terminal" -Directory -ErrorAction SilentlyContinue |
+                ForEach-Object { Join-Path $_.FullName "MQL5\Include\Trade\Trade.mqh" } |
+                Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ((Test-Path $pf) -or $ad) { Write-Host "библиотека уже на месте"; "MQL5DIR=auto" | Out-File $env:GITHUB_ENV -Append; exit 0 }
           Start-Process -FilePath "C:\Program Files\MetaTrader 5\terminal64.exe"
-          $ok = $false
-          for ($i = 0; $i -lt 24; $i++) {
+          $where = $null
+          for ($i = 0; $i -lt 36; $i++) {
             Start-Sleep -Seconds 10
-            if (Test-Path $need) { $ok = $true; break }
+            if (Test-Path $pf) { $where = "pf"; break }
+            $ad = Get-ChildItem "$env:APPDATA\MetaQuotes\Terminal" -Directory -ErrorAction SilentlyContinue |
+                  ForEach-Object { Join-Path $_.FullName "MQL5\Include\Trade\Trade.mqh" } |
+                  Where-Object { Test-Path $_ } | Select-Object -First 1
+            if ($ad) { $where = "appdata"; break }
           }
           Stop-Process -Name terminal64 -Force -ErrorAction SilentlyContinue
-          if (-not $ok) { throw "стандартная библиотека MQL5 не появилась за 240 с" }
-          Write-Host "библиотека появилась на попытке $i"
+          if (-not $where) { throw "стандартная библиотека MQL5 не появилась за 360 с" }
+          if ($where -eq "pf") { "MQL5DIR=C:\Program Files\MetaTrader 5\MQL5" | Out-File $env:GITHUB_ENV -Append }
+          elseif ($ad) { "MQL5DIR=$(Split-Path (Split-Path $ad))" | Out-File $env:GITHUB_ENV -Append }
+          Write-Host "библиотека найдена: $where"
 
       - name: Compile RangeBotEA and Ict2022EA
         shell: pwsh
         run: |
           $ed = "C:\Program Files\MetaTrader 5\metaeditor64.exe"
-          $mql5dir = "C:\Program Files\MetaTrader 5\MQL5"
+          $mql5dir = $env:MQL5DIR
+          Write-Host "Include-путь: $mql5dir"
           $fail = 0
           foreach ($ea in @("RangeBotEA", "Ict2022EA")) {
             $src = "$env:GITHUB_WORKSPACE\mt5_ea\$ea.mq5"
