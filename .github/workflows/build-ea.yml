@@ -40,11 +40,18 @@ jobs:
         shell: pwsh
         run: |
           $ed = "C:\Program Files\MetaTrader 5\metaeditor64.exe"
+          # при /auto-установке папка данных пуста и стандартной Include-библиотеки
+          # там нет — указываем путь к ней флагом /inc и копируем на всякий случай
+          $mql5dir = "C:\Program Files\MetaTrader 5\MQL5"
+          if (-not (Test-Path "$mql5dir\Include\Trade\Trade.mqh")) { throw "стандартная библиотека MQL5 не найдена в $mql5dir" }
+          $data = "$env:APPDATA\MetaQuotes\Terminal\D0E8209F77C8CF37AD8BF550E51FF075\MQL5"
+          New-Item -ItemType Directory -Force -Path $data | Out-Null
+          Copy-Item -Recurse -Force "$mql5dir\Include" "$data\Include"
           $fail = 0
           foreach ($ea in @("RangeBotEA", "Ict2022EA")) {
             $src = "$env:GITHUB_WORKSPACE\mt5_ea\$ea.mq5"
             $log = "$env:GITHUB_WORKSPACE\mt5_ea\ci_$ea.log"
-            $p = Start-Process -FilePath $ed -ArgumentList "/compile:`"$src`"", "/log:`"$log`"" -Wait -PassThru
+            $p = Start-Process -FilePath $ed -ArgumentList "/compile:`"$src`"", "/inc:`"$mql5dir`"", "/log:`"$log`"" -Wait -PassThru
             $text = Get-Content $log -ErrorAction SilentlyContinue
             $tail = ($text | Select-Object -Last 3) -join " "
             Write-Host "== $ea (exit $($p.ExitCode)): $tail"
