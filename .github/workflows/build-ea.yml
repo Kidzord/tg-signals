@@ -1,0 +1,63 @@
+# Компиляция MQL5-советников на Windows-раннере.
+# Ставит MetaTrader 5 (portable), собирает оба EA, при ошибках — красный билд.
+name: build-ea
+
+on:
+  push:
+    branches: [main]
+    paths: ["mt5_ea/**", ".github/workflows/build-ea.yml"]
+  pull_request:
+    paths: ["mt5_ea/**", ".github/workflows/build-ea.yml"]
+  workflow_dispatch:
+
+jobs:
+  compile:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache MT5 installer
+        uses: actions/cache@v4
+        with:
+          path: ~/mt5setup.exe
+          key: mt5setup-2026
+
+      - name: Download MetaTrader 5 installer
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "$env:USERPROFILE\mt5setup.exe")) {
+            Invoke-WebRequest -Uri "https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe" -OutFile "$env:USERPROFILE\mt5setup.exe"
+          }
+
+      - name: Install MetaTrader 5 (silent)
+        shell: pwsh
+        run: |
+          Start-Process -FilePath "$env:USERPROFILE\mt5setup.exe" -ArgumentList "/auto" -Wait
+          $ed = "C:\Program Files\MetaTrader 5\metaeditor64.exe"
+          if (-not (Test-Path $ed)) { throw "MetaEditor не установился" }
+
+      - name: Compile RangeBotEA and Ict2022EA
+        shell: pwsh
+        run: |
+          $ed = "C:\Program Files\MetaTrader 5\metaeditor64.exe"
+          $fail = 0
+          foreach ($ea in @("RangeBotEA", "Ict2022EA")) {
+            $src = "$env:GITHUB_WORKSPACE\mt5_ea\$ea.mq5"
+            $log = "$env:GITHUB_WORKSPACE\mt5_ea\ci_$ea.log"
+            $p = Start-Process -FilePath $ed -ArgumentList "/compile:`"$src`"", "/log:`"$log`"" -Wait -PassThru
+            $text = Get-Content $log -ErrorAction SilentlyContinue
+            $tail = ($text | Select-Object -Last 3) -join " "
+            Write-Host "== $ea (exit $($p.ExitCode)): $tail"
+            # exit code MetaEditor = количество файлов с ошибками; 0 ошибок в логе обязателен
+            if ($p.ExitCode -ne 0 -or ($tail -notmatch "0 errors")) { $fail = 1 }
+          }
+          if ($fail) { throw "ошибки компиляции" }
+
+      - name: Upload compiled EAs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ea-builds
+          path: |
+            mt5_ea/RangeBotEA.ex5
+            mt5_ea/Ict2022EA.ex5
+          if-no-files-found: error
