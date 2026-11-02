@@ -181,6 +181,30 @@ def send_plain(text: str, token: str | None = None,
     return res.ok, ("ok" if res.ok else res.error)
 
 
+def send_media_group(paths: list[str], caption: str = "",
+                     token: str | None = None,
+                     chat_id: str | int | None = None) -> ApiResult:
+    """Альбом фото (2–10) — удобно отправлять карусель для TikTok/Threads."""
+    chat = cfg.CHAT_ID if chat_id is None else str(chat_id)
+    if not chat:
+        return ApiResult(False, error="no chat_id")
+    items: list[dict] = []
+    files: dict[str, str] = {}
+    for i, path in enumerate(paths[:10]):
+        item = {"type": "photo", "media": f"attach://photo{i}"}
+        if i == 0 and caption:
+            item["caption"] = _caption(caption)
+            item["parse_mode"] = "HTML"
+        items.append(item)
+        files[f"photo{i}"] = path
+    if not items:
+        return ApiResult(False, error="нет картинок")
+    return api_call("sendMediaGroup",
+                    {"chat_id": chat,
+                     "media": json.dumps(items, ensure_ascii=False)},
+                    files, token=token)
+
+
 def send_message_result(text: str, token: str | None = None,
                         chat_id: str | int | None = None,
                         markup: dict | None = None) -> ApiResult:

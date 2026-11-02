@@ -49,6 +49,7 @@ import ru_post
 import telegram_editor
 import tg
 import threads_editor
+import tiktok_editor
 import track_record
 import x_post
 
@@ -303,6 +304,17 @@ def post_tg_content() -> bool:
     return ok
 
 
+def remind_tiktok() -> bool:
+    """Собрать карусель для TikTok и прислать владельцу в личку."""
+    chat = owner_chat()
+    if not chat:
+        log.warning("нет чата владельца для TikTok")
+        return False
+    ok = tiktok_editor.send(chat, cfg.SUB_BOT_TOKEN or cfg.BOT_TOKEN)
+    log.info("карусель TikTok -> %s", ok)
+    return ok
+
+
 def remind_x() -> bool:
     """Прислать владельцу в личку следующий неопубликованный пост для X (EN)."""
     chat = owner_chat()
@@ -460,6 +472,16 @@ def build_scheduler() -> BackgroundScheduler:
                 sch.add_job(lambda n=net: remind_ru(n),
                             CronTrigger(hour=hm[0], minute=hm[1], timezone=TZ),
                             id=f"{net}_{i}", replace_existing=True)
+
+    if cfg.TIKTOK_REMIND_ENABLED:
+        for i, when in enumerate(_times(cfg.TIKTOK_REMIND_TIMES), 1):
+            hm = _hhmm(when)
+            if not hm:
+                log.error("напоминание TikTok: неверное время %r", when)
+                continue
+            sch.add_job(remind_tiktok,
+                        CronTrigger(hour=hm[0], minute=hm[1], timezone=TZ),
+                        id=f"tiktok_{i}", replace_existing=True)
     return sch
 
 
@@ -469,7 +491,7 @@ def main() -> None:
         jobs = {"plan": post_plan, "day": post_day_summary, "week": post_week_summary,
                 "promo": post_promo, "threads": remind_threads, "x": remind_x,
                 "revenue": revenue.send_report, "backup": backup.snapshot,
-                "tgcontent": post_tg_content,
+                "tgcontent": post_tg_content, "tiktok": remind_tiktok,
                 "vk": lambda: remind_ru("vk"), "dzen": lambda: remind_ru("dzen")}
         job = jobs.get(what)
         if not job:

@@ -45,6 +45,7 @@ import store
 import telegram_editor
 import tg
 import threads_editor
+import tiktok_editor
 import track_record
 import ui_components
 import subbot_ui
@@ -1194,7 +1195,8 @@ def handle(users: dict, uid: str, raw: str, name: str = "") -> dict | None:
                        "последний сигнал, /post week — итог недели, /post result — "
                        "последняя закрытая сделка.\n"
                        "Telegram: /tgpost — сразу опубликовать следующий пост, "
-                       "/tgpost preview — только превью.")
+                       "/tgpost preview — только превью.\n"
+                       "TikTok: /tt — карусель из карточек и текст для публикации.")
             return None
 
     if cmd in ("start", "menu"):
@@ -1307,6 +1309,9 @@ def handle(users: dict, uid: str, raw: str, name: str = "") -> dict | None:
                 telegram_editor.publish(int(arg), uid, TOKEN)
             else:
                 telegram_editor.publish_next(uid, TOKEN)
+            return None
+        if cmd in ("tt", "tiktok"):
+            tiktok_editor.send(uid, TOKEN)
             return None
 
     # остальное — только по активной подписке

@@ -124,6 +124,9 @@ X_REMIND_TIMES = os.getenv("X_REMIND_TIMES", "10:30,16:30").strip()
 RU_REMIND_ENABLED = _flag("RU_REMIND_ENABLED", "1")
 VK_REMIND_TIMES = os.getenv("VK_REMIND_TIMES", "11:00,17:00").strip()
 DZEN_REMIND_TIMES = os.getenv("DZEN_REMIND_TIMES", "12:00,18:00").strip()
+# TikTok: карусель из карточек и текста в личку владельцу (API требует аудита)
+TIKTOK_REMIND_ENABLED = _flag("TIKTOK_REMIND_ENABLED", "1")
+TIKTOK_REMIND_TIMES = os.getenv("TIKTOK_REMIND_TIMES", "19:00").strip()
 
 # --- Пробный доступ и рефералы (premium-бот) ---
 # Пробный доступ: сколько дней даём один раз новому пользователю (0/выкл — не даём)
