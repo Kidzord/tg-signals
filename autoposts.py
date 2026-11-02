@@ -296,13 +296,10 @@ def remind_threads() -> bool:
 
 
 def post_tg_content() -> bool:
-    """Превью Telegram-поста владельцу; публикация — по кнопке в боте."""
+    """Опубликовать следующий Telegram-пост в группу. Владельцу — только факт."""
     chat = owner_chat()
-    if not chat:
-        log.warning("нет чата владельца для Telegram-поста")
-        return False
-    ok = telegram_editor.send_next(chat, cfg.SUB_BOT_TOKEN or cfg.BOT_TOKEN)
-    log.info("превью Telegram-поста -> %s", ok)
+    ok = telegram_editor.publish_next(chat, cfg.SUB_BOT_TOKEN or cfg.BOT_TOKEN)
+    log.info("Telegram-пост опубликован: %s", ok)
     return ok
 
 

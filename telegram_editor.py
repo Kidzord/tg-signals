@@ -1,8 +1,8 @@
-"""Публикатор Telegram-постов: превью владельцу → кнопка «Опубликовать».
+"""Публикатор Telegram-постов.
 
 Банк лежит в telegram_posts.py, картинки — общие с Threads (портретные 4:5).
-Владелец получает готовый пост с фото и двумя кнопками. Пока он не нажал
-«Опубликовать», в группу ничего не уходит.
+По расписанию бот сам берёт следующий пост и публикует его в группу.
+Превью с кнопкой «Опубликовать» осталось для ручного режима.
 """
 from __future__ import annotations
 
@@ -78,3 +78,15 @@ def publish(n: int, owner_chat: str | None = None,
         tg.send_plain(f"❗ Не удалось опубликовать #{n}: {res.error[:200]}",
                       token=owner_token, chat_id=owner_chat)
     return res.ok
+
+
+def publish_next(owner_chat: str | None = None,
+                 owner_token: str | None = None) -> bool:
+    """Взять следующий неиспользованный пост и сразу опубликовать в группу."""
+    n = telegram_posts.next_unused()
+    if n is None:
+        if owner_chat:
+            tg.send_plain("📝 Банк Telegram-постов закончился. Скажи — добавлю новые.",
+                          token=owner_token, chat_id=owner_chat)
+        return False
+    return publish(n, owner_chat, owner_token)

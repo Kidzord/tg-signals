@@ -43,7 +43,6 @@ import render as card
 import revenue
 import store
 import telegram_editor
-import telegram_posts
 import tg
 import threads_editor
 import track_record
@@ -1194,8 +1193,8 @@ def handle(users: dict, uid: str, raw: str, name: str = "") -> dict | None:
                        "В любой момент: /post — следующий пост, /post signal — "
                        "последний сигнал, /post week — итог недели, /post result — "
                        "последняя закрытая сделка.\n"
-                       "Telegram: /tgpost — превью поста с кнопкой «Опубликовать», "
-                       "/tgpost now — опубликовать сразу.")
+                       "Telegram: /tgpost — сразу опубликовать следующий пост, "
+                       "/tgpost preview — только превью.")
             return None
 
     if cmd in ("start", "menu"):
@@ -1296,17 +1295,18 @@ def handle(users: dict, uid: str, raw: str, name: str = "") -> dict | None:
                 threads_editor.send_next(uid, TOKEN)
             return None
         if cmd == "tgpost":
-            arg = args[0].lower() if args else "preview"
-            if arg in ("now", "publish"):
-                n = telegram_posts.next_unused()
-                if n is None:
-                    reply(uid, "Банк Telegram-постов закончился.")
+            arg = args[0].lower() if args else "publish"
+            if arg in ("preview", "show"):
+                if len(args) > 1 and args[1].isdigit():
+                    telegram_editor.send_next(uid, TOKEN, int(args[1]))
                 else:
-                    telegram_editor.publish(n, uid, TOKEN)
+                    telegram_editor.send_next(uid, TOKEN)
+            elif arg in ("now", "publish"):
+                telegram_editor.publish_next(uid, TOKEN)
             elif arg.isdigit():
-                telegram_editor.send_next(uid, TOKEN, int(arg))
+                telegram_editor.publish(int(arg), uid, TOKEN)
             else:
-                telegram_editor.send_next(uid, TOKEN)
+                telegram_editor.publish_next(uid, TOKEN)
             return None
 
     # остальное — только по активной подписке
