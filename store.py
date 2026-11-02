@@ -483,6 +483,24 @@ def payments_since(since_ts: float) -> list[sqlite3.Row]:
         con.close()
 
 
+def payment_by_ref(ref: str) -> dict | None:
+    """Платёж по номеру из ledger или по внешнему ID провайдера."""
+    con = connect()
+    try:
+        if str(ref).isdigit():
+            row = con.execute("SELECT * FROM payments WHERE id=?",
+                              (int(ref),)).fetchone()
+            if row:
+                return dict(row)
+        row = con.execute(
+            "SELECT * FROM payments WHERE external_id=? ORDER BY id DESC LIMIT 1",
+            (str(ref),),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        con.close()
+
+
 # -------------------------------------------------------------- group outbox
 
 def enqueue_group(*, trade_id: str, kind: str, path: str, caption: str,

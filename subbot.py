@@ -687,6 +687,62 @@ def reply(uid: str, text: str) -> None:
     tg.send_message(text, token=TOKEN, chat_id=uid)
 
 
+def _esc(s: str) -> str:
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
+def _send_feedback(users: dict, uid: str, raw: str) -> None:
+    """Отзыв тестера → в личку владельца с пометкой источника и статуса."""
+    parts = raw.split(None, 1)
+    text = parts[1].strip() if len(parts) > 1 else ""
+    if not text:
+        reply(uid, "Напиши отзыв после команды: /feedback <текст> — что работает, "
+                   "что сломалось, чего не хватает. Автор читает всё сам.")
+        return
+    owner = str(cfg.OWNER_CHAT_ID or "")
+    if not owner:
+        reply(uid, "Сейчас не могу передать автору — попробуй позже.")
+        return
+    u = users.get(uid) or {}
+    src = str(u.get("source", "") or "direct")
+    status = ("premium" if is_paid(users, uid)
+              else "триал" if u.get("trial_used") else "новый")
+    tg.send_message(f"💬 <b>Фидбек · {status} · {src}</b>\n"
+                    f"От: <code>{uid}</code>\n\n{_esc(text)}",
+                    token=TOKEN, chat_id=owner)
+    reply(uid, "Спасибо, передал автору 👍")
+
+
+def _refund_stars(owner_uid: str, ref: str) -> None:
+    """Возврат Stars по платежу из ledger: refundStarPayment + пометка refunded."""
+    row = store.payment_by_ref(ref)
+    if not row:
+        reply(owner_uid, f"Платёж <code>{_esc(ref)}</code> не найден в ledger.")
+        return
+    if str(row["provider"]) != "stars":
+        reply(owner_uid, f"Платёж #{row['id']} — {row['provider']}: возвращается "
+                         f"вручную через провайдера. Stars — автоматически.")
+        return
+    if str(row["status"]) != "paid":
+        reply(owner_uid, f"Платёж #{row['id']} уже в статусе {row['status']}.")
+        return
+    res = tg.api_call(
+        "refundStarPayment",
+        {"user_id": int(row["uid"]),
+         "telegram_payment_charge_id": str(row["external_id"])},
+        token=TOKEN)
+    if not res.ok:
+        reply(owner_uid, f"❗ Возврат не прошёл: {_esc(res.error[:200])}")
+        return
+    store.mark_payment_refunded(provider="stars",
+                                external_id=str(row["external_id"]))
+    reply(owner_uid,
+          f"↩️ Возврат оформлен: {row['amount']:g} Stars → <code>{row['uid']}</code>.\n"
+          f"Доступ до конца оплаченного периода остаётся — снять вручную, "
+          f"если нужно: /status у подписчика.")
+
+
 def _num(raw: str, lo: float, hi: float) -> float | None:
     try:
         v = float(raw.replace(",", ".").strip())
@@ -1429,6 +1485,19 @@ def handle(users: dict, uid: str, raw: str, name: str = "") -> dict | None:
             tiktok_editor.send(uid, TOKEN)
             return None
 
+    # фидбек доступен всем — это канал связи с автором для тестеров
+    if cmd == "feedback":
+        _send_feedback(users, uid, raw)
+        return None
+        if cmd == "refund":
+            if not args:
+                reply(uid, "Формат: /refund <id> — возврат Stars по номеру платежа "
+                           "(номера видны в /revenue). Крипта возвращается вручную "
+                           "через @CryptoBot.")
+                return None
+            _refund_stars(uid, args[0])
+            return None
+
     # остальное — только по активной подписке
     if not is_paid(users, uid):
         send_gate(uid, users)
@@ -1847,6 +1916,7 @@ def main() -> None:
         ("mycard", "Карточка счёта"),
         ("symbols", "Фильтр инструментов"),
         ("maxday", "Лимит сигналов в сутки"),
+        ("feedback", "Отзыв автору бота"),
         ("help", "Помощь"),
     ], token=TOKEN)
     if not ok:

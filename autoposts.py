@@ -47,6 +47,7 @@ import devlog
 import render as card
 import revenue
 import ru_post
+import store
 import telegram_editor
 import tg
 import threads_editor
@@ -333,6 +334,100 @@ def post_promo() -> bool:
     return ok
 
 
+def _top_counts(counts: dict[str, int], limit: int = 4) -> str:
+    items = sorted(counts.items(), key=lambda x: (-x[1], x[0]))[:limit]
+    return ", ".join(f"{k} {v}" for k, v in items) or "нет данных"
+
+
+def post_growth(now: dt.datetime | None = None) -> bool:
+    """Еженедельный отчёт по росту — только владельцу в личку.
+
+    Снапшот аудитории (users.json) + оплаты за 7 дней из ledger: источники
+    задаются через /start src_*, атрибуция пишется и в users, и в payments.
+    """
+    now = now or dt.datetime.now(TZ)
+    users = load_json(os.path.join(HERE, "users.json"))
+    total = len(users)
+    paid_n = sum(1 for u in users.values()
+                 if float(u.get("paid_until", 0) or 0) > now.timestamp())
+    trial_n = sum(1 for u in users.values() if u.get("trial_used"))
+    conv = (paid_n / total * 100.0) if total else 0.0
+    src: dict[str, int] = {}
+    for u in users.values():
+        s = str(u.get("source", "") or "direct")
+        src[s] = src.get(s, 0) + 1
+
+    pays = store.payments_since(now.timestamp() - 7 * 86400)
+    paid_week = [p for p in pays
+                 if str(p["status"]) == "paid" and float(p["amount"]) > 0]
+    wk_sum = sum(float(p["amount"]) for p in paid_week)
+    wk_src: dict[str, int] = {}
+    for p in paid_week:
+        s = str(p["source"] or "direct")
+        wk_src[s] = wk_src.get(s, 0) + 1
+
+    totals = store.payment_totals(now.timestamp() - 30 * 86400)
+    mrr = totals.get("stars:paid", 0.0) + totals.get("crypto:paid", 0.0)
+
+    lines = [
+        f"📈 <b>Рост · неделя к {now.strftime('%d.%m')}</b>",
+        f"Контакты: {total} · платящих: {paid_n} · конверсия {conv:.0f}%",
+        f"Триал запускали (за всё время): {trial_n}",
+        f"Источники: {_top_counts(src)}",
+        f"Оплаты за 7 дней: {len(paid_week)} на {_usd(wk_sum)} $",
+    ]
+    if paid_week:
+        lines.append(f"Оплаты по источникам: {_top_counts(wk_src)}")
+    lines.append(f"Деньги за 30 дней (MRR-приближение): {_usd(mrr)} $")
+    ok, info = tg.send_message("\n".join(lines),
+                               token=cfg.SUB_BOT_TOKEN or cfg.BOT_TOKEN,
+                               chat_id=owner_chat())
+    log.info("growth -> %s (%s)", ok, info)
+    return ok
+
+
+def post_month(now: dt.datetime | None = None) -> bool:
+    """«Месяц в цифрах» — 1-го числа, сводка за предыдущий календарный месяц."""
+    now = now or dt.datetime.now(TZ)
+    first = (now.replace(day=1) - dt.timedelta(days=1)).replace(day=1)
+    nxt = (first + dt.timedelta(days=32)).replace(day=1)
+    rows = load_trades()
+    before = [t for t in rows if t["ts"] < first.timestamp()]
+    month = [t for t in rows if first.timestamp() <= t["ts"] < nxt.timestamp()]
+    n, wins, sum_r = _stats(month)
+    label = period_label(first.date(), (nxt - dt.timedelta(days=1)).date())
+    head = f"🗓 <b>Месяц в цифрах · {label}</b>"
+
+    if n == 0:
+        text = head + "\n\nМесяц без сделок — рынок не дал входов по правилам."
+        ok, info = tg.send_message(text)
+        _mirror(None, text)
+        log.info("месяц (без сделок) -> %s (%s)", ok, info)
+        return ok
+
+    bal_start = cfg.PLAN_DEPOSIT + PER_R * sum(t["r"] for t in before)
+    bal_end = bal_start + PER_R * sum_r
+    m = track_record.metrics(month)
+    pf = "∞" if m["pf"] == float("inf") else f"{m['pf']:.2f}"
+    note = (f"PF {pf} · макс. просадка {m['max_dd_r']:.1f}R · "
+            f"серия убытков до {m['losing_streak']}\n"
+            f"С начала счёта: {(bal_end / cfg.PLAN_DEPOSIT - 1) * 100:+.1f}%")
+    os.makedirs(OUT_DIR, exist_ok=True)
+    path = os.path.join(OUT_DIR, f"month_{first:%Y%m}.png")
+    try:
+        card.render_summary_card(card.SummaryPlan(
+            title="Месяц в цифрах", period=label, trades=n, wins=wins,
+            sum_r=sum_r, bal_start=bal_start, bal_end=bal_end, note=note,
+            when=now), path)
+        ok, info = tg.send_photo(path, head + "\n\n" + note)
+    except Exception as e:
+        log.error("месяц: карточка не отрисовалась (%s), шлю текстом", e)
+        ok, info = tg.send_message(head + "\n\n" + note)
+    _mirror(path, head + "\n\n" + note)
+    log.info("месяц -> %s (%s)", ok, info)
+    return ok
+
+
 # ------------------------------------------------------- напоминания о Threads
 
 def remind_threads() -> bool:
@@ -546,6 +641,7 @@ def daily_plan() -> list[tuple[str, str, str, object]]:
         ("day", cfg.DAY_SUMMARY_TIME, "mon-fri", post_day_summary),
         ("week", cfg.WEEK_SUMMARY_TIME, "fri", post_week_summary),
         ("revenue", "09:05", "mon", revenue.send_report),
+        ("growth", "09:15", "mon", post_growth),
         ("backup", "03:00", "*", backup.snapshot),
         ("cleanup", "03:30", "*", cleanup_artifacts),
     ]
@@ -605,7 +701,7 @@ def catch_up(plan) -> None:
     """Догнать слот, пропущенный из-за рестарта/сна, если он был недавно."""
     now = dt.datetime.now(TZ)
     for name, when, dow, fn in plan:
-        if name in ("backup", "cleanup"):
+        if name in ("backup", "cleanup", "month"):
             continue
         hm = _hhmm(when)
         if not hm or not _dow_ok(dow, now.date()):
@@ -667,6 +763,17 @@ def build_scheduler() -> BackgroundScheduler:
                         id="threads_week", replace_existing=True)
         else:
             log.error("Threads week: неверное время %r", cfg.THREADS_WEEK_TIME)
+
+    # «Месяц в цифрах» — 1-го числа, календарная логика (не в daily_plan/догоне)
+    if cfg.MONTH_SUMMARY_ENABLED:
+        hm = _hhmm(cfg.MONTH_SUMMARY_TIME)
+        if hm:
+            sch.add_job(tracked("month", post_month),
+                        CronTrigger(day="1", hour=hm[0], minute=hm[1],
+                                    timezone=TZ),
+                        id="month", replace_existing=True)
+        else:
+            log.error("месяц в цифрах: неверное время %r", cfg.MONTH_SUMMARY_TIME)
 
     if cfg.X_REMIND_ENABLED:
         for i, when in enumerate(_times(cfg.X_REMIND_TIMES), 1):
