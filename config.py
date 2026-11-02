@@ -40,6 +40,9 @@ PLAN_TOTAL_PCT = _float("PLAN_TOTAL_PCT", 10.0)
 # --- Premium-подписка (Telegram Stars) ---
 # Цена подписки в Stars (1–10000). У Telegram период подписки только 30 дней.
 SUB_PRICE_STARS = int(_float("SUB_PRICE_STARS", 500.0))
+# Годовой план: разовый счёт Stars (подписка Telegram умеет только 30 дней).
+# 0 — годовой план выключен.
+SUB_PRICE_STARS_YEAR = int(_float("SUB_PRICE_STARS_YEAR", "0"))
 SUB_TITLE = os.getenv("SUB_TITLE", "KidzordFX Premium").strip()
 SUB_DESCRIPTION = os.getenv(
     "SUB_DESCRIPTION",
@@ -58,6 +61,8 @@ CRYPTO_PAY_TOKEN = os.getenv("CRYPTO_PAY_TOKEN", "").strip()
 CRYPTO_PAY_TESTNET = _flag("CRYPTO_PAY_TESTNET", "0")
 # Цена подписки в крипте (0 — способ оплаты выключен). ~500 ⭐ ≈ 8 USDT.
 CRYPTO_PRICE_USDT = _float("CRYPTO_PRICE_USDT", 8.0)
+# Годовая цена в крипте (0 — годовой план выключен).
+CRYPTO_PRICE_USDT_YEAR = _float("CRYPTO_PRICE_USDT_YEAR", "0.0")
 # Валюта счёта: USDT, TON, BTC, ETH и т.п.
 CRYPTO_ASSET = os.getenv("CRYPTO_ASSET", "USDT").strip().upper() or "USDT"
 
@@ -106,9 +111,20 @@ PREMIUM_URL = os.getenv("PREMIUM_URL", "https://t.me/KidzordPremim_bot").strip()
 PLAN_TIME = os.getenv("PLAN_TIME", "08:00").strip()
 DAY_SUMMARY_TIME = os.getenv("DAY_SUMMARY_TIME", "23:30").strip()
 WEEK_SUMMARY_TIME = os.getenv("WEEK_SUMMARY_TIME", "23:50").strip()
+# Пост-превью для Telegram: раз в день владельцу, публикация — по кнопке.
+TG_CONTENT_ENABLED = _flag("TG_CONTENT_ENABLED", "1")
+TG_CONTENT_TIME = os.getenv("TG_CONTENT_TIME", "12:00").strip()
 # Напоминания о постах Threads в личку: список времён через запятую
 THREADS_REMIND_ENABLED = _flag("THREADS_REMIND_ENABLED", "1")
 THREADS_REMIND_TIMES = os.getenv("THREADS_REMIND_TIMES", "09:00,14:00,19:00").strip()
+# Отдельный слот под реальную сделку и недельный трек-рекорд для Threads.
+THREADS_RESULT_ENABLED = _flag("THREADS_RESULT_ENABLED", "1")
+THREADS_RESULT_TIME = os.getenv("THREADS_RESULT_TIME", "19:00").strip()
+THREADS_WEEK_ENABLED = _flag("THREADS_WEEK_ENABLED", "1")
+THREADS_WEEK_TIME = os.getenv("THREADS_WEEK_TIME", "20:00").strip()
+# Лендинг собирается локально из trades.jsonl (деплой — вручную/CI).
+LANDING_ENABLED = _flag("LANDING_ENABLED", "1")
+LANDING_TIME = os.getenv("LANDING_TIME", "23:55").strip()
 # Напоминания о постах для X (отдельный англ. аккаунт) в личку
 X_REMIND_ENABLED = _flag("X_REMIND_ENABLED", "1")
 X_REMIND_TIMES = os.getenv("X_REMIND_TIMES", "10:30,16:30").strip()
@@ -116,6 +132,9 @@ X_REMIND_TIMES = os.getenv("X_REMIND_TIMES", "10:30,16:30").strip()
 RU_REMIND_ENABLED = _flag("RU_REMIND_ENABLED", "1")
 VK_REMIND_TIMES = os.getenv("VK_REMIND_TIMES", "11:00,17:00").strip()
 DZEN_REMIND_TIMES = os.getenv("DZEN_REMIND_TIMES", "12:00,18:00").strip()
+# TikTok: карусель из карточек и текста в личку владельцу (API требует аудита)
+TIKTOK_REMIND_ENABLED = _flag("TIKTOK_REMIND_ENABLED", "1")
+TIKTOK_REMIND_TIMES = os.getenv("TIKTOK_REMIND_TIMES", "19:00").strip()
 
 # --- Пробный доступ и рефералы (premium-бот) ---
 # Пробный доступ: сколько дней даём один раз новому пользователю (0/выкл — не даём)
@@ -124,6 +143,19 @@ TRIAL_DAYS = int(_float("TRIAL_DAYS", 3.0))
 # Реферальная программа: сколько дней получает пригласивший за оплату друга
 REF_ENABLED = _flag("REF_ENABLED", "1")
 REF_DAYS = int(_float("REF_DAYS", 7.0))
+# Бонус приглашённому после его первой оплаты (двусторонняя рефералка).
+REF_DAYS_FRIEND = int(_float("REF_DAYS_FRIEND", 3.0))
+# Промокоды: CODE:DAYS через запятую, например NEW20:20,OLD30:30.
+# Один код — один раз на пользователя.
+PROMO_CODES: dict[str, int] = {}
+for _item in os.getenv("PROMO_CODES", "").split(","):
+    _item = _item.strip()
+    if ":" in _item:
+        _code, _days = _item.split(":", 1)
+        try:
+            PROMO_CODES[_code.strip().upper()] = int(float(_days))
+        except ValueError:
+            continue
 # username premium-бота без @ — из него собирается реферальная ссылка ?start=ref_<id>
 SUB_BOT_USERNAME = os.getenv("SUB_BOT_USERNAME", "").strip().lstrip("@")
 # ссылка «Поддержка» (t.me/username или инвайт) — кнопка в меню бота
@@ -138,6 +170,14 @@ MONITOR_ENABLED = _flag("MONITOR_ENABLED", "1")
 MONITOR_EVERY_MIN = int(_float("MONITOR_EVERY_MIN", 15.0))
 # если пульса нет дольше M минут — алерт владельцу в личку
 MONITOR_STALE_MIN = int(_float("MONITOR_STALE_MIN", 15.0))
+# сколько процессов bot.py должно работать (range AUDUSD+USDCAD + classic XAUUSD)
+EXPECTED_BOTS = int(_float("HEARTBEAT_EXPECT_BOTS", 3.0))
+# Внешний dead-man switch: URL healthchecks.io (или аналога). Пока ПК жив,
+# monitor.py раз в цикл пингует его; если ПК упал — сервис шлёт алерт.
+HEALTHCHECK_URL = os.getenv("HEALTHCHECK_URL", "").strip()
+# Доставка: сколько попыток и максимальная пауза между ними.
+DELIVERY_MAX_ATTEMPTS = int(_float("DELIVERY_MAX_ATTEMPTS", 6.0))
+DELIVERY_ALERT = _flag("DELIVERY_ALERT", "1")
 
 # --- Прочее ---
 DEDUP_TTL_SEC = int(os.getenv("DEDUP_TTL_SEC", "900"))

@@ -398,6 +398,170 @@ def render_result_card(*, symbol: str, side: str, kind: str, r: float, out_path:
     return c.save(out_path)
 
 
+def _trade_levels(tp1: float | None, tp2: float | None, tp3: float | None,
+                  stop: float | None, entry: float | None,
+                  exit_px: float | None,
+                  exit_color: str) -> list[tuple[str, float, str, float]]:
+    """Уровни карточки результата без дублей.
+
+    У range/sonar/ict цель одна, и в состоянии сделки она лежит сразу в
+    tp1/tp2/tp3. Рисуем только TP1: три одинаковые линии — это визуальный баг.
+    Если выход совпал с TP/SL/входом, отдельную линию «Выход» не рисуем —
+    выход и так отмечен крестиком.
+    """
+    levels: list[tuple[str, float, str, float]] = []
+    seen: list[float] = []
+    for name, px, col, alpha in (
+        ("TP1", tp1, theme.GREEN, 1.0),
+        ("TP2", tp2, theme.GREEN, 0.75),
+        ("TP3", tp3, theme.GREEN, 0.55),
+    ):
+        if px is None:
+            continue
+        if any(abs(float(px) - p) < 1e-9 for p in seen):
+            continue
+        seen.append(float(px))
+        levels.append((name, float(px), col, alpha))
+    base = [float(x) for x in (entry, stop) if x is not None] + seen
+    if stop is not None:
+        levels.append(("SL", float(stop), theme.RED, 1.0))
+    if entry is not None:
+        levels.append(("Вход", float(entry), theme.LABEL2, 1.0))
+    if exit_px is not None and not any(abs(float(exit_px) - p) < 1e-9 for p in base):
+        levels.append(("Выход", float(exit_px), exit_color, 1.0))
+    return levels
+
+
+def render_trade_chart(*, symbol: str, side: str, kind: str, r: float,
+                       entry: float, stop: float, exit_px: float | None,
+                       bars: list[Bar], tf: str, entry_idx: int, exit_idx: int,
+                       out_path: str, tp1: float | None = None,
+                       tp2: float | None = None, tp3: float | None = None,
+                       note: str = "", when: dt.datetime | None = None) -> str:
+    """Карточка результата с графиком MT5: свечи, вход, стоп, цели, выход.
+
+    Это не скриншот окна терминала (Python-пакет MT5 его не умеет), а тот же
+    график, построенный по данным брокера. Работает без GUI и выглядит как
+    остальные карточки: вход/выход отмечены, риск и прибыль заштрихованы.
+    """
+    if not bars:
+        raise ValueError("нет баров для графика")
+
+    is_long = side.upper() == "LONG"
+    side_color = theme.GREEN if is_long else theme.RED
+    color = theme.GREEN if r > 0.001 else (theme.LABEL2 if abs(r) <= 0.001 else theme.RED)
+    c = theme.Card(12.8, 7.2)
+
+    # ---------------- шапка ----------------
+    c.text(0.035, 0.945, cfg.CARD_TITLE, size=20, weight="bold", display=True)
+    c.text(0.035, 0.893, theme.spaced("TRADE RESULT"), size=8.5, color=theme.LABEL3)
+    c.text(0.965, 0.945, f"{symbol} · {feeds.tf_label(tf)}", size=22,
+           weight="bold", display=True, ha="right")
+    c.chip(0.858, 0.8615, 0.107, 0.045, "LONG" if is_long else "SHORT",
+           color=side_color, size=11.5)
+    c.text(0.50, 0.882, f"{r:+.2f}R", size=24, weight="bold", display=True,
+           color=color, ha="center")
+    c.hairline(0.035, 0.965, 0.845)
+
+    # ---------------- график ----------------
+    n = len(bars)
+    ax = c.fig.add_axes([0.045, 0.165, 0.915, 0.635])
+    ax.set_facecolor("none")
+    ax.patch.set_alpha(0.0)
+
+    all_levels = [x for x in (entry, stop, exit_px, tp1, tp2, tp3) if x is not None]
+    lo = min([b.l for b in bars] + all_levels)
+    hi = max([b.h for b in bars] + all_levels)
+    pad = max((hi - lo) * 0.08, 0.0001)
+    ax.set_ylim(lo - pad, hi + pad)
+    ax.set_xlim(-1, n + 7)
+
+    last_target = tp3 if tp3 is not None else (tp2 if tp2 is not None else tp1)
+    if last_target is not None:
+        if is_long:
+            ax.fill_between([-1, n + 7], entry, stop, color=theme.RED, alpha=0.10, lw=0)
+            ax.fill_between([-1, n + 7], entry, last_target, color=theme.GREEN, alpha=0.08, lw=0)
+        else:
+            ax.fill_between([-1, n + 7], stop, entry, color=theme.RED, alpha=0.10, lw=0)
+            ax.fill_between([-1, n + 7], last_target, entry, color=theme.GREEN, alpha=0.08, lw=0)
+
+    ax.yaxis.set_major_locator(mticker.MaxNLocator(7))
+    ax.grid(axis="y", color=theme.GLASS_LINE, lw=0.7)
+    ax.set_axisbelow(True)
+
+    tick = max((hi - lo) / 400, 1e-5)
+    for i, b in enumerate(bars):
+        candle = theme.GREEN if b.c >= b.o else theme.RED
+        ax.vlines(i, b.l, b.h, color=candle, lw=0.9, zorder=3)
+        body_lo, body_hi = sorted((b.o, b.c))
+        ax.add_patch(Rectangle((i - 0.31, body_lo), 0.62,
+                               max(body_hi - body_lo, tick),
+                               facecolor=candle, edgecolor=candle, lw=0, zorder=4))
+
+    # Уровни без дублей: у range/sonar/ict цель одна, и TP1/TP2/TP3
+    # не должны рисоваться тремя линиями на одной цене.
+    levels = _trade_levels(tp1, tp2, tp3, stop, entry, exit_px, color)
+    for name, price, col, alpha in levels:
+        lw = 1.5 if name in ("Вход", "Выход") else 1.1
+        ax.axhline(price, color=col, lw=lw, ls=(0, (5, 4)), alpha=alpha, zorder=2)
+
+    placed: list[float] = []
+    for name, price, col, alpha in sorted(levels, key=lambda x: -x[1]):
+        y = price
+        span = (hi - lo) or 1.0
+        for prev in placed:
+            if abs(y - prev) < span * 0.028:
+                y = prev - span * 0.030
+        placed.append(y)
+        ax.annotate(f"{name}  {money(price)}", xy=(n + 6.6, y), xytext=(n + 6.6, y),
+                    color=theme.BASE, fontsize=8.5,
+                    fontproperties=theme.font("semibold"),
+                    ha="right", va="center", zorder=6,
+                    bbox=dict(boxstyle="round,pad=0.34", fc=col, ec="none",
+                              alpha=max(alpha, 0.78)))
+
+    # вход и выход
+    if 0 <= entry_idx < n:
+        ax.scatter([entry_idx], [entry], marker="^" if is_long else "v",
+                   s=95, color=side_color, edgecolor=theme.BASE, linewidth=0.8, zorder=8)
+    if exit_px is not None and 0 <= exit_idx < n:
+        ax.scatter([exit_idx], [exit_px], marker="X", s=95,
+                   color=color, edgecolor=theme.BASE, linewidth=0.8, zorder=8)
+
+    ax.tick_params(axis="y", colors=theme.LABEL3, length=0)
+    ax.tick_params(axis="x", colors=theme.LABEL3, length=0)
+    for s in ("top", "right", "left"):
+        ax.spines[s].set_visible(False)
+    ax.spines["bottom"].set_color(theme.GLASS_LINE)
+    _tick_font(ax)
+
+    step = max(1, n // 5)
+    ticks = list(range(0, n, step))[:6]
+    labels = []
+    for i in ticks:
+        t = bars[i].t
+        labels.append(t.strftime("%d.%m %H:%M") if feeds.tf_minutes(tf) < 1440
+                      else t.strftime("%d.%m"))
+    ax.set_xticks(ticks)
+    ax.set_xticklabels(labels)
+    _tick_font(ax)
+
+    # ---------------- подвал ----------------
+    c.hairline(0.035, 0.965, 0.128)
+    left = (f"Вход {money(entry)}   ·   Стоп {money(stop)}   ·   "
+            f"Выход {money(exit_px) if exit_px is not None else '—'}   ·   "
+            f"Итог {r:+.2f}R")
+    c.text(0.035, 0.095, left, size=10.5)
+    if note:
+        c.text(0.035, 0.055, note[:90], size=9.5, color=theme.LABEL2)
+    tail = f"{(when or dt.datetime.now()).strftime('%d.%m.%Y %H:%M')} {cfg.TZ_LABEL}"
+    c.text(0.965, 0.095, tail, size=9, color=theme.LABEL3, ha="right")
+    c.text(0.965, 0.055, "данные: MT5 · демо-счёт", size=9,
+           color=theme.LABEL3, ha="right")
+
+    return c.save(out_path)
+
+
 @dataclass
 class SummaryPlan:
     """Данные сводки за период для карточки-отчёта."""

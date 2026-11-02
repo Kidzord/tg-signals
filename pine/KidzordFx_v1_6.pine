@@ -1,0 +1,1818 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════
+//  KIDZORDFX V1.3 · P1  ·  SMC / EMA200 CHECKLIST + TRADES
+//  Чек-лист (как в таблице закрытого бота) + карточки сделок:
+//  предварительная (до триггера), реальная (вход, SL, TP1-TP3), частичные закрытия,
+//  перевод в БУ, статистика; канал/веер по подтверждённым пивотам.
+//
+//  V1.3: торговые сессии (Азия / Лондон / Нью-Йорк / перекрытие Лдн+НЙ) по местному
+//  биржевому времени — перевод на летнее/зимнее время учитывается автоматически
+//  (IANA-зоны Asia/Tokyo, Europe/London, America/New_York). Прежнее «одно окно»
+//  с фиксированным GMT-смещением доступно отдельным режимом.
+//
+//  V1.4: зоны сессий — боксы по крайним точкам свечей (верх = максимум сессии,
+//  низ = минимум) с подписями; рисуются от открытия до закрытия сессии вместо
+//  заливки фоном на весь экран.
+//
+//  V1.5: проверено под Минск (GMT+3, без перевода часов): чек-лист и подписи
+//  зон показывают живые окна по МСК; у кильзон есть режим «Минск».
+//
+//  Профиль по умолчанию — сбалансированный: сессии Лдн+НЙ, CHoCH 2/4, спред-фильтр
+//  вкл, триггер любой, трейлинг UT Bot после TP1, лимиты дня 3 сделки / −2R,
+//  объём от риска. Жёсткая дисциплина (кильзоны, 3/4 фактора, пул, rVol, сила 2)
+//  включается галочками, если сигналов становится слишком много.
+//
+//  V1.6: Order Blocks (отрисовка + опциональный фильтр «вход у свежего OB»),
+//  порог размера FVG; фильтр «мелких» BOS покрыт дизайном рефа (фрактал ∪ экстремум).
+//
+//  Карта кода (P4-1): ВХОДЫ → РЕЕСТР УРОВНЕЙ LV → ДАННЫЕ СТАРШИХ ТФ → УРОВНИ,
+//  СВИП И ТРИГГЕРЫ → ЦЕЛЬ → ФАКТОРЫ SMC (CHoCH, ORDER BLOCKS) → VWAP И rVOL →
+//  СТОРОНА, СЕССИИ, КИЛЬЗОНЫ → ЗОНЫ СЕССИЙ И ASIA H/L → r-ГЕЙТЫ → СДЕЛКИ И
+//  СОПРОВОЖДЕНИЕ → ПРЕВЬЮ-ПЛАН → ТАБЛИЦЫ И ДИАГНОСТИКА → АЛЕРТЫ.
+//  Полный журнал изменений — в файле плана (KidzordFx_V1_3_план_улучшений.md).
+//  Проверка чистой логики — отдельным скриптом KidzordFx_selftest.pine (P4-2).
+//
+//  ТФ: рабочий = ТФ графика (авто), касание EMA200 = 1H, контекст = 4H.
+//  Логика оригинала неизвестна — это самостоятельная реализация тех же идей.
+// ═══════════════════════════════════════════════════════════════════════════
+indicator("KidzordFx V1.6", "KidzordFx", overlay = true, max_bars_back = 500, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+// ─────────────────────────────── ВХОДНЫЕ ───────────────────────────────
+gTF    = "Таймфреймы"
+gCtx   = "Старший ТФ: EMA200 / наклон / зона"
+gTrg   = "Рабочий ТФ: тест и триггер"
+gRisk  = "Риск и цель"
+gLv    = "Уровни: PUT WALL / resistance"
+gSMC   = "SMC-факторы (нужно N из 3)"
+gFltr  = "Доп. фильтры: VWAP / EMA-стек / MACD / RSI"
+gTrade = "Сделки: карточки, TP, статистика"
+gTbl   = "Таблица и вид"
+gMode  = "Режим проверки"
+htfTf     = input.timeframe("240", "ТФ контекста (4H)", group = gTF)
+touchTf   = input.timeframe("60", "ТФ касания EMA200", group = gTF)
+htfEmaLen = input.int(200, "EMA старшего ТФ: длина", minval = 10, maxval = 1000, group = gTF)
+ltfTfRaw  = input.timeframe("", "Рабочий ТФ (пусто = ТФ графика)", group = gTF)
+ltfEmaLen = input.int(200, "EMA рабочего ТФ: длина", minval = 10, maxval = 1000, group = gTF)
+sideAllow = input.string("Обе", "Разрешённая сторона", options = ["Обе", "Только лонг", "Только шорт"], group = gTF)
+tfFallback = input.bool(false, "ТФ-фолбэк на ТФ графика", group = gTF, tooltip = "Если ТФ контекста/касания ниже ТФ графика, считать EMA200 на ТФ графика вместо молчаливой блокировки сигналов.")
+slopeLen  = input.int(20, "Окно наклона, баров", minval = 1, maxval = 200, group = gCtx)
+minSlope  = input.float(0.01, "Мин. наклон EMA200, ATR/бар", minval = 0.0, step = 0.005, group = gCtx)
+useDayCtx = input.bool(true, "Дневной контекст (цена vs EMA200 на D)", group = gCtx)
+tolHtf    = input.float(0.6, "Допуск касания, в ATR (больше = «почти дотронулся»)", minval = 0.01, step = 0.05, group = gCtx)
+memHours  = input.int(24, "Память касания, часов", minval = 1, maxval = 720, group = gCtx)
+chopLen   = input.int(100, "Окно «болтанки», баров", minval = 10, group = gCtx)
+erMin     = input.float(0.20, "Мин. эффективность (ER 0–1)", minval = 0.0, maxval = 1.0, step = 0.05, group = gCtx)
+tolLtf    = input.float(0.15, "Зона теста EMA200, в ATR", minval = 0.01, step = 0.05, group = gTrg)
+testLook  = input.int(20, "Тест актуален, баров", minval = 1, group = gTrg)
+trigLook  = input.int(5, "Триггер актуален, баров", minval = 1, group = gTrg)
+pinMult   = input.float(1.5, "Пин-бар: тень / тело", minval = 0.5, step = 0.1, group = gTrg)
+usePin    = input.bool(true, "Триггер: пин-бар", group = gTrg)
+useEngulf = input.bool(true, "Триггер: поглощение", group = gTrg)
+useMicro  = input.bool(true, "Триггер: BOS (пробой свинга телом)", group = gTrg)
+trigBosLen = input.int(5, "BOS: длина свинга, баров", minval = 2, maxval = 50, group = gTrg)
+useIfvg   = input.bool(true, "Триггер: IFVG (инверсия имбаланса)", group = gTrg)
+ifvgLook  = input.int(60, "IFVG актуален, баров", minval = 1, group = gTrg)
+ifvgTol   = input.float(0.10, "IFVG: допуск теста, ATR", minval = 0.01, step = 0.05, group = gTrg)
+minTrigPow = input.int(1, "Мин. сила триггера (0 = любой)", minval = 0, maxval = 4, group = gTrg, tooltip = "Пин-бар = 1, поглощение = 2, IFVG = 3, BOS = 4. По умолчанию 1 — работает любой включённый триггер; 2 отсекает голые пины.")
+minRangeK = input.float(0.40, "Мин. размер свечи-триггера, в ATR", minval = 0.0, step = 0.05, group = gTrg)
+swingLen  = input.int(10, "Стоп: за N баров", minval = 2, group = gRisk)
+stopBuf   = input.float(0.20, "Отступ стопа от свинга, ATR", minval = 0.0, step = 0.05, group = gRisk)
+stopMode  = input.string("За манипуляцией", "База стопа", options = ["За манипуляцией", "Свинг"], group = gRisk)
+manipLook = input.int(20, "Стоп: манипуляция актуальна, баров", minval = 1, group = gRisk)
+riskAtrMode = input.bool(true, "Риск в коридоре считать в ATR", group = gRisk)
+riskMinAtr = input.float(0.0, "Риск мин, ATR (0 = без нижней границы)", minval = 0.0, step = 0.05, group = gRisk)
+riskMaxAtr = input.float(4.0, "Риск макс, ATR", minval = 0.1, step = 0.1, group = gRisk)
+riskMin   = input.float(0.05, "Риск мин, %", minval = 0.01, step = 0.05, group = gRisk)
+riskMax   = input.float(1.50, "Риск макс, %", minval = 0.02, step = 0.05, group = gRisk)
+liqLen    = input.int(60, "Ликвидность: экстремум за N баров", minval = 5, group = gRisk)
+tgtMin    = input.float(0.15, "Цель мин, %", minval = 0.0, step = 0.05, group = gRisk)
+tgtMax    = input.float(5.00, "Цель макс, %", minval = 0.0, step = 0.05, group = gRisk)
+minRR     = input.float(1.5, "Мин. R:R", minval = 0.1, step = 0.1, group = gRisk)
+useDayBud = input.bool(true, "Цель не дальше дневного хода", group = gRisk)
+dayBudgetK = input.float(1.0, "Дневной ход = ATR(D) ×", minval = 0.2, step = 0.1, group = gRisk)
+maxDayTrades = input.int(3, "Макс. сделок за день (0 = без лимита)", minval = 0, maxval = 50, group = gRisk)
+dayStopR     = input.float(2.0, "Стоп дня, R (0 = без лимита)", minval = 0.0, step = 0.5, group = gRisk, tooltip = "После просадки за день до −N R новые входы блокируются до следующего дня.")
+useTrail    = input.bool(true, "Трейлинг-стоп после TP (UT Bot)", group = gRisk, tooltip = "Схема UT Bot: стоп подтягивается к close − k×ATR (лонг) / close + k×ATR (шорт) и никогда не отдаляется. Включается со следующего бара после указанного TP. При выходе по трейлу R считается по фактической цене стопа — и в плюс, и в минус.")
+trailAfter  = input.int(1, "Включать трейлинг после TP №", minval = 1, maxval = 3, group = gRisk)
+trailK      = input.float(2.0, "Трейлинг: отступ, ATR ×", minval = 0.1, step = 0.1, group = gRisk)
+useLot      = input.bool(true, "Считать объём от риска", group = gRisk, tooltip = "Объём = депозит × риск% / дистанция до стопа. Для золота — в унциях, для крипты — в монетах (без учёта плеча и стоимости контракта: проверяйте шаг лота у брокера).")
+depUsd      = input.float(10000, "Депозит, USDT", minval = 0, group = gRisk)
+riskPct     = input.float(1.0, "Риск на сделку, %", minval = 0.01, step = 0.1, group = gRisk)
+lvMode    = input.string("Уровни + EMA200", "Источник уровня", options = ["Только EMA200", "Только уровни", "Уровни + EMA200"], group = gLv)
+lv1       = input.float(0.0, "Уровень 1 (0 = выкл.)", minval = 0.0, step = 0.1, group = gLv)
+lv1n      = input.string("", "   подпись 1", group = gLv)
+lv2       = input.float(0.0, "Уровень 2", minval = 0.0, step = 0.1, group = gLv)
+lv2n      = input.string("", "   подпись 2", group = gLv)
+lv3       = input.float(0.0, "Уровень 3", minval = 0.0, step = 0.1, group = gLv)
+lv3n      = input.string("", "   подпись 3", group = gLv)
+lv4       = input.float(0.0, "Уровень 4", minval = 0.0, step = 0.1, group = gLv)
+lv4n      = input.string("", "   подпись 4", group = gLv)
+lv5       = input.float(0.0, "Уровень 5", minval = 0.0, step = 0.1, group = gLv)
+lv5n      = input.string("", "   подпись 5", group = gLv)
+lvPersist = input.int(6, "Закрепление за уровнем, баров", minval = 1, maxval = 100, group = gLv)
+lvTol     = input.float(0.15, "Допуск теста уровня, ATR", minval = 0.01, step = 0.05, group = gLv)
+lvLook    = input.int(60, "Тест уровня актуален, баров", minval = 1, group = gLv)
+lvDays    = input.int(7, "Длина линий уровней, дней (0 = вся история)", minval = 0, maxval = 1000, group = gLv)
+showLv    = input.bool(true, "Рисовать уровни", group = gLv)
+useAuto   = input.bool(true, "Авто-уровни: хай/лоу дня и недели", group = gLv)
+useIB     = input.bool(false, "Уровни IB (первый час) и overnight", group = gLv, tooltip = "IB 09:30–10:30 и overnight 18:00–09:30 по Нью-Йорку — концепция американских акций и фьючерсов. Для золота, FX и крипты держи выключенным.")
+sweepLen  = input.int(20, "Свип: экстремум за N баров", minval = 3, group = gSMC)
+useFracSweep = input.bool(true, "Свип по фракталу (точнее)", group = gSMC)
+fracL     = input.int(2, "Фрактал: баров слева", minval = 1, maxval = 20, group = gSMC)
+fracR     = input.int(2, "Фрактал: баров справа", minval = 1, maxval = 20, group = gSMC)
+bosLen    = input.int(20, "BOS: структура за N баров", minval = 3, group = gSMC)
+fvgLook   = input.int(30, "FVG актуален, баров", minval = 1, group = gSMC)
+rangeLen  = input.int(30, "Диапазон: окно, баров", minval = 5, group = gSMC)
+rangeMinAtr = input.float(2.0, "Диапазон мин, ATR", minval = 0.0, step = 0.5, group = gSMC)
+rangeMaxAtr = input.float(20.0, "Диапазон макс, ATR", minval = 1.0, step = 1.0, group = gSMC)
+facLook   = input.int(30, "Фактор актуален, баров", minval = 1, group = gSMC)
+needFac   = input.int(2, "Нужно факторов (из 3–4)", minval = 1, maxval = 4, group = gSMC)
+useChoch  = input.bool(true, "Фактор: CHoCH (смена характера)", group = gSMC, tooltip = "O-1: слом структуры ПРОТИВ текущего тренда (по последовательности BOS) — первый сигнал разворота. Свежий CHoCH в сторону сделки засчитывается 4-м фактором. Выкл = работают прежние 3 фактора.")
+showEq    = input.bool(true, "Показывать EQH/EQL (пулы ликвидности)", group = gSMC, tooltip = "O-3: равные хаи/лои — зоны стопов. Пунктирная линия тянется, пока пул не собран (свипнут); после сбора помечается ✓.")
+eqTol     = input.float(0.25, "EQH/EQL: допуск равенства, ATR", minval = 0.01, step = 0.05, group = gSMC)
+eqKeep    = input.int(6, "Сколько пулов хранить", minval = 1, maxval = 30, group = gSMC)
+useEq     = input.bool(false, "Блокировать вход под/над живым пулом", group = gSMC, tooltip = "Лонг запрещён, пока над ценой в пределах радиуса висит несобранный EQH (риск стоп-ханта); шорт — под ценой живой EQL. После свипа пул считается собранным и не мешает.")
+eqNear    = input.float(1.5, "Радиус блокировки, ATR", minval = 0.1, step = 0.1, group = gSMC)
+obShow    = input.bool(true, "Показывать Order Blocks", group = gSMC, tooltip = "O-2: блок заказов — последняя свеча против импульса перед сломом структуры. Бычьи (под ценой) — зоны спроса, медвежьи (над ценой) — предложения. Смягчённый блок (закрытие за противоположной границей) удаляется.")
+obLook    = input.int(10, "OB: поиск свечи-основы, баров", minval = 2, maxval = 50, group = gSMC)
+obKeep    = input.int(6, "Сколько блоков держать", minval = 1, maxval = 20, group = gSMC)
+useOb     = input.bool(false, "Вход только у свежего OB", group = gSMC, tooltip = "Лонг разрешён, если под ценой в пределах радиуса есть несмягчённый бычий OB; шорт — если над ценой медвежий. Выкл = не блокирует.")
+obNear    = input.float(1.5, "Радиус OB, ATR", minval = 0.1, step = 0.1, group = gSMC)
+obTgtOn   = input.bool(false, "Цели по противостоящим OB", group = gSMC, tooltip = "План №2 п.5: если впереди есть несмягчённый Order Block, его ближайший край становится целью — раньше фиксированных R-уровней и при том же фильтре процента и R:R. Выкл = цели только по уровням и свингам.")
+fvgMinAtr = input.float(0.0, "FVG: мин размер, ATR (0 = любой)", minval = 0.0, step = 0.05, group = gSMC, tooltip = "O-6: гэп должен быть больше указанной доли ATR, иначе не считается имбалансом. Влияет на триггер IFVG и фактор FVG. 0 = прежнее поведение.")
+useDisc   = input.bool(false, "Фильтр дисконт/премиум", group = gSMC, tooltip = "O-4: лонг только в нижней половине диапазона (дисконт), шорт — в верхней (премиум). Диапазон — dealing range от последних фрактальных свингов, без них — N-баровое окно. Выключен = не блокирует.")
+useVwap  = input.bool(false, "VWAP сессии: лонг выше / шорт ниже", group = gFltr)
+useStack = input.bool(false, "EMA 9/21/50 выстроены по тренду", group = gFltr)
+useMacd  = input.bool(false, "MACD: гистограмма в сторону сделки", group = gFltr)
+useRsi   = input.bool(false, "RSI: не перекуплен / не перепродан", group = gFltr)
+emaF1    = input.int(9, "EMA фильтра 1", minval = 1, group = gFltr)
+emaF2    = input.int(21, "EMA фильтра 2", minval = 1, group = gFltr)
+emaF3    = input.int(50, "EMA фильтра 3", minval = 1, group = gFltr)
+macdFast = input.int(12, "MACD fast", minval = 1, group = gFltr)
+macdSlow = input.int(26, "MACD slow", minval = 1, group = gFltr)
+macdSigL = input.int(9, "MACD signal", minval = 1, group = gFltr)
+rsiLen   = input.int(14, "RSI длина", minval = 1, group = gFltr)
+rsiOB    = input.int(70, "RSI перекупленность", minval = 50, maxval = 100, group = gFltr)
+rsiOS    = input.int(30, "RSI перепроданность", minval = 0, maxval = 50, group = gFltr)
+useSprd  = input.bool(true, "Спред: бар входа ≥ N × спред", group = gFltr)
+sprTicks = input.float(5.0, "Спред, тиков", minval = 0.1, step = 0.5, group = gFltr, tooltip = "Оценка спреда инструмента в тиках: золото ≈ 3–5, мажоры ≈ 1–2.")
+sprK     = input.int(5, "Бар входа ≥ N × спред", minval = 1, maxval = 50, group = gFltr)
+useRvol   = input.bool(false, "rVol: фильтр объёма часа", group = gFltr, tooltip = "P1-4: объём бара против среднего объёма этого же часа за N дней (EWMA, нормировано на бар). Тихий час = мало участников = хуже входы. Если у символа нет объёма, фильтр сам отключается.")
+rvolMin   = input.float(0.8, "rVol мин", minval = 0.1, step = 0.1, group = gFltr)
+rvolDays  = input.int(5, "rVol: дней в среднем", minval = 1, maxval = 20, group = gFltr)
+useDxy    = input.bool(false, "Межрыночный фильтр: доллар (DXY)", group = gFltr, tooltip = "Для золота доллар — главный драйвер: лонг разрешён, только когда DXY ниже своей EMA (доллар слабеет), шорт — когда выше. Для инструментов, не зависящих от доллара, держите выключенным.")
+dxyTicker = input.string("TVC:DXY", "Тикер доллара", group = gFltr)
+dxyEmaLen = input.int(20, "DXY: EMA, баров", minval = 5, maxval = 200, group = gFltr)
+showTrades = input.bool(true, "Рисовать карточки сделок", group = gTrade)
+keepCards  = input.int(3, "Сколько последних сделок показывать", minval = 1, maxval = 10, group = gTrade)
+modeSoft   = input.bool(true, "Мягкий режим (часть условий — совещательно)", group = gMode)
+softNeed   = input.int(2, "Мягкий: минимум из 3 (+фильтры)", minval = 0, maxval = 4, group = gMode, tooltip = "Совещательные пункты: наклон, диапазон, SMC-факторы и (если включены) доп. фильтры. Цель/RR обязательна всегда.")
+onlyClosed = input.bool(true, "Сигнал только по закрытию бара", group = gMode, tooltip = "Вкл: метка, вход и алерт появляются только после закрытия бара — сигнал не мигает внутри бара. Выкл: сигнал виден сразу, но может исчезнуть до закрытия.")
+showPreview = input.bool(true, "Предварительные сделки (до триггера)", group = gTrade)
+sweepDelay = input.int(1, "Вход не раньше N баров после свипа", minval = 0, maxval = 10, group = gTrg)
+useSess   = input.bool(true, "Только внутри торговых сессий", group = gTrade)
+sessMode  = input.string("Сессии (перевод часов авто)", "Режим сессий", options = ["Сессии (перевод часов авто)", "Одно окно (вручную)"], group = gTrade, tooltip = "«Сессии»: окна задаются по местному биржевому времени Токио / Лондона / Нью-Йорка — переход на летнее/зимнее время применяется автоматически, включая неделю в конце октября, когда США и Европа переводят часы в разные дни. «Одно окно»: прежнее поведение с фиксированным GMT-смещением — часы сами не переводятся.")
+// — сессии по местному биржевому времени: у каждой своя IANA-зона, перевод часов автоматический —
+sAsiaOn   = input.bool(false, "Азия · Токио", group = gTrade, inline = "sA", tooltip = "Токийская сессия. Время — местное токийское (Asia/Tokyo), перевод часов учитывается автоматически. По Минску: 03:00–09:00 круглый год (Токио и Минск без перевода).")
+sAsiaTf   = input.session("0900-1500", "", group = gTrade, inline = "sA")
+sLdnOn    = input.bool(true, "Лондон", group = gTrade, inline = "sL", tooltip = "Европейская сессия. Время — местное лондонское (Europe/London): окно всегда 08:00–17:00 по Лондону. По Минску: зимой 11:00–20:00, летом 10:00–19:00 — перевод автоматический.")
+sLdnTf    = input.session("0800-1700", "", group = gTrade, inline = "sL")
+sNyOn     = input.bool(true, "Нью-Йорк", group = gTrade, inline = "sN", tooltip = "Американская сессия. Время — местное нью-йоркское (America/New_York): окно всегда 09:30–16:00 по Нью-Йорку. По Минску: летом 16:30–23:00, зимой 17:30–00:00 — перевод автоматический.")
+sNyTf     = input.session("0930-1600", "", group = gTrade, inline = "sN")
+sLnoOn    = input.bool(false, "Перекрытие Лдн+НЙ", group = gTrade, inline = "sX", tooltip = "Самое ликвидное окно суток: 13:00–17:00 по Лондону = 08:00–12:00 по Нью-Йорку. По Минску: зимой 16:00–20:00, летом 15:00–19:00.")
+sLnoTf    = input.session("1300-1700", "", group = gTrade, inline = "sX")
+showSessBg = input.bool(true, "Зоны сессий по экстремумам свечей", group = gTrade, tooltip = "Для каждой включённой сессии рисуется бокс от открытия до закрытия: верх = максимум сессии, низ = минимум, подпись = название и высота зоны. Не заливает весь экран.")
+sessZoneKeep = input.int(10, "Сколько последних зон хранить (на сессию)", minval = 1, maxval = 50, group = gTrade)
+showAz    = input.bool(true, "Уровни азиатского диапазона (H/L)", group = gTrade, tooltip = "O-10: после закрытия Азии её хай/лоу рисуются уровнями и тянутся, пока не собраны — ликвидность для Лондона и НЙ.")
+rollOn    = input.bool(true, "Исключать ролловер 16:55–17:05 НЙ", group = gTrade, tooltip = "Спред в эти минуты расширяется — вход идёт по плохой цене. Работает независимо от фильтра сессий; на баровых ТФ исключается бар, попадающий в окно.")
+rollSess  = input.session("1655-1705", "Окно ролловера (НЙ)", group = gTrade)
+kzOn      = input.bool(false, "Только в кильзонах (открытия сессий)", group = gTrade, tooltip = "Вход только в первые часы сессий — там основной импульс дня. Пояс кильзон выбирается ниже: местное время Лдн/НЙ (перевод автоматический) или Минск. Включайте вместе с сессиями: даёт ~5 часов входов в сутки.")
+kzLdnOn   = input.bool(true, "Кильзона Лондон", group = gTrade, inline = "kzL", tooltip = "Окно 08:00–11:00 по Лондону. По Минску: зимой 11:00–14:00, летом 10:00–13:00. В режиме «Минск» вводится прямо по МСК.")
+kzLdnS    = input.session("0800-1100", "", group = gTrade, inline = "kzL")
+kzNyOn    = input.bool(true, "Кильзона Нью-Йорк", group = gTrade, inline = "kzN", tooltip = "Окно 09:30–11:30 по Нью-Йорку. По Минску: летом США 16:30–18:30, зимой 17:30–19:30. В режиме «Минск» вводится прямо по МСК.")
+kzNyS     = input.session("0930-1130", "", group = gTrade, inline = "kzN")
+kzTzMode  = input.string("Местное (Лдн/НЙ)", "Время кильзон", options = ["Местное (Лдн/НЙ)", "Минск (GMT+3)"], group = gTrade, tooltip = "«Местное»: окна кильзон задаются по времени Лондона и Нью-Йорка, перевод часов автоматический. «Минск»: окна задаются по минскому времени (GMT+3, без перевода) — при переходе Лондона/НЙ на летнее/зимнее время окна в МСК съезжают на час, поправьте вручную.")
+kzSb1On   = input.bool(false, "Silver Bullet 1 · 10:00–11:00 НЙ", group = gTrade, inline = "kzS1", tooltip = "O-11, ICT Silver Bullet: 10:00–11:00 по Нью-Йорку — AM-окно высокой вероятности. В режиме «Минск» вводится по МСК: летом 17:00–18:00, зимой 18:00–19:00.")
+kzSb1S    = input.session("1000-1100", "", group = gTrade, inline = "kzS1")
+kzSb2On   = input.bool(false, "Silver Bullet 2 · 14:00–15:00 НЙ", group = gTrade, inline = "kzS2", tooltip = "O-11, ICT Silver Bullet: 14:00–15:00 по Нью-Йорку — PM-окно. В режиме «Минск» вводится по МСК: летом 21:00–22:00, зимой 22:00–23:00.")
+kzSb2S    = input.session("1400-1500", "", group = gTrade, inline = "kzS2")
+newsOn    = input.bool(true, "Блокировать окна новостей", group = gTrade, tooltip = "Тихие окна вокруг типичных релизов: данные 08:30 (CPI, NFP) и решение ФРС 14:00 по Нью-Йорку. Подстройте под свой календарь.")
+newsTz    = input.string("Нью-Йорк", "Часовой пояс новостей", options = ["Нью-Йорк", "Лондон", "График"], group = gTrade)
+n1On      = input.bool(true, "Новость 1 · 08:30", group = gTrade, inline = "n1")
+n1S       = input.session("0828-0834", "", group = gTrade, inline = "n1")
+n2On      = input.bool(true, "Новость 2 · 14:00", group = gTrade, inline = "n2")
+n2S       = input.session("1358-1404", "", group = gTrade, inline = "n2")
+n3On      = input.bool(false, "Новость 3 · 10:00", group = gTrade, inline = "n3")
+n3S       = input.session("0958-1004", "", group = gTrade, inline = "n3")
+useJsonAlert = input.bool(false, "Алерты входа в JSON (вебхуки)", group = gTrade, tooltip = "Вкл: алерт входа — одна JSON-строка (ticker, tf, dir, entry, sl, tp1–tp3, session). Выкл: прежний текст. Выход из сделки всегда приходит строкой CSV: CLOSE,ticker,tf,dir,R,reason.")
+showSessStat = input.bool(true, "Статистика по сессиям и дням недели", group = gTrade, tooltip = "P3-1: в таблице статистики появляются строки по сессиям входа (сделки, сумма R, доля прибыльных) и строка «лучший/худший день недели».")
+pvAlertOn  = input.bool(true, "Алерт «готовится сетап»", group = gTrade, tooltip = "Уведомление при появлении превью-карточки плана — до триггера, можно готовиться заранее. Работает, только если создан алерт на «Any alert() function call». Формат — как у входа (текст или JSON с type=setup).")
+sessIn    = input.session("1630-2300", "Торговое окно (ручной режим)", group = gTrade)
+tzIn      = input.string("GMT+3", "Часовой пояс окна", options = ["GMT+2", "GMT+3", "GMT+4", "UTC", "Exchange", "Минск (GMT+3)"], group = gTrade, tooltip = "Только для режима «Одно окно (вручную)». «Минск (GMT+3)» = Europe/Minsk (без перевода часов). Фиксированные GMT-смещения часы не переводят — для автоматики используйте режим «Сессии».")
+showStats  = input.bool(true, "Таблица статистики", group = gTrade)
+tp1R       = input.float(1.0, "TP1, R", minval = 0.1, step = 0.1, group = gTrade)
+tp2R       = input.float(2.0, "TP2, R", minval = 0.2, step = 0.1, group = gTrade)
+tp3R       = input.float(3.0, "TP3, R", minval = 0.3, step = 0.1, group = gTrade)
+p1Pct      = input.int(40, "Закрыть на TP1, % позиции", minval = 0, maxval = 100, group = gTrade)
+p2Pct      = input.int(30, "Закрыть на TP2, % позиции", minval = 0, maxval = 100, group = gTrade)
+beAfter    = input.int(1, "Перевод в БУ после TP №", minval = 0, maxval = 3, group = gTrade, tooltip = "0 = не переводить в БУ")
+maxBars    = input.int(120, "Закрыть по времени, баров", minval = 5, group = gTrade)
+reEntryBars = input.int(10, "Кулдаун после выхода, баров", minval = 0, maxval = 200, group = gTrade)
+tblPos    = input.string("Верх-право", "Позиция таблицы чек-листа", options = ["Верх-право", "Верх-лево", "Низ-право", "Низ-лево"], group = gTbl)
+showTbl   = input.bool(true, "Показывать чек-лист", group = gTbl)
+showZone  = input.bool(true, "Показывать зону EMA200 старшего ТФ", group = gTbl)
+showLtfE  = input.bool(true, "Показывать EMA рабочего ТФ", group = gTbl)
+showMarks = input.bool(true, "Метки сигналов", group = gTbl)
+lblSizeIn = input.string("Крошечный", "Размер подписей SL/TP и карточек", options = ["Крошечный", "Мелкий", "Обычный"], group = gTbl, tooltip = "По умолчанию «Крошечный»: TP — цветной текст почти без фона, SL — маленький бейдж. Полные цифры (R, %, доли) — в карточке входа, статистике и алертах.")
+tblCompact = input.bool(false, "Компактные таблицы (мобильный)", group = gTbl, tooltip = "P3-3: чек-лист без пояснений (только пункты и ✓/✗), статистика из 5 ключевых строк, диагностика скрыта — для телефона.")
+showTL    = input.bool(true, "Наклонные линии по экстремумам", group = gTbl)
+pivL      = input.int(5, "Пивот: баров слева", minval = 1, maxval = 100, group = gTbl)
+pivR      = input.int(5, "Пивот: баров справа", minval = 1, maxval = 100, group = gTbl)
+tlCount   = input.int(3, "Сколько линий на сторону", minval = 1, maxval = 20, group = gTbl)
+tlExtend  = input.bool(true, "Продлевать вправо", group = gTbl)
+showEma50 = input.bool(false, "Показывать EMA 50", group = gTbl)
+showHtfEma = input.bool(true, "Показывать EMA200 контекста", group = gTbl)
+showDEma = input.bool(false, "Показывать EMA200 дневную", group = gTbl)
+showDiag  = input.bool(true, "Таблица диагностики (частота условий)", group = gTbl)
+theme     = input.string("Графит + золото", "Тема оформления", options = ["Графит + золото", "Тёмный минимал", "Светлый премиум"], group = gTbl)
+diagLen   = input.int(500, "Окно диагностики, баров", minval = 50, maxval = 5000, group = gTbl)
+tlMode    = input.string("Канал", "Тип линий по экстремумам", options = ["Канал", "Веер"], group = gTbl)
+// UDT уровня: один объект на уровень, поля мутируются на каждом баре.
+// kind: 1 = сопротивление, -1 = поддержка, 0 = оба; prio: 10 ручной, 5 PD/PW, 3 ON/IB
+type Lvl
+    string nm
+    float  px
+    bool   act
+    int    kind
+    int    prio
+    int    touchS
+    int    rejectS
+    int    touchL
+    int    rejectL
+// доли TP: защита от суммы > 100% (иначе статистика начисляет невозможные R)
+int p1PctSafe = int(math.max(0.0, math.min(100.0, p1Pct)))
+int p2PctSafe = int(math.max(0.0, math.min(100.0 - p1PctSafe, p2Pct)))
+int p3PctSafe = 100 - p1PctSafe - p2PctSafe
+float p1Frac = p1PctSafe / 100.0
+float p2Frac = p2PctSafe / 100.0
+// ──────────────────────── РЕЕСТР УРОВНЕЙ ────────────────────────
+// Уровни живут в одном массиве объектов: при смене дня/недели/сессии
+// сбрасываются только касания этого уровня, а не вся история.
+f_initLV() =>
+    array<Lvl> res = array.new<Lvl>()
+    array.push(res, Lvl.new("", 0.0, false, 0, 10, -1, -1, -1, -1))
+    array.push(res, Lvl.new("", 0.0, false, 0, 10, -1, -1, -1, -1))
+    array.push(res, Lvl.new("", 0.0, false, 0, 10, -1, -1, -1, -1))
+    array.push(res, Lvl.new("", 0.0, false, 0, 10, -1, -1, -1, -1))
+    array.push(res, Lvl.new("", 0.0, false, 0, 10, -1, -1, -1, -1))
+    array.push(res, Lvl.new("", 0.0, false, 1, 5, -1, -1, -1, -1))
+    array.push(res, Lvl.new("", 0.0, false, -1, 5, -1, -1, -1, -1))
+    array.push(res, Lvl.new("", 0.0, false, 1, 5, -1, -1, -1, -1))
+    array.push(res, Lvl.new("", 0.0, false, -1, 5, -1, -1, -1, -1))
+    array.push(res, Lvl.new("", 0.0, false, 1, 3, -1, -1, -1, -1))
+    array.push(res, Lvl.new("", 0.0, false, -1, 3, -1, -1, -1, -1))
+    array.push(res, Lvl.new("", 0.0, false, 1, 3, -1, -1, -1, -1))
+    array.push(res, Lvl.new("", 0.0, false, -1, 3, -1, -1, -1, -1))
+    res
+var array<Lvl> LV = f_initLV()
+// ──────────────────────── ДАННЫЕ СТАРШЕГО ТФ ────────────────────────
+float htfEma     = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfEmaLen)[1], lookahead = barmerge.lookahead_on)
+float htfEmaPast = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfEmaLen)[slopeLen + 1], lookahead = barmerge.lookahead_on)
+float htfAtr     = request.security(syminfo.tickerid, htfTf, ta.atr(14)[1], lookahead = barmerge.lookahead_on)
+float htfClose   = request.security(syminfo.tickerid, htfTf, close[1], lookahead = barmerge.lookahead_on)
+// EMA200 и ATR на ТФ касания (по умолчанию 1H)
+float emaTouch = request.security(syminfo.tickerid, touchTf, ta.ema(close, htfEmaLen)[1], lookahead = barmerge.lookahead_on)
+float atrTouch = request.security(syminfo.tickerid, touchTf, ta.atr(14)[1], lookahead = barmerge.lookahead_on)
+// дневной контекст и дневной ход
+float atrD = request.security(syminfo.tickerid, "D", ta.atr(14)[1], lookahead = barmerge.lookahead_on)
+float dEma = request.security(syminfo.tickerid, "D", ta.ema(close, htfEmaLen)[1], lookahead = barmerge.lookahead_on)
+// План №2 п.4: межрыночный контекст — доллар (закрытый бар, без перерисовки)
+float dxyClose = request.security(dxyTicker, timeframe.period, close[1], lookahead = barmerge.lookahead_on)
+float dxyEma   = request.security(dxyTicker, timeframe.period, ta.ema(close, dxyEmaLen)[1], lookahead = barmerge.lookahead_on)
+// ──────────────────────── ДАННЫЕ РАБОЧЕГО ТФ (авто) ────────────────────────
+string ltfTf  = ltfTfRaw == "" ? timeframe.period : ltfTfRaw
+float  tfSec  = timeframe.in_seconds()
+int    touchBars = int(math.max(1.0, math.round(memHours * 3600.0 / tfSec)))
+bool   tfWarn = htfTf != "" and timeframe.in_seconds(htfTf) <= timeframe.in_seconds(timeframe.period)
+bool   touchWarn = touchTf != "" and timeframe.in_seconds(touchTf) < timeframe.in_seconds(timeframe.period)
+float emaLtfSec = request.security(syminfo.tickerid, ltfTf, ta.ema(close, ltfEmaLen)[1], lookahead = barmerge.lookahead_on)
+float emaLtfNat = ta.ema(close, ltfEmaLen)
+bool   ltfIsChart = timeframe.in_seconds(ltfTf) == timeframe.in_seconds()
+float  emaLtf    = ltfIsChart ? emaLtfNat : emaLtfSec
+float atrChart  = ta.atr(14)
+float ema50v    = ta.ema(close, 50)
+// ТФ-фолбэк: если запрошенный старший ТФ не выше графика, считаем EMA на графике.
+// Идея из JustExecution/HTF_indicator: используем только подтверждённые значения.
+float emaCtxNative     = ta.ema(close, htfEmaLen)
+float emaCtxNativePrev = emaCtxNative[1]
+float emaCtxNativePast = ta.ema(close, htfEmaLen)[slopeLen + 1]
+float htfEmaEff        = (tfWarn and tfFallback) ? emaCtxNativePrev : htfEma
+float htfEmaPastEff    = (tfWarn and tfFallback) ? emaCtxNativePast : htfEmaPast
+float htfAtrEff        = (tfWarn and tfFallback) ? atrChart : htfAtr
+float htfCloseEff      = (tfWarn and tfFallback) ? close[1] : htfClose
+float emaTouchEff      = (touchWarn and tfFallback) ? emaLtf : emaTouch
+float atrTouchEff      = (touchWarn and tfFallback) ? atrChart : atrTouch
+// ──────────────────────── 2. КОНТЕКСТ + 4. НАКЛОН ────────────────────────
+float slopePct = (na(htfEmaEff) or na(htfEmaPastEff) or htfEmaPastEff == 0.0) ? na : (htfEmaEff - htfEmaPastEff) / htfEmaPastEff * 100.0
+float slopeAtrTotal = (na(htfEmaEff) or na(htfEmaPastEff) or na(htfAtrEff) or htfAtrEff == 0.0) ? na : (htfEmaEff - htfEmaPastEff) / htfAtrEff
+float slopeVal = nz(slopeAtrTotal / slopeLen, 0.0)   // ATR на бар
+bool ctxL    = not na(htfEmaEff) and not na(htfCloseEff) and htfCloseEff > htfEmaEff
+bool ctxS    = not na(htfEmaEff) and not na(htfCloseEff) and htfCloseEff < htfEmaEff
+bool slopeL  = slopeVal >= minSlope
+bool slopeS  = slopeVal <= -minSlope
+bool flatMkt = math.abs(slopeVal) < minSlope
+// ──────────────────────── 3. КАСАНИЕ 200 СТАРШЕГО ТФ ────────────────────────
+float zoneHalf = nz(atrTouchEff, 0.0) * tolHtf
+bool  touchL   = not na(emaTouchEff) and low <= emaTouchEff + zoneHalf and close >= emaTouchEff - zoneHalf
+bool  touchS   = not na(emaTouchEff) and high >= emaTouchEff - zoneHalf and close <= emaTouchEff + zoneHalf
+int   barsTouchL = nz(ta.barssince(touchL), 999999)
+int   barsTouchS = nz(ta.barssince(touchS), 999999)
+bool  touchLRecent = barsTouchL <= touchBars
+bool  touchSRecent = barsTouchS <= touchBars
+// ──────────────────────── 9. НЕТ БОЛТАНКИ: ER + диапазон в ATR ────────────────────────
+float erNum = math.abs(close - close[chopLen])
+float erDen = math.sum(math.abs(close - close[1]), chopLen)
+float erVal = erDen > 0.0 ? erNum / erDen : 0.0
+bool  noChop = erVal >= erMin
+// ──────────────────────── 5. ТЕСТ EMA200: та же линия, что и касание ────────────────────────
+float testZone = nz(atrTouchEff, 0.0) * tolLtf
+bool  emaTestL = not na(emaTouchEff) and low <= emaTouchEff + testZone and close > emaTouchEff
+bool  emaTestS = not na(emaTouchEff) and high >= emaTouchEff - testZone and close < emaTouchEff
+int   barsEmaTestL = nz(ta.barssince(emaTestL), 999999)
+int   barsEmaTestS = nz(ta.barssince(emaTestS), 999999)
+bool  emaTestRecentL = barsEmaTestL <= testLook
+bool  emaTestRecentS = barsEmaTestS <= testLook
+// ──────────────────────── УРОВНИ: РЕЕСТР + СОСТОЯНИЕ ────────────────────────
+// Один реестр для ручных уровней, PDH/PDL, PWH/PWL, ONH/ONL, IBH/IBL.
+// Идеи из аналогов: RTH Levels (freeze-at-close для PD/ON/IB) и Prior Levels
+// (единый список уровней вместо десятков отдельных серий). При смене цены
+// уровня касания и отбои сбрасываются — иначе вчерашний PDH засчитывался бы
+// как сегодняшний.
+bool emaSrcOn = lvMode != "Только уровни"
+bool lvSrcOn  = lvMode != "Только EMA200"
+// авто-уровни: экстремумы прошлого дня и недели (обновляются сами, не устаревают)
+[autoDHi, autoDLo] = request.security(syminfo.tickerid, "D", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+[autoWHi, autoWLo] = request.security(syminfo.tickerid, "W", [high[1], low[1]], lookahead = barmerge.lookahead_on)
+// Initial Balance (первый час 9:30–10:30 NY) и overnight-диапазон (18:00–09:30 NY)
+bool inON = not na(time(timeframe.period, "1800-0930", "America/New_York"))
+bool inIB = not na(time(timeframe.period, "0930-1030", "America/New_York"))
+var float onH = na
+var float onL = na
+var float ibH = na
+var float ibL = na
+if inON and not inON[1]
+    onH := high
+    onL := low
+else if inON
+    onH := math.max(nz(onH, high), high)
+    onL := math.min(nz(onL, low), low)
+if inIB and not inIB[1]
+    ibH := high
+    ibL := low
+else if inIB
+    ibH := math.max(nz(ibH, high), high)
+    ibL := math.min(nz(ibL, low), low)
+float lvTolAbs = nz(atrChart, 0.0) * lvTol
+float hiCl = ta.highest(close, lvPersist)
+float loCl = ta.lowest(close, lvPersist)
+f_lvName(string nm, float px) =>
+    nm == "" ? str.tostring(px, format.mintick) : nm
+// Обновление уровня: при смене цены (новый день/неделя/сессия) сбрасываем
+// только касания этого уровня. Идентичность уровня — его цена.
+f_updLvl(array<Lvl> arr, int idx, string nm, float px, bool act, int kind, int prio) =>
+    Lvl l = array.get(arr, idx)
+    if act and (not l.act or na(l.px) or px != l.px)
+        l.touchS  := -1
+        l.rejectS := -1
+        l.touchL  := -1
+        l.rejectL := -1
+    l.nm   := nm
+    l.px   := px
+    l.act  := act
+    l.kind := kind
+    l.prio := prio
+    true
+// цены и активность
+f_updLvl(LV, 0, f_lvName(lv1n, lv1), lv1, lv1 > 0.0 and lvSrcOn, 0, 10)
+f_updLvl(LV, 1, f_lvName(lv2n, lv2), lv2, lv2 > 0.0 and lvSrcOn, 0, 10)
+f_updLvl(LV, 2, f_lvName(lv3n, lv3), lv3, lv3 > 0.0 and lvSrcOn, 0, 10)
+f_updLvl(LV, 3, f_lvName(lv4n, lv4), lv4, lv4 > 0.0 and lvSrcOn, 0, 10)
+f_updLvl(LV, 4, f_lvName(lv5n, lv5), lv5, lv5 > 0.0 and lvSrcOn, 0, 10)
+f_updLvl(LV, 5, "PDH", autoDHi, useAuto and lvSrcOn and not na(autoDHi), 1, 5)
+f_updLvl(LV, 6, "PDL", autoDLo, useAuto and lvSrcOn and not na(autoDLo), -1, 5)
+f_updLvl(LV, 7, "PWH", autoWHi, useAuto and lvSrcOn and not na(autoWHi), 1, 5)
+f_updLvl(LV, 8, "PWL", autoWLo, useAuto and lvSrcOn and not na(autoWLo), -1, 5)
+f_updLvl(LV, 9, "ONH", onH, useIB and lvSrcOn and not na(onH) and not inON, 1, 3)
+f_updLvl(LV, 10, "ONL", onL, useIB and lvSrcOn and not na(onL) and not inON, -1, 3)
+f_updLvl(LV, 11, "IBH", ibH, useIB and lvSrcOn and not na(ibH) and not inIB, 1, 3)
+f_updLvl(LV, 12, "IBL", ibL, useIB and lvSrcOn and not na(ibL) and not inIB, -1, 3)
+// касания и отбои: пишем один раз при событии, бар запоминаем в реестре
+// (на незакрытом баре не пишем, чтобы состояние не мигало внутри бара)
+bool regOk = not onlyClosed or barstate.isconfirmed
+for i = 0 to array.size(LV) - 1
+    Lvl l = array.get(LV, i)
+    if l.act and not na(l.px) and regOk
+        bool tS = l.kind >= 0 and high >= l.px - lvTolAbs
+        bool rS = tS and close < l.px
+        bool tL = l.kind <= 0 and low <= l.px + lvTolAbs
+        bool rL = tL and close > l.px
+        if tS
+            l.touchS := bar_index
+        if rS
+            l.rejectS := bar_index
+        if tL
+            l.touchL := bar_index
+        if rL
+            l.rejectL := bar_index
+// ближайшее касание/отбой + отдельно «сетап одного уровня»
+int bestTouchS = 999999
+int bestRejS   = 999999
+int bestTouchL = 999999
+int bestRejL   = 999999
+float lvTouchPriceS = na
+float lvTouchPriceL = na
+float lvPriceS = na
+float lvPriceL = na
+string lvTouchNameS = ""
+string lvTouchNameL = ""
+string lvNameS = ""
+string lvNameL = ""
+float lvSetupPriceS = na
+float lvSetupPriceL = na
+string lvSetupNameS = ""
+string lvSetupNameL = ""
+int lvSetupAgoS = 999999
+int lvSetupAgoL = 999999
+int lvSetupTouchAgoS = 999999
+int lvSetupTouchAgoL = 999999
+for i = 0 to array.size(LV) - 1
+    Lvl l = array.get(LV, i)
+    if l.act and not na(l.px)
+        if l.kind >= 0 and hiCl < l.px
+            bool tOkS = l.touchS >= 0 and bar_index - l.touchS <= lvLook
+            bool rOkS = l.rejectS >= 0 and bar_index - l.rejectS <= lvLook
+            if tOkS and bar_index - l.touchS < bestTouchS
+                bestTouchS := bar_index - l.touchS
+                lvTouchPriceS := l.px
+                lvTouchNameS := l.nm
+            if rOkS and bar_index - l.rejectS < bestRejS
+                bestRejS := bar_index - l.rejectS
+                lvPriceS := l.px
+                lvNameS := l.nm
+            if tOkS and rOkS and bar_index - l.rejectS < lvSetupAgoS
+                lvSetupAgoS := bar_index - l.rejectS
+                lvSetupTouchAgoS := bar_index - l.touchS
+                lvSetupPriceS := l.px
+                lvSetupNameS := l.nm
+        if l.kind <= 0 and loCl > l.px
+            bool tOkL = l.touchL >= 0 and bar_index - l.touchL <= lvLook
+            bool rOkL = l.rejectL >= 0 and bar_index - l.rejectL <= lvLook
+            if tOkL and bar_index - l.touchL < bestTouchL
+                bestTouchL := bar_index - l.touchL
+                lvTouchPriceL := l.px
+                lvTouchNameL := l.nm
+            if rOkL and bar_index - l.rejectL < bestRejL
+                bestRejL := bar_index - l.rejectL
+                lvPriceL := l.px
+                lvNameL := l.nm
+            if tOkL and rOkL and bar_index - l.rejectL < lvSetupAgoL
+                lvSetupAgoL := bar_index - l.rejectL
+                lvSetupTouchAgoL := bar_index - l.touchL
+                lvSetupPriceL := l.px
+                lvSetupNameL := l.nm
+bool lvTouchS = bestTouchS <= lvLook
+bool lvTestS  = bestRejS <= lvLook
+bool lvTouchL = bestTouchL <= lvLook
+bool lvTestL  = bestRejL <= lvLook
+int lvTouchAgoS = lvTouchS ? bestTouchS : 999999
+int lvTouchAgoL = lvTouchL ? bestTouchL : 999999
+int lvAgoS = lvTestS ? bestRejS : 999999
+int lvAgoL = lvTestL ? bestRejL : 999999
+// если у какого-то уровня есть и касание, и отбой — таблица и ref показывают именно его
+bool lvSetupOkS = not na(lvSetupPriceS)
+bool lvSetupOkL = not na(lvSetupPriceL)
+if lvSetupOkS
+    lvPriceS := lvSetupPriceS
+    lvNameS := lvSetupNameS
+    lvAgoS := lvSetupAgoS
+    lvTouchPriceS := lvSetupPriceS
+    lvTouchNameS := lvSetupNameS
+    lvTouchAgoS := lvSetupTouchAgoS
+if lvSetupOkL
+    lvPriceL := lvSetupPriceL
+    lvNameL := lvSetupNameL
+    lvAgoL := lvSetupAgoL
+    lvTouchPriceL := lvSetupPriceL
+    lvTouchNameL := lvSetupNameL
+    lvTouchAgoL := lvSetupTouchAgoL
+// ── СЕТАП: касание и тест одного уровня/одной EMA ──
+// Уровень: у одного уровня есть и касание, и отбой (lvSetupOk).
+// EMA: касание и тест — на одной и той же линии emaTouchEff.
+bool emaSetupL = emaSrcOn and touchLRecent and emaTestRecentL
+bool emaSetupS = emaSrcOn and touchSRecent and emaTestRecentS
+bool useLvL = lvSrcOn and lvSetupOkL and (not emaSetupL or lvAgoL <= barsEmaTestL)
+bool useLvS = lvSrcOn and lvSetupOkS and (not emaSetupS or lvAgoS <= barsEmaTestS)
+bool touchOkL = useLvL ? lvTouchL : (emaSetupL ? touchLRecent : false)
+bool touchOkS = useLvS ? lvTouchS : (emaSetupS ? touchSRecent : false)
+bool testOkL  = useLvL ? lvTestL  : (emaSetupL ? emaTestRecentL : false)
+bool testOkS  = useLvS ? lvTestS  : (emaSetupS ? emaTestRecentS : false)
+// опорная цена выбранного сетапа: уровень или та же EMA
+float refL = useLvL ? lvPriceL : emaTouchEff
+float refS = useLvS ? lvPriceS : emaTouchEff
+// ──────────────────────── 7. РИСК В КОРИДОРЕ ────────────────────────
+// свип (манипуляция): прокол прежнего экстремума и возврат за него
+// по фракталу — структурная точка, а не просто N-баровый экстремум
+float pivHiV = ta.pivothigh(high, fracL, fracR)
+float pivLoV = ta.pivotlow(low, fracL, fracR)
+bool  pivHiNew = not na(pivHiV)
+bool  pivLoNew = not na(pivLoV)
+float fracHi = ta.valuewhen(pivHiNew, pivHiV, 0)
+float fracLo = ta.valuewhen(pivLoNew, pivLoV, 0)
+var int fracHiBar = na
+var int fracLoBar = na
+if pivHiNew
+    fracHiBar := bar_index - fracR
+if pivLoNew
+    fracLoBar := bar_index - fracR
+bool fracFreshL = not na(fracLo) and not na(fracLoBar) and bar_index - fracLoBar <= sweepLen
+bool fracFreshS = not na(fracHi) and not na(fracHiBar) and bar_index - fracHiBar <= sweepLen
+float sweepRefL = ta.lowest(low, sweepLen)[1]
+float sweepRefS = ta.highest(high, sweepLen)[1]
+bool  sweepLraw = low < sweepRefL and close > sweepRefL
+bool  sweepSraw = high > sweepRefS and close < sweepRefS
+bool  sweepLfr = not na(fracLo) and low < fracLo and close > fracLo
+bool  sweepSfr = not na(fracHi) and high > fracHi and close < fracHi
+bool  sweepL = (useFracSweep and fracFreshL) ? sweepLfr : sweepLraw
+bool  sweepS = (useFracSweep and fracFreshS) ? sweepSfr : sweepSraw
+int   sinceSweepL = nz(ta.barssince(sweepL), 999999)
+int   sinceSweepS = nz(ta.barssince(sweepS), 999999)
+float swingBaseL = ta.lowest(low, swingLen)
+float swingBaseS = ta.highest(high, swingLen)
+float manipLoS = ta.valuewhen(sweepL, low, 0)
+float manipHiS = ta.valuewhen(sweepS, high, 0)
+int   manipAgoL = nz(ta.barssince(sweepL), 999999)
+int   manipAgoS = nz(ta.barssince(sweepS), 999999)
+bool  useManipL = stopMode == "За манипуляцией" and manipAgoL <= manipLook and not na(manipLoS) and manipLoS < close
+bool  useManipS = stopMode == "За манипуляцией" and manipAgoS <= manipLook and not na(manipHiS) and manipHiS > close
+float stopBufAbs = nz(atrChart, 0.0) * stopBuf
+float stopL = (useManipL ? manipLoS : swingBaseL) - stopBufAbs
+float stopS = (useManipS ? manipHiS : swingBaseS) + stopBufAbs
+float riskL = (close == 0.0) ? na : (close - stopL) / close * 100.0
+float riskS = (close == 0.0) ? na : (stopS - close) / close * 100.0
+float riskAtrL = (na(atrChart) or atrChart == 0.0) ? na : (close - stopL) / atrChart
+float riskAtrS = (na(atrChart) or atrChart == 0.0) ? na : (stopS - close) / atrChart
+bool  riskOkL = riskAtrMode ? (not na(riskAtrL) and riskAtrL >= riskMinAtr and riskAtrL <= riskMaxAtr) : (not na(riskL) and riskL >= riskMin and riskL <= riskMax)
+bool  riskOkS = riskAtrMode ? (not na(riskAtrS) and riskAtrS >= riskMinAtr and riskAtrS <= riskMaxAtr) : (not na(riskS) and riskS >= riskMin and riskS <= riskMax)
+// ──────────────────────── 6. ТРИГГЕР ────────────────────────
+float rng      = high - low
+float bodyAbs  = math.abs(close - open)
+float refBody  = math.max(bodyAbs, syminfo.mintick)
+float lowerW   = math.min(open, close) - low
+float upperW   = high - math.max(open, close)
+bool  bigEnough = rng >= atrChart * minRangeK
+bool pinL = usePin and lowerW >= pinMult * refBody and close > (high + low) / 2.0
+bool pinS = usePin and upperW >= pinMult * refBody and close < (high + low) / 2.0
+bool engL = useEngulf and close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
+bool engS = useEngulf and close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
+float microHi = ta.highest(high, trigBosLen)[1]
+float microLo = ta.lowest(low, trigBosLen)[1]
+bool micL = useMicro and close > microHi
+bool micS = useMicro and close < microLo
+// IFVG: инверсия имбаланса — возраст считаем от инверсии, а не от формирования
+bool bullFvgNow = low > high[2] and (low - high[2]) >= fvgMinAtr * nz(atrChart, 0.0)
+bool bearFvgNow = high < low[2] and (low[2] - high) >= fvgMinAtr * nz(atrChart, 0.0)
+float fvgBotS = ta.valuewhen(bullFvgNow, high[2], 0)
+float fvgTopL = ta.valuewhen(bearFvgNow, low[2], 0)
+float fvgTopBull = ta.valuewhen(bullFvgNow, low, 0)
+float fvgBotBear = ta.valuewhen(bearFvgNow, high, 0)
+var int invBarS = na
+var int invBarL = na
+if bullFvgNow
+    invBarS := na
+if bearFvgNow
+    invBarL := na
+// инвалидация инверсии: цена вернулась выше/ниже всего гэпа
+if not na(fvgTopBull) and close > fvgTopBull
+    invBarS := na
+if not na(fvgBotBear) and close < fvgBotBear
+    invBarL := na
+bool invCrossS = not na(fvgBotS) and close < fvgBotS and close[1] >= fvgBotS
+bool invCrossL = not na(fvgTopL) and close > fvgTopL and close[1] <= fvgTopL
+if invCrossS
+    invBarS := bar_index
+if invCrossL
+    invBarL := bar_index
+int invAgoS = na(invBarS) ? 999999 : bar_index - invBarS
+int invAgoL = na(invBarL) ? 999999 : bar_index - invBarL
+float ifvgTolAbs = nz(atrChart, 0.0) * ifvgTol
+bool  invS = useIfvg and not na(fvgBotS) and invAgoS <= ifvgLook and close < fvgBotS and high >= fvgBotS - ifvgTolAbs
+bool  invL = useIfvg and not na(fvgTopL) and invAgoL <= ifvgLook and close > fvgTopL and low <= fvgTopL + ifvgTolAbs
+// reclaim после свипа: паттерн может сработать ниже refL, если цена вернулась за свипнутый экстремум
+bool reclaimL = sinceSweepL <= trigLook and not na(manipLoS) and close > manipLoS
+bool reclaimS = sinceSweepS <= trigLook and not na(manipHiS) and close < manipHiS
+// P1-5: сила триггера — пин 1 · поглощение 2 · IFVG 3 · BOS 4 (порог настраивается)
+int powTrigL = micL ? 4 : invL ? 3 : (engL and bigEnough) ? 2 : (pinL and bigEnough) ? 1 : 0
+int powTrigS = micS ? 4 : invS ? 3 : (engS and bigEnough) ? 2 : (pinS and bigEnough) ? 1 : 0
+bool patL = powTrigL > 0 and powTrigL >= minTrigPow and (close > refL or reclaimL)
+bool patS = powTrigS > 0 and powTrigS >= minTrigPow and (close < refS or reclaimS)
+int  barsTrigL = nz(ta.barssince(patL), 999999)
+int  barsTrigS = nz(ta.barssince(patS), 999999)
+bool trigL = barsTrigL <= trigLook
+bool trigS = barsTrigS <= trigLook
+// ──────────────────────── ПУЛЫ ЛИКВИДНОСТИ (EQH/EQL) ────────────────────────
+// Пулы равных хаёв/лоёв — магниты ликвидности и зоны стоп-хантов; свип помечает ✓.
+// перебираем активные уровни + swing и берём ближайшую цель, прошедшую фильтры.
+// ──────────────────────── O-3: EQH/EQL — ПУЛЫ ЛИКВИДНОСТИ ────────────────────────
+// Равные хаи/лои (два пивота в пределах допуска) — скопление стопов.
+// Линия тянется, пока пул не собран; после свипа помечается ✓ и замирает.
+color colPool = #C9A66B
+float eqTolAtr = nz(atrChart, 0.0) * eqTol
+var float eqhPrev = na
+var float eqhLvl  = na
+var bool  eqhAlive = false
+var line  eqhLn = na
+var label eqhLb = na
+var array<line>  eqLnA = array.new_line()
+var array<label> eqLbA = array.new_label()
+if pivHiNew
+    bool eqHitHi = not na(eqhPrev) and math.abs(pivHiV - eqhPrev) <= eqTolAtr
+    if eqHitHi and showEq
+        if not na(eqhLn)
+            array.push(eqLnA, eqhLn)
+            array.push(eqLbA, eqhLb)
+            if array.size(eqLnA) > eqKeep
+                line.delete(array.shift(eqLnA))
+                label.delete(array.shift(eqLbA))
+        eqhLvl := math.max(pivHiV, eqhPrev)
+        eqhAlive := true
+        eqhLn := line.new(bar_index - fracR, eqhLvl, bar_index, eqhLvl, color = color.new(colPool, 15), width = 1, style = line.style_dotted)
+        eqhLb := label.new(bar_index, eqhLvl, "EQH", style = label.style_label_down, color = color.new(colPool, 55), textcolor = color.white, size = size.tiny)
+    eqhPrev := pivHiV
+bool eqhSwept = eqhAlive and high > eqhLvl
+if eqhSwept
+    eqhAlive := false
+    if not na(eqhLb)
+        label.set_text(eqhLb, "EQH ✓")
+if showEq and eqhAlive and not na(eqhLn)
+    line.set_x2(eqhLn, bar_index)
+    label.set_x(eqhLb, bar_index)
+var float eqlPrev = na
+var float eqlLvl  = na
+var bool  eqlAlive = false
+var line  eqlLn = na
+var label eqlLb = na
+var array<line>  eqLnB = array.new_line()
+var array<label> eqLbB = array.new_label()
+if pivLoNew
+    bool eqHitLo = not na(eqlPrev) and math.abs(pivLoV - eqlPrev) <= eqTolAtr
+    if eqHitLo and showEq
+        if not na(eqlLn)
+            array.push(eqLnB, eqlLn)
+            array.push(eqLbB, eqlLb)
+            if array.size(eqLnB) > eqKeep
+                line.delete(array.shift(eqLnB))
+                label.delete(array.shift(eqLbB))
+        eqlLvl := math.min(pivLoV, eqlPrev)
+        eqlAlive := true
+        eqlLn := line.new(bar_index - fracR, eqlLvl, bar_index, eqlLvl, color = color.new(colPool, 15), width = 1, style = line.style_dotted)
+        eqlLb := label.new(bar_index, eqlLvl, "EQL", style = label.style_label_up, color = color.new(colPool, 55), textcolor = color.white, size = size.tiny)
+    eqlPrev := pivLoV
+bool eqlSwept = eqlAlive and low < eqlLvl
+if eqlSwept
+    eqlAlive := false
+    if not na(eqlLb)
+        label.set_text(eqlLb, "EQL ✓")
+if showEq and eqlAlive and not na(eqlLn)
+    line.set_x2(eqlLn, bar_index)
+    label.set_x(eqlLb, bar_index)
+// опциональный фильтр: не стоять под несобранным пулом
+bool eqOkLraw = not useEq or not (eqhAlive and close < eqhLvl and eqhLvl - close <= eqNear * nz(atrChart, 0.0))
+bool eqOkSraw = not useEq or not (eqlAlive and close > eqlLvl and close - eqlLvl <= eqNear * nz(atrChart, 0.0))
+
+// ──────────────────────── 10. ФАКТОРЫ SMC ────────────────────────
+bool  fSweepL = nz(ta.barssince(sweepL), 999999) <= facLook
+bool  fSweepS = nz(ta.barssince(sweepS), 999999) <= facLook
+// BOS: подтверждённый swing + N-баровый экстремум
+float bosRefL = not na(fracHi) ? math.max(fracHi, ta.highest(high, bosLen)[1]) : ta.highest(high, bosLen)[1]
+float bosRefS = not na(fracLo) ? math.min(fracLo, ta.lowest(low, bosLen)[1]) : ta.lowest(low, bosLen)[1]
+bool  bosL = close > bosRefL
+bool  bosS = close < bosRefS
+bool  fBosL = nz(ta.barssince(bosL), 999999) <= facLook
+bool  fBosS = nz(ta.barssince(bosS), 999999) <= facLook
+// O-1 CHoCH: тренд по последовательности BOS; слом против тренда = смена характера
+var int mktTrend = 0
+bool chochUpEvt = false
+bool chochDnEvt = false
+if bosL
+    chochUpEvt := mktTrend == -1
+    mktTrend := 1
+if bosS
+    chochDnEvt := mktTrend == 1
+    mktTrend := -1
+bool  fChokL = useChoch and nz(ta.barssince(chochUpEvt), 999999) <= facLook
+bool  fChokS = useChoch and nz(ta.barssince(chochDnEvt), 999999) <= facLook
+// ──────────────────────── O-2: ORDER BLOCKS ────────────────────────
+// Блок заказов: последняя свеча против импульса перед сломом структуры.
+// Бычий OB (зона спроса) — медвежья свеча перед bosL; медвежий — бычья перед bosS.
+// Закрытие за противоположной границей = блок смягчён и удаляется (стиль LuxAlgo).
+color colObBull = #2E9E8F
+color colObBear = #D0544A
+var array<int>   obDir  = array.new_int()
+var array<float> obTop  = array.new_float()
+var array<float> obBot  = array.new_float()
+var array<box>   obBx   = array.new_box()
+bool obBurstL = bosL and not bosL[1]
+bool obBurstS = bosS and not bosS[1]
+if obBurstL and obShow
+    float obFT = na
+    float obFB = na
+    int   obFI = na
+    for i = 1 to obLook
+        if close[i] < open[i]
+            obFT := high[i]
+            obFB := low[i]
+            obFI := bar_index - i
+            break
+    if not na(obFT)
+        array.push(obDir, 1)
+        array.push(obTop, obFT)
+        array.push(obBot, obFB)
+        array.push(obBx, box.new(obFI, obFT, bar_index, obFB, border_color = color.new(colObBull, 30), bgcolor = color.new(colObBull, 87), border_width = 1))
+if obBurstS and obShow
+    float obFT = na
+    float obFB = na
+    int   obFI = na
+    for i = 1 to obLook
+        if close[i] > open[i]
+            obFT := high[i]
+            obFB := low[i]
+            obFI := bar_index - i
+            break
+    if not na(obFT)
+        array.push(obDir, -1)
+        array.push(obTop, obFT)
+        array.push(obBot, obFB)
+        array.push(obBx, box.new(obFI, obFT, bar_index, obFB, border_color = color.new(colObBear, 30), bgcolor = color.new(colObBear, 87), border_width = 1))
+if array.size(obDir) > obKeep
+    box.delete(array.get(obBx, 0))
+    array.remove(obDir, 0)
+    array.remove(obTop, 0)
+    array.remove(obBot, 0)
+    array.remove(obBx, 0)
+if array.size(obDir) > 0
+    for i = array.size(obDir) - 1 to 0
+        int od = array.get(obDir, i)
+        float otp = array.get(obTop, i)
+        float obt = array.get(obBot, i)
+        bool obMit = od == 1 ? close < obt : close > otp
+        if obMit
+            box.delete(array.get(obBx, i))
+            array.remove(obDir, i)
+            array.remove(obTop, i)
+            array.remove(obBot, i)
+            array.remove(obBx, i)
+        else
+            box.set_right(array.get(obBx, i), bar_index)
+// FVG: последний гэп + близость цены (не просто «когда-то был»)
+int   fvgAgoBull = nz(ta.barssince(bullFvgNow), 999999)
+int   fvgAgoBear = nz(ta.barssince(bearFvgNow), 999999)
+float fvgProx = nz(atrChart, 0.0) * 0.5
+bool  nearBull = not na(fvgBotS) and not na(fvgTopBull) and close >= fvgBotS - fvgProx and close <= fvgTopBull + fvgProx
+bool  nearBear = not na(fvgTopL) and not na(fvgBotBear) and close <= fvgTopL + fvgProx and close >= fvgBotBear - fvgProx
+bool  fFvgL = fvgAgoBull <= fvgLook and nearBull
+bool  fFvgS = fvgAgoBear <= fvgLook and nearBear
+float rngHi  = ta.highest(high, rangeLen)
+float rngLo  = ta.lowest(low, rangeLen)
+float rngAtr = (na(atrChart) or atrChart == 0.0) ? na : (rngHi - rngLo) / atrChart
+bool  fRange = not na(rngAtr) and rngAtr >= rangeMinAtr and rngAtr <= rangeMaxAtr
+// O-4: дисконт/премиум по dealing range от последних фрактальных свингов;
+// если свингов ещё нет — прежнее N-баровое окно.
+float drHi = not na(fracHi) ? fracHi : rngHi
+float drLo = not na(fracLo) ? fracLo : rngLo
+float drPos = drHi > drLo ? (close - drLo) / (drHi - drLo) : 0.5
+bool  fDiscL = drPos <= 0.5
+bool  fDiscS = drPos >= 0.5
+int scoreL = (fSweepL ? 1 : 0) + (fBosL ? 1 : 0) + (fFvgL ? 1 : 0) + (fChokL ? 1 : 0)
+int scoreS = (fSweepS ? 1 : 0) + (fBosS ? 1 : 0) + (fFvgS ? 1 : 0) + (fChokS ? 1 : 0)
+int facMax = useChoch ? 4 : 3
+
+// ─── 8. ЦЕЛЬ: СЛЕДУЮЩАЯ ВАЛИДНАЯ (после OB-блоков — видит их край) ───
+// Не хватаемся за ближайший уровень, если он слишком близко/даёт RR < minRR:
+// цель — следующая валидная за пределами коридора (уровень / OB / свинг).
+float swingHi = ta.highest(high, liqLen)[1]
+float swingLo = ta.lowest(low, liqLen)[1]
+float dayCap = (na(atrD) or close <= 0.0) ? na : atrD * dayBudgetK / close * 100.0
+float tgtPxL = na
+float tgtPxS = na
+for i = 0 to array.size(LV) - 1
+    Lvl l = array.get(LV, i)
+    if l.act and not na(l.px)
+        if l.kind >= 0 and l.px > close
+            float t = (l.px - close) / close * 100.0
+            bool ok = t >= tgtMin and t <= tgtMax and not na(riskL) and riskL > 0.0 and t / riskL >= minRR and (not useDayBud or na(dayCap) or t <= dayCap)
+            if ok and (na(tgtPxL) or l.px < tgtPxL)
+                tgtPxL := l.px
+        else if l.kind <= 0 and l.px < close
+            float tS = (close - l.px) / close * 100.0
+            bool okS = tS >= tgtMin and tS <= tgtMax and not na(riskS) and riskS > 0.0 and tS / riskS >= minRR and (not useDayBud or na(dayCap) or tS <= dayCap)
+            if okS and (na(tgtPxS) or l.px > tgtPxS)
+                tgtPxS := l.px
+if not na(swingHi) and swingHi > close
+    float t = (swingHi - close) / close * 100.0
+    bool ok = t >= tgtMin and t <= tgtMax and not na(riskL) and riskL > 0.0 and t / riskL >= minRR and (not useDayBud or na(dayCap) or t <= dayCap)
+    if ok and (na(tgtPxL) or swingHi < tgtPxL)
+        tgtPxL := swingHi
+if not na(swingLo) and swingLo < close
+    float tS = (close - swingLo) / close * 100.0
+    bool okS = tS >= tgtMin and tS <= tgtMax and not na(riskS) and riskS > 0.0 and tS / riskS >= minRR and (not useDayBud or na(dayCap) or tS <= dayCap)
+    if okS and (na(tgtPxS) or swingLo > tgtPxS)
+        tgtPxS := swingLo
+float tgtL = na(tgtPxL) ? na : (tgtPxL - close) / close * 100.0
+float tgtS = na(tgtPxS) ? na : (close - tgtPxS) / close * 100.0
+float rrL  = (na(tgtL) or na(riskL) or riskL <= 0.0) ? na : tgtL / riskL
+float rrS  = (na(tgtS) or na(riskS) or riskS <= 0.0) ? na : tgtS / riskS
+bool  tgtOkL = not na(tgtL) and tgtL >= tgtMin and tgtL <= tgtMax and not na(rrL) and rrL >= minRR
+bool  tgtOkS = not na(tgtS) and tgtS >= tgtMin and tgtS <= tgtMax and not na(rrS) and rrS >= minRR
+// План №2 п.5: цели по противостоящим Order Blocks — край зоны вместо/раньше фиксированных R
+if obTgtOn and array.size(obDir) > 0
+    for i = 0 to array.size(obDir) - 1
+        int obd = array.get(obDir, i)
+        if obd == -1
+            float obTpL = array.get(obBot, i)
+            if obTpL > close
+                float obTL = (obTpL - close) / close * 100.0
+                bool obOkL = obTL >= tgtMin and obTL <= tgtMax and not na(riskL) and riskL > 0.0 and obTL / riskL >= minRR and (not useDayBud or na(dayCap) or obTL <= dayCap)
+                if obOkL and (na(tgtPxL) or obTpL < tgtPxL)
+                    tgtPxL := obTpL
+        else
+            float obTpS = array.get(obTop, i)
+            if obTpS < close
+                float obTS = (close - obTpS) / close * 100.0
+                bool obOkS = obTS >= tgtMin and obTS <= tgtMax and not na(riskS) and riskS > 0.0 and obTS / riskS >= minRR and (not useDayBud or na(dayCap) or obTS <= dayCap)
+                if obOkS and (na(tgtPxS) or obTpS > tgtPxS)
+                    tgtPxS := obTpS
+// ──────────────────────── ДОП. ФИЛЬТРЫ ────────────────────────
+// EMA-стек
+float emaF1v = ta.ema(close, emaF1)
+float emaF2v = ta.ema(close, emaF2)
+float emaF3v = ta.ema(close, emaF3)
+bool  stackOkL = emaF1v > emaF2v and emaF2v > emaF3v and close > emaF3v
+bool  stackOkS = emaF1v < emaF2v and emaF2v < emaF3v and close < emaF3v
+// MACD — гистограмма растёт в сторону сделки
+[macdV, macdSigV, macdHistV] = ta.macd(close, macdFast, macdSlow, macdSigL)
+bool macdOkL = macdHistV > 0.0 and macdHistV > macdHistV[1]
+bool macdOkS = macdHistV < 0.0 and macdHistV < macdHistV[1]
+// RSI — не в зоне перекупленности/перепроданности
+float rsiVal = ta.rsi(close, rsiLen)
+bool  rsiOkL = not na(rsiVal) and rsiVal < rsiOB
+bool  rsiOkS = not na(rsiVal) and rsiVal > rsiOS
+// VWAP сессии — со сбросом в начале дня (та версия из открытого скрипта не сбрасывалась)
+bool newDay = nz(ta.change(time("D")), 0) != 0
+var float cumPV  = 0.0
+var float cumVol = 0.0
+if newDay
+    cumPV  := 0.0
+    cumVol := 0.0
+cumPV  := cumPV + hlc3 * nz(volume)
+cumVol := cumVol + nz(volume)
+float vwapVal = cumVol > 0.0 ? cumPV / cumVol : na
+bool  vwapOkL = na(vwapVal) or close > vwapVal
+bool  vwapOkS = na(vwapVal) or close < vwapVal
+// ──────────────────────── P1-4: ОТНОСИТЕЛЬНЫЙ ОБЪЁМ ПО ЧАСУ ────────────────────────
+// EWMA объёма по часам суток (зона графика), нормировано на бар текущего ТФ.
+var array<float> rvAcc = array.new_float(24, 0.0)
+var array<float> rvAvg = array.new_float(24, 0.0)
+if newDay
+    float rvW = 1.0 / rvolDays
+    for i = 0 to 23
+        float rvA = array.get(rvAcc, i)
+        if rvA > 0.0
+            float rvO = array.get(rvAvg, i)
+            array.set(rvAvg, i, rvO <= 0.0 ? rvA : rvO * (1.0 - rvW) + rvA * rvW)
+        array.set(rvAcc, i, 0.0)
+int   rvHour = hour(time, syminfo.timezone)
+float rvBars = 60.0 / (timeframe.in_seconds() / 60.0)
+float rvAvgBar = array.get(rvAvg, rvHour) / rvBars
+float rvolVal = rvAvgBar > 0.0 ? nz(volume) / rvAvgBar : na
+bool  rvolOk = not useRvol or not timeframe.isintraday or na(rvolVal) or rvolVal >= rvolMin
+// ──────────────────────── СТОРОНА И ИТОГ ────────────────────────
+bool ctxKnown = not na(htfEmaEff) and not na(htfCloseEff)
+bool useLong = ctxKnown ? htfCloseEff >= htfEmaEff : true
+bool isL     = useLong
+bool allowL  = sideAllow != "Только шорт"
+bool allowS  = sideAllow != "Только лонг"
+// торговые сессии: режим «Сессии» задаёт окна по местному биржевому времени —
+// IANA-зоны (Asia/Tokyo, Europe/London, America/New_York) сами применяют перевод
+// на летнее/зимнее время, включая переходную неделю конца октября, когда США и
+// Европа переводят часы в разные дни. Режим «Одно окно» — прежний ручной вариант.
+bool useSessAuto = sessMode == "Сессии (перевод часов авто)"
+bool inAsia = not na(time(timeframe.period, sAsiaTf, "Asia/Tokyo"))
+bool inLdn  = not na(time(timeframe.period, sLdnTf, "Europe/London"))
+bool inLno  = not na(time(timeframe.period, sLnoTf, "Europe/London"))
+bool inNy   = not na(time(timeframe.period, sNyTf, "America/New_York"))
+bool inSessAuto = (sAsiaOn and inAsia) or (sLdnOn and inLdn) or (sLnoOn and inLno) or (sNyOn and inNy)
+string tzStr    = tzIn == "Exchange" ? syminfo.timezone : tzIn == "Минск (GMT+3)" ? "Europe/Minsk" : tzIn
+bool inSessWin  = not na(time(timeframe.period, sessIn, tzStr))
+bool inSess     = useSessAuto ? inSessAuto : inSessWin
+// какая сессия активна сейчас (для подсказки в чек-листе)
+string sessName = useSessAuto ? (sNyOn and inNy ? "НЙ" : sLnoOn and inLno ? "Лдн+НЙ" : sLdnOn and inLdn ? "Лдн" : sAsiaOn and inAsia ? "Азия" : "—") : sessIn + " " + tzIn
+// P0-5: на дневных ТФ сессионных окон не существует — фильтр не должен глушить сигналы
+bool sessTfOn = timeframe.isintraday
+// P1-2: ролловер 16:55–17:05 по Нью-Йорку — расширенный спред и проскальзывание
+bool inRollover = rollOn and not na(time(timeframe.period, rollSess, "America/New_York"))
+bool sessOk = (not useSess or not sessTfOn or inSess) and not inRollover
+// P1-1: кильзоны — вход только в первые часы сессий (местное время, DST автоматически)
+// пояс кильзон: местное время бирж (DST-авто) или Минск (GMT+3, фиксировано)
+bool kzMsk   = kzTzMode == "Минск (GMT+3)"
+bool inKzLdn = not na(time(timeframe.period, kzLdnS, kzMsk ? "Europe/Minsk" : "Europe/London"))
+bool inKzNy  = not na(time(timeframe.period, kzNyS, kzMsk ? "Europe/Minsk" : "America/New_York"))
+bool inSb1 = not na(time(timeframe.period, kzSb1S, kzMsk ? "Europe/Minsk" : "America/New_York"))
+bool inSb2 = not na(time(timeframe.period, kzSb2S, kzMsk ? "Europe/Minsk" : "America/New_York"))
+bool kzOk    = not kzOn or not sessTfOn or (kzLdnOn and inKzLdn) or (kzNyOn and inKzNy) or (kzSb1On and inSb1) or (kzSb2On and inSb2)
+// P1-3: окна новостей — тихие периоды без входов
+string newsTzStr = newsTz == "Нью-Йорк" ? "America/New_York" : newsTz == "Лондон" ? "Europe/London" : syminfo.timezone
+bool inN1 = not na(time(timeframe.period, n1S, newsTzStr))
+bool inN2 = not na(time(timeframe.period, n2S, newsTzStr))
+bool inN3 = not na(time(timeframe.period, n3S, newsTzStr))
+bool newsBlock = newsOn and ((n1On and inN1) or (n2On and inN2) or (n3On and inN3))
+// P2-1: дневные лимиты — число сделок и убыток за день
+var int   dayTrades = 0
+var float dayR      = 0.0
+if newDay
+    dayTrades := 0
+    dayR      := 0.0
+bool dayLimOk = (maxDayTrades <= 0 or dayTrades < maxDayTrades) and (dayStopR <= 0 or dayR > -dayStopR)
+// V1.5: окно сессии в минском времени (GMT+3, без перевода) — для подписей и чек-листа
+f_hm(string s, int pos) =>
+    int hh = int(nz(str.tonumber(str.substring(s, pos, pos + 2)), 0))
+    int mm = int(nz(str.tonumber(str.substring(s, pos + 2, pos + 4)), 0))
+    hh * 60 + mm
+f_mskWin(string tz, string sess) =>
+    int sMin = f_hm(sess, 0)
+    int eMin = f_hm(sess, 5)
+    int yv = year(time, tz)
+    int mov = month(time, tz)
+    int ddv = dayofmonth(time, tz)
+    int tS = timestamp(tz, yv, mov, ddv, sMin / 60, sMin % 60, 0)
+    int tE = timestamp(tz, yv, mov, ddv, eMin / 60, eMin % 60, 0) + (eMin < sMin ? 86400000 : 0)
+    str.format_time(tS, "HH:mm", "Europe/Minsk") + "–" + str.format_time(tE, "HH:mm", "Europe/Minsk")
+// ──────────────────────── ЗОНЫ СЕССИЙ (по крайним точкам свечей) ────────────────────────
+// Вместо заливки фоном на весь экран: бокс от открытия до закрытия сессии,
+// верх = максимум сессии, низ = минимум, подпись = название + высота зоны.
+// Смена дня считается в зоне самой сессии: выходные не склеивают пятницу
+// с понедельником, а полночь графика не режет НЙ-сессию.
+color colSessAsia = #7E57C2
+color colSessLdn  = #26A69A
+color colSessLno  = #FFB74D
+color colSessNy   = #42A5F5
+color colSessWin  = #787B86
+f_zone(bool st, bool act, bool en, string nm, string msk, color col, int keep) =>
+    var float zHi = na
+    var float zLo = na
+    var box   zBx = na
+    var label zLb = na
+    var array<box>   zBxA = array.new_box()
+    var array<label> zLbA = array.new_label()
+    if st
+        // предыдущая сессия не закрылась краем (выходные) — всё равно в кольцо
+        if not na(zBx)
+            array.push(zBxA, zBx)
+            array.push(zLbA, zLb)
+            if array.size(zBxA) > keep
+                box.delete(array.shift(zBxA))
+                label.delete(array.shift(zLbA))
+        zHi := high
+        zLo := low
+        zBx := box.new(bar_index, high, bar_index + 1, low, border_color = color.new(col, 50), bgcolor = color.new(col, 91), border_width = 1)
+        zLb := label.new(bar_index, high, nm, style = label.style_label_upper_left, color = color.new(col, 92), textcolor = col, size = size.tiny)
+    if act and not na(zBx)
+        zHi := math.max(zHi, high)
+        zLo := math.min(zLo, low)
+        box.set_top(zBx, zHi)
+        box.set_bottom(zBx, zLo)
+        box.set_right(zBx, bar_index)
+        label.set_y(zLb, zHi)
+        label.set_text(zLb, nm + " " + msk + " МСК · " + str.tostring(zHi - zLo, format.mintick))
+    if en and not na(zBx)
+        array.push(zBxA, zBx)
+        array.push(zLbA, zLb)
+        if array.size(zBxA) > keep
+            box.delete(array.shift(zBxA))
+            label.delete(array.shift(zLbA))
+        zBx := na
+        zLb := na
+// смена календарного дня в зоне самой сессии
+bool dChgTky = dayofmonth(time, "Asia/Tokyo") != dayofmonth(time[1], "Asia/Tokyo")
+bool dChgLdn = dayofmonth(time, "Europe/London") != dayofmonth(time[1], "Europe/London")
+bool dChgNy  = dayofmonth(time, "America/New_York") != dayofmonth(time[1], "America/New_York")
+bool dChgWin = dayofmonth(time, tzStr) != dayofmonth(time[1], tzStr)
+bool zOn = showSessBg
+bool aAs = zOn and useSessAuto and sAsiaOn and inAsia
+bool aLd = zOn and useSessAuto and sLdnOn and inLdn
+bool aLn = zOn and useSessAuto and sLnoOn and inLno
+bool aNy = zOn and useSessAuto and sNyOn and inNy
+bool aWn = zOn and not useSessAuto and inSessWin
+f_zone(aAs and (not aAs[1] or dChgTky), aAs, not aAs and aAs[1], "Азия", f_mskWin("Asia/Tokyo", sAsiaTf), colSessAsia, sessZoneKeep)
+f_zone(aLd and (not aLd[1] or dChgLdn), aLd, not aLd and aLd[1], "Лондон", f_mskWin("Europe/London", sLdnTf), colSessLdn, sessZoneKeep)
+f_zone(aLn and (not aLn[1] or dChgLdn), aLn, not aLn and aLn[1], "Лдн+НЙ", f_mskWin("Europe/London", sLnoTf), colSessLno, sessZoneKeep)
+f_zone(aNy and (not aNy[1] or dChgNy), aNy, not aNy and aNy[1], "НЙ", f_mskWin("America/New_York", sNyTf), colSessNy, sessZoneKeep)
+f_zone(aWn and (not aWn[1] or dChgWin), aWn, not aWn and aWn[1], "Окно", f_mskWin(tzStr, sessIn), colSessWin, sessZoneKeep)
+// ──────────────────────── O-10: УРОВНИ АЗИАТСКОГО ДИАПАЗОНА ────────────────────────
+// Хай/лоу азиатской сессии — ликвидность для Лондона и НЙ: линия тянется,
+// пока не собрана (свипнута), после сбора помечается ✓ и замирает.
+bool azAct = useSessAuto and sAsiaOn and inAsia
+bool azStart = azAct and not azAct[1]
+bool azEnd = not azAct and azAct[1]
+var float azHi = na
+var float azLo = na
+var int   azBar0 = na
+var line  azHiLn = na
+var line  azLoLn = na
+var label azHiLb = na
+var label azLoLb = na
+var bool  azHiFree = false
+var bool  azLoFree = false
+if azStart
+    azHi := high
+    azLo := low
+    azBar0 := bar_index
+    azHiFree := false
+    azLoFree := false
+if azAct
+    azHi := math.max(azHi, high)
+    azLo := math.min(azLo, low)
+if azEnd and showAz
+    if not na(azHiLn)
+        line.delete(azHiLn)
+        label.delete(azHiLb)
+    if not na(azLoLn)
+        line.delete(azLoLn)
+        label.delete(azLoLb)
+    azHiLn := line.new(azBar0, azHi, bar_index, azHi, color = color.new(#7E57C2, 25), width = 1, style = line.style_dashed)
+    azLoLn := line.new(azBar0, azLo, bar_index, azLo, color = color.new(#7E57C2, 25), width = 1, style = line.style_dashed)
+    azHiLb := label.new(bar_index, azHi, "Азия H", style = label.style_label_left, color = color.new(#7E57C2, 60), textcolor = color.white, size = size.tiny)
+    azLoLb := label.new(bar_index, azLo, "Азия L", style = label.style_label_left, color = color.new(#7E57C2, 60), textcolor = color.white, size = size.tiny)
+if not azAct and not na(azHiLn)
+    if not azHiFree and high > azHi
+        azHiFree := true
+        label.set_text(azHiLb, "Азия H ✓")
+    if not azHiFree
+        line.set_x2(azHiLn, bar_index)
+        label.set_x(azHiLb, bar_index)
+    if not azLoFree and low < azLo
+        azLoFree := true
+        label.set_text(azLoLb, "Азия L ✓")
+    if not azLoFree
+        line.set_x2(azLoLn, bar_index)
+        label.set_x(azLoLb, bar_index)
+// дневной контекст: цена vs EMA200 на дневке
+bool dayUp = not na(dEma) and close > dEma
+bool dayDn = not na(dEma) and close < dEma
+bool dayOkL = not useDayCtx or dayUp
+bool dayOkS = not useDayCtx or dayDn
+bool tfOk = (not tfWarn or tfFallback) and (not touchWarn or tfFallback)
+bool r1  = isL ? allowL : allowS
+bool r2  = tfOk and (isL ? (ctxL and dayOkL) : (ctxS and dayOkS))
+bool r3  = isL ? touchOkL : touchOkS
+bool r4  = isL ? slopeL : slopeS
+bool r5  = isL ? testOkL : testOkS
+bool r6  = isL ? trigL : trigS
+bool r7  = isL ? riskOkL : riskOkS
+// бюджет дня уже посчитан в блоке цели (dayCap)
+float selTgt = isL ? tgtL : tgtS
+bool  budgetOk = not useDayBud or na(dayCap) or (not na(selTgt) and selTgt <= dayCap)
+bool r8  = (isL ? tgtOkL : tgtOkS) and budgetOk
+bool r9  = noChop and fRange
+bool r10 = (isL ? scoreL : scoreS) >= math.min(needFac, facMax)
+bool okVwap = not useVwap or (isL ? vwapOkL : vwapOkS)
+bool okStack = not useStack or (isL ? stackOkL : stackOkS)
+bool okMacd = not useMacd or (isL ? macdOkL : macdOkS)
+bool okRsi = not useRsi or (isL ? rsiOkL : rsiOkS)
+bool okDisc = not useDisc or (isL ? fDiscL : fDiscS)
+// P1-6: фильтр спреда — бар входа должен быть крупнее N × спреда
+bool okSprd = not useSprd or rng >= sprTicks * syminfo.mintick * sprK
+// O-3: не стоять под несобранным пулом ликвидности (EQH над лонгом / EQL под шортом)
+bool okEq = not useEq or (isL ? eqOkLraw : eqOkSraw)
+// P1-4: тихий час = мало участия
+bool okRvol = rvolOk
+// O-2: цена у свежего несмягчённого OB нужной стороны
+bool obL2 = false
+bool obS2 = false
+if array.size(obDir) > 0
+    float obReach = obNear * nz(atrChart, 0.0)
+    for i = 0 to array.size(obDir) - 1
+        int od = array.get(obDir, i)
+        float otp = array.get(obTop, i)
+        float obt = array.get(obBot, i)
+        if od == 1 and obt <= close and close - otp <= obReach
+            obL2 := true
+        if od == -1 and otp >= close and obt - close <= obReach
+            obS2 := true
+bool okOb = not useOb or (isL ? obL2 : obS2)
+// План №2 п.4: доллар против золота — лонг при слабеющем долларе, шорт при крепнущем
+bool okDxy = not useDxy or na(dxyClose) or na(dxyEma) or (isL ? dxyClose < dxyEma : dxyClose > dxyEma)
+bool r11 = okVwap and okStack and okMacd and okRvol and okRsi and okDisc and okSprd and okEq and okOb and okDxy
+// окно торговли = сессии + кильзоны + новости + лимиты дня
+bool r12 = sessOk and kzOk and not newsBlock and dayLimOk
+// Цель/RR — жёсткий риск-гейт в ОБОИХ режимах: сделка без цели не сделка.
+// В мягком режиме совещательны только наклон, диапазон, SMC-факторы и включённые фильтры.
+bool anyFilter = useVwap or useStack or useMacd or useRsi or useDisc or useSprd or useEq or useRvol or useOb or useDxy
+int softCnt = (r4 ? 1 : 0) + (r9 ? 1 : 0) + (r10 ? 1 : 0) + (anyFilter and r11 ? 1 : 0)
+int coreMiss = (r1 ? 0 : 1) + (r2 ? 0 : 1) + (r3 ? 0 : 1) + (r5 ? 0 : 1) + (r6 ? 0 : 1) + (r7 ? 0 : 1) + (r8 ? 0 : 1) + (r12 ? 0 : 1)
+int strictMiss = coreMiss + (r4 ? 0 : 1) + (r9 ? 0 : 1) + (r10 ? 0 : 1) + (r11 ? 0 : 1)
+int  missing = modeSoft ? coreMiss + int(math.max(0, softNeed - softCnt)) : strictMiss
+bool allOk = missing == 0
+bool sigRawL  = allOk and isL
+bool sigRawS  = allOk and not isL
+bool longSig  = sigRawL and (not onlyClosed or barstate.isconfirmed)
+bool shortSig = sigRawS and (not onlyClosed or barstate.isconfirmed)
+int  lsInt = longSig ? 1 : 0
+int  ssInt = shortSig ? 1 : 0
+bool longEvt  = lsInt == 1 and nz(lsInt[1], 0) == 0
+bool shortEvt = ssInt == 1 and nz(ssInt[1], 0) == 0
+// ═══════════════════ СДЕЛКИ: СОСТОЯНИЕ ═══════════════════
+var int   stDir    = 0
+var float stEntry  = na
+var float stStop   = na
+var float stTp1    = na
+var float stTp2    = na
+var float stTp3    = na
+var int   stBar    = na
+var float rDist    = na
+var float partDone = 0.0
+var float tradeR   = 0.0
+var bool  hit1     = false
+var bool  hit2     = false
+var bool  hit3     = false
+var bool  beOn     = false
+var int   lastExitBar = na
+var int   stSessId = 0
+var int   stDow    = 0
+// статистика
+var int   nTrades = 0
+var int   nWins   = 0
+var float sumR    = 0.0
+var float sumWin  = 0.0
+var float sumLoss = 0.0
+var float eqR     = 0.0
+var float peakR   = 0.0
+var float ddR     = 0.0
+var int   cntTp1  = 0
+var int   cntTp2  = 0
+var int   cntFull = 0
+var int   cntSl   = 0
+var int   cntTime = 0
+// P3-1: разбивка сделок по сессиям входа и дням недели
+var array<int>   sessN = array.new_int(4, 0)
+var array<float> sessR = array.new_float(4, 0.0)
+var array<int>   sessW = array.new_int(4, 0)
+var array<int>   dowN  = array.new_int(8, 0)
+var array<float> dowR  = array.new_float(8, 0.0)
+// объекты карточки
+var box   bxRisk = na
+var box   bxRew  = na
+var line  lnEnt  = na
+var line  lnSl   = na
+var line  lnT1   = na
+var line  lnT2   = na
+var line  lnT3   = na
+var label lbSl   = na
+var label lbT1   = na
+var label lbT2   = na
+var label lbT3   = na
+var bool  hasDraw = false
+// кольцо последних карточек: держим только N сделок
+var array<box>   cdBx1 = array.new_box()
+var array<box>   cdBx2 = array.new_box()
+var array<line>  cdLn1 = array.new_line()
+var array<line>  cdLn2 = array.new_line()
+var array<line>  cdLn3 = array.new_line()
+var array<line>  cdLn4 = array.new_line()
+var array<line>  cdLn5 = array.new_line()
+var array<label> cdLb1 = array.new_label()
+var array<label> cdLb2 = array.new_label()
+var array<label> cdLb3 = array.new_label()
+var array<label> cdLb4 = array.new_label()
+// ──────────────────────── ПАЛИТРА ────────────────────────
+bool thGold  = theme == "Графит + золото"
+bool thLight = theme == "Светлый премиум"
+color colGold  = thLight ? color.new(#A8863F, 0) : color.new(#C9A66B, 0)
+color colBg    = thLight ? color.new(#FAF9F6, 0) : thGold ? color.new(#0E1116, 0) : color.new(#101215, 0)
+color colHeadA = thLight ? color.new(#ECE9E1, 0) : thGold ? color.new(#1A1D23, 0) : color.new(#1B1E22, 0)
+color colRowBg = thLight ? color.new(#F6F4EF, 0) : thGold ? color.new(#14171C, 0) : color.new(#15181C, 0)
+color colBrd   = thLight ? color.new(#D9D4C7, 0) : thGold ? color.new(#2B3038, 0) : color.new(#24282E, 0)
+color colTxt   = thLight ? color.new(#23262B, 0) : color.new(#E4E6E9, 0)
+color colSub   = thLight ? color.new(#6B6F76, 0) : color.new(#8D949E, 0)
+color colOk    = thLight ? color.new(#2F6F5E, 0) : thGold ? color.new(#57A08B, 0) : color.new(#2E9E8F, 0)
+color colBad   = thLight ? color.new(#9A3F31, 0) : thGold ? color.new(#B25B49, 0) : color.new(#D0544A, 0)
+color colEnt   = thLight ? color.new(#7A7E85, 0) : thGold ? color.new(#7C848E, 0) : color.new(#6E757D, 0)
+color colSoft  = thLight ? color.new(#8A93A0, 0) : color.new(#5A6A80, 0)
+color colName  = colSub
+color colInfo  = colTxt
+// размер подписей сделок (P3-визуал): сильнее заливка, крупнее текст
+string lblSz = lblSizeIn == "Крошечный" ? size.tiny : lblSizeIn == "Обычный" ? size.normal : size.small
+f_num(float x, string fmt) =>
+    na(x) ? "—" : str.tostring(x, fmt)
+// ═══════════════════ ВХОД В СДЕЛКУ: АВТОМАТ СЕТАПА ═══════════════════
+// IDLE -> SETUP (касание+тест) -> ENTRY (триггер+риск+цель) -> USED.
+// Повторный вход возможен только после сброса сетапа и кулдауна.
+var int setupState = 0
+var int setupSide = 0
+int sideNow = isL ? 1 : -1
+if sideNow != setupSide
+    setupState := 0
+    setupSide := sideNow
+bool setupNow = r1 and r2 and r3 and r5 and r12
+bool trigNow  = r6 and r7 and r8
+if not setupNow
+    setupState := 0
+else if setupState == 0
+    setupState := 1
+if stDir != 0
+    setupState := 2
+bool coolOk = na(lastExitBar) or (bar_index - lastExitBar) >= reEntryBars
+bool sweepOk = isL ? sinceSweepL >= sweepDelay : sinceSweepS >= sweepDelay
+bool entryNow = setupNow and trigNow and setupState == 1 and stDir == 0 and coolOk and sweepOk and (not onlyClosed or barstate.isconfirmed)
+bool goLong  = entryNow and isL
+bool goShort = entryNow and not isL
+if entryNow
+    setupState := 2
+if goLong or goShort
+    float stp  = goLong ? stopL : stopS
+    float dist = math.abs(close - stp)
+    if dist > syminfo.mintick
+        float sgn = goLong ? 1.0 : -1.0
+        stDir   := goLong ? 1 : -1
+        stEntry := close
+        stStop  := stp
+        rDist   := dist
+        stTp1   := close + sgn * tp1R * dist
+        stTp2   := close + sgn * tp2R * dist
+        stTp3   := close + sgn * tp3R * dist
+        stBar   := bar_index
+        dayTrades := dayTrades + 1
+        float lotQty = useLot and depUsd > 0.0 and dist > 0.0 ? depUsd * riskPct / 100.0 / dist : na
+        stSessId := useSessAuto ? (inNy ? 3 : inLdn ? 2 : inAsia ? 1 : 0) : (inSessWin ? 3 : 0)
+        stDow := dayofweek(time, syminfo.timezone)
+        partDone := 0.0
+        tradeR   := 0.0
+        hit1 := false
+        hit2 := false
+        hit3 := false
+        beOn := false
+        string alertDir = goLong ? "LONG" : "SHORT"
+        string qtyJs = na(lotQty) ? "" : ",\"qty\":" + str.tostring(lotQty, "#.####")
+        string alertTxt = useJsonAlert ? "{\"ticker\":\"" + syminfo.ticker + "\",\"tf\":\"" + timeframe.period + "\",\"dir\":\"" + alertDir + "\",\"entry\":" + str.tostring(stEntry, format.mintick) + ",\"sl\":" + str.tostring(stStop, format.mintick) + ",\"tp1\":" + str.tostring(stTp1, format.mintick) + ",\"tp2\":" + str.tostring(stTp2, format.mintick) + ",\"tp3\":" + str.tostring(stTp3, format.mintick) + qtyJs + ",\"session\":\"" + (useSessAuto ? sessName : sessIn) + "\"}" : alertDir + " " + syminfo.ticker + " " + timeframe.period + " | вход " + str.tostring(stEntry, format.mintick) + " | SL " + str.tostring(stStop, format.mintick) + " | TP1 " + str.tostring(stTp1, format.mintick) + " | TP2 " + str.tostring(stTp2, format.mintick) + " | TP3 " + str.tostring(stTp3, format.mintick) + (na(lotQty) ? "" : " | объём " + str.tostring(lotQty, "#.####"))
+        alert(alertTxt, alert.freq_once_per_bar_close)
+        if showTrades
+            bxRisk := box.new(bar_index, math.max(stEntry, stStop), bar_index + 1, math.min(stEntry, stStop), border_color = color.new(colBad, 30), bgcolor = color.new(colBad, 84))
+            bxRew  := box.new(bar_index, math.max(stEntry, stTp3), bar_index + 1, math.min(stEntry, stTp3), border_color = color.new(colOk, 45), bgcolor = color.new(colOk, 90))
+            lnEnt  := line.new(bar_index, stEntry, bar_index + 1, stEntry, color = colEnt, width = 2)
+            lnSl   := line.new(bar_index, stStop, bar_index + 1, stStop, color = colBad, width = 2, style = line.style_solid)
+            lnT1   := line.new(bar_index, stTp1, bar_index + 1, stTp1, color = colOk, width = 1, style = line.style_dashed)
+            lnT2   := line.new(bar_index, stTp2, bar_index + 1, stTp2, color = colOk, width = 1, style = line.style_dashed)
+            lnT3   := line.new(bar_index, stTp3, bar_index + 1, stTp3, color = colOk, width = 2, style = line.style_dashed)
+            lbSl   := label.new(bar_index + 1, stStop, "SL · " + str.tostring(stStop, format.mintick), style = label.style_label_left, color = color.new(colBad, 45), textcolor = color.white, size = lblSz)
+            lbT1   := label.new(bar_index + 1, stTp1, "TP1 · " + str.tostring(stTp1, format.mintick), style = label.style_label_left, color = color.new(colOk, 92), textcolor = colOk, size = lblSz)
+            lbT2   := label.new(bar_index + 1, stTp2, "TP2 · " + str.tostring(stTp2, format.mintick), style = label.style_label_left, color = color.new(colOk, 92), textcolor = colOk, size = lblSz)
+            lbT3   := label.new(bar_index + 1, stTp3, "TP3 · " + str.tostring(stTp3, format.mintick), style = label.style_label_left, color = color.new(colOk, 92), textcolor = colOk, size = lblSz)
+            hasDraw := true
+            if array.size(cdBx1) >= keepCards
+                box.delete(array.shift(cdBx1))
+                box.delete(array.shift(cdBx2))
+                line.delete(array.shift(cdLn1))
+                line.delete(array.shift(cdLn2))
+                line.delete(array.shift(cdLn3))
+                line.delete(array.shift(cdLn4))
+                line.delete(array.shift(cdLn5))
+                label.delete(array.shift(cdLb1))
+                label.delete(array.shift(cdLb2))
+                label.delete(array.shift(cdLb3))
+                label.delete(array.shift(cdLb4))
+            array.push(cdBx1, bxRisk)
+            array.push(cdBx2, bxRew)
+            array.push(cdLn1, lnEnt)
+            array.push(cdLn2, lnSl)
+            array.push(cdLn3, lnT1)
+            array.push(cdLn4, lnT2)
+            array.push(cdLn5, lnT3)
+            array.push(cdLb1, lbSl)
+            array.push(cdLb2, lbT1)
+            array.push(cdLb3, lbT2)
+            array.push(cdLb4, lbT3)
+// ═══════════════════ ВЕДЕНИЕ СДЕЛКИ ═══════════════════
+if stDir != 0 and bar_index > stBar
+    bool isLong = stDir == 1
+    bool slTouch = isLong ? (low <= stStop) : (high >= stStop)
+    bool t1Touch = isLong ? (high >= stTp1) : (low <= stTp1)
+    bool t2Touch = isLong ? (high >= stTp2) : (low <= stTp2)
+    bool t3Touch = isLong ? (high >= stTp3) : (low <= stTp3)
+    float p1 = p1Frac
+    float p2 = p2Frac
+    bool finished = false
+    string exitReason = ""
+    // P2-2 (O-7, UT Bot): трейлинг-стоп — подтягивается к close ∓ k×ATR, никогда не отдаляется.
+    // Действует со следующего бара после указанного TP — так же, как перевод в БУ.
+    bool trailOn = useTrail and (trailAfter <= 1 ? hit1 : trailAfter == 2 ? hit2 : hit3)
+    if trailOn and not na(atrChart)
+        float trailPx = isLong ? close - trailK * atrChart : close + trailK * atrChart
+        float newStop = isLong ? math.max(stStop, trailPx) : math.min(stStop, trailPx)
+        if newStop != stStop
+            stStop := newStop
+            if hasDraw
+                line.set_y1(lnSl, stStop)
+                line.set_y2(lnSl, stStop)
+                label.set_y(lbSl, stStop)
+                label.set_text(lbSl, "трейл " + str.tostring(stStop, format.mintick))
+    // консервативно: если на одном баре и стоп, и цель — считаем стоп первым
+    if slTouch
+        // при трейлинге — по фактической цене стопа (может быть и в плюс); БУ = 0R; обычный SL = −1R
+        float stopR = (isLong ? (stStop - stEntry) : (stEntry - stStop)) / rDist
+        tradeR := tradeR + (1.0 - partDone) * (trailOn ? stopR : beOn ? 0.0 : -1.0)
+        partDone := 1.0
+        finished := true
+        exitReason := trailOn ? "трейл" : beOn ? "БУ" : "SL"
+    else
+        if t1Touch and not hit1
+            hit1 := true
+            partDone := math.min(1.0, partDone + p1)
+            tradeR := tradeR + p1 * tp1R
+            if hasDraw
+                label.set_text(lbT1, "TP1 ✓ " + str.tostring(stTp1, format.mintick))
+            if beAfter == 1
+                stStop := stEntry
+                beOn := true
+                if hasDraw
+                    line.set_y1(lnSl, stStop)
+                    line.set_y2(lnSl, stStop)
+                    label.set_y(lbSl, stStop)
+                    label.set_text(lbSl, "SL→БУ " + str.tostring(stStop, format.mintick))
+                    box.set_top(bxRisk, stEntry + syminfo.mintick)
+                    box.set_bottom(bxRisk, stEntry - syminfo.mintick)
+            if partDone >= 1.0
+                finished := true
+                exitReason := "TP1"
+        if not finished and t2Touch and hit1 and not hit2
+            hit2 := true
+            partDone := math.min(1.0, partDone + p2)
+            tradeR := tradeR + p2 * tp2R
+            if hasDraw
+                label.set_text(lbT2, "TP2 ✓ " + str.tostring(stTp2, format.mintick))
+            if beAfter == 2
+                stStop := stEntry
+                beOn := true
+                if hasDraw
+                    line.set_y1(lnSl, stStop)
+                    line.set_y2(lnSl, stStop)
+                    label.set_y(lbSl, stStop)
+                    label.set_text(lbSl, "SL→БУ " + str.tostring(stStop, format.mintick))
+                    box.set_top(bxRisk, stEntry + syminfo.mintick)
+                    box.set_bottom(bxRisk, stEntry - syminfo.mintick)
+            if partDone >= 1.0
+                finished := true
+                exitReason := "TP2"
+        if not finished and t3Touch and hit2 and not hit3
+            hit3 := true
+            tradeR := tradeR + (1.0 - partDone) * tp3R
+            partDone := 1.0
+            finished := true
+            exitReason := "TP3"
+    if not finished and bar_index - stBar > maxBars
+        float mtm = isLong ? (close - stEntry) / rDist : (stEntry - close) / rDist
+        tradeR := tradeR + (1.0 - partDone) * mtm
+        partDone := 1.0
+        finished := true
+        exitReason := "время"
+    if hasDraw and not finished
+        box.set_right(bxRisk, bar_index)
+        box.set_right(bxRew, bar_index)
+        line.set_x2(lnEnt, bar_index)
+        line.set_x2(lnSl, bar_index)
+        line.set_x2(lnT1, bar_index)
+        line.set_x2(lnT2, bar_index)
+        line.set_x2(lnT3, bar_index)
+        label.set_x(lbSl, bar_index + 1)
+        label.set_x(lbT1, bar_index + 1)
+        label.set_x(lbT2, bar_index + 1)
+        label.set_x(lbT3, bar_index + 1)
+    if finished
+        if hasDraw
+            box.set_right(bxRisk, bar_index)
+            box.set_right(bxRew, bar_index)
+            line.set_x2(lnEnt, bar_index)
+            line.set_x2(lnSl, bar_index)
+            line.set_x2(lnT1, bar_index)
+            line.set_x2(lnT2, bar_index)
+            line.set_x2(lnT3, bar_index)
+            label.set_x(lbSl, bar_index + 1)
+            label.set_x(lbT1, bar_index + 1)
+            label.set_x(lbT2, bar_index + 1)
+            label.set_x(lbT3, bar_index + 1)
+            if exitReason == "TP3"
+                label.set_text(lbT3, "TP3 ✓ " + str.tostring(stTp3, format.mintick))
+            else if exitReason == "TP2"
+                label.set_text(lbT2, "TP2 ✓ " + str.tostring(stTp2, format.mintick))
+            else if exitReason == "TP1"
+                label.set_text(lbT1, "TP1 ✓ " + str.tostring(stTp1, format.mintick))
+            else if exitReason == "время"
+                label.set_text(lbSl, "выход по времени " + str.tostring(close, format.mintick))
+            else
+                label.set_text(lbSl, exitReason + " ✗ " + str.tostring(stStop, format.mintick))
+        nTrades := nTrades + 1
+        sumR := sumR + tradeR
+        if tradeR > 0
+            nWins := nWins + 1
+            sumWin := sumWin + tradeR
+        else if tradeR < 0
+            sumLoss := sumLoss + tradeR
+        eqR := eqR + tradeR
+        peakR := math.max(peakR, eqR)
+        ddR := math.min(ddR, eqR - peakR)
+        dayR := dayR + tradeR
+        array.set(sessN, stSessId, array.get(sessN, stSessId) + 1)
+        array.set(sessR, stSessId, array.get(sessR, stSessId) + tradeR)
+        if tradeR > 0
+            array.set(sessW, stSessId, array.get(sessW, stSessId) + 1)
+        array.set(dowN, stDow, array.get(dowN, stDow) + 1)
+        array.set(dowR, stDow, array.get(dowR, stDow) + tradeR)
+        alert("CLOSE," + syminfo.ticker + "," + timeframe.period + "," + (stDir == 1 ? "LONG" : "SHORT") + "," + f_num(tradeR, "#.##") + "," + exitReason, alert.freq_once_per_bar_close)
+        if hit3
+            cntFull := cntFull + 1
+        else if hit2
+            cntTp2 := cntTp2 + 1
+        else if hit1
+            cntTp1 := cntTp1 + 1
+        else if exitReason == "время"
+            cntTime := cntTime + 1
+        else
+            cntSl := cntSl + 1
+        stDir := 0
+        lastExitBar := bar_index
+        alert((isLong ? "LONG " : "SHORT ") + syminfo.ticker + " закрыта: " + exitReason + " @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+// ──────────────────────── ПРЕДВАРИТЕЛЬНАЯ СДЕЛКА (до триггера) ────────────────────────
+// План фиксируется в момент появления и только продлевается вправо. Если стоп/цель
+// materially изменились — карточка пересоздаётся. Так линии не «плывут» назад.
+bool pvReady = showPreview and stDir == 0 and r1 and r2 and r3 and r5 and r7 and r8 and r12 and not r6
+var box   pvRisk = na
+var box   pvRew  = na
+var line  pvEnt  = na
+var line  pvSl   = na
+var line  pvT1   = na
+var line  pvT2   = na
+var line  pvT3   = na
+var label pvLb   = na
+var bool  pvOn   = false
+var float pvS0   = na
+var float pv30   = na
+var int   pvDir  = 0
+float pvStop  = isL ? stopL : stopS
+float pvDist  = na(pvStop) ? na : math.abs(close - pvStop)
+bool  pvValid = pvReady and not na(pvDist) and pvDist > syminfo.mintick
+float pvSgn   = isL ? 1.0 : -1.0
+float pv1 = close + pvSgn * tp1R * pvDist
+float pv2 = close + pvSgn * tp2R * pvDist
+float pv3 = close + pvSgn * tp3R * pvDist
+bool pvNewPlan = pvValid and (not pvOn or pvDir != (isL ? 1 : -1) or math.abs(pvStop - pvS0) > atrChart * 0.10 or math.abs(pv3 - pv30) > atrChart * 0.10)
+bool pvStart = pvNewPlan and not pvOn
+if pvNewPlan
+    if pvOn
+        box.delete(pvRisk)
+        box.delete(pvRew)
+        line.delete(pvEnt)
+        line.delete(pvSl)
+        line.delete(pvT1)
+        line.delete(pvT2)
+        line.delete(pvT3)
+        label.delete(pvLb)
+    pvRisk := box.new(bar_index, math.max(close, pvStop), bar_index + 1, math.min(close, pvStop), border_color = color.new(colBad, 75), bgcolor = color.new(colBad, 94))
+    pvRew  := box.new(bar_index, math.max(close, pv3), bar_index + 1, math.min(close, pv3), border_color = color.new(colOk, 80), bgcolor = color.new(colOk, 95))
+    pvEnt  := line.new(bar_index, close, bar_index + 1, close, color = colEnt, width = 1, style = line.style_dotted)
+    pvSl   := line.new(bar_index, pvStop, bar_index + 1, pvStop, color = color.new(colBad, 45), width = 1, style = line.style_dotted)
+    pvT1   := line.new(bar_index, pv1, bar_index + 1, pv1, color = color.new(colOk, 55), width = 1, style = line.style_dotted)
+    pvT2   := line.new(bar_index, pv2, bar_index + 1, pv2, color = color.new(colOk, 55), width = 1, style = line.style_dotted)
+    pvT3   := line.new(bar_index, pv3, bar_index + 1, pv3, color = color.new(colOk, 55), width = 1, style = line.style_dotted)
+    string pvSoft = modeSoft ? " · soft " + str.tostring(softCnt) + "/" + str.tostring(softNeed) : ""
+    float pvLot = useLot and depUsd > 0.0 and not na(pvDist) and pvDist > 0.0 ? depUsd * riskPct / 100.0 / pvDist : na
+    pvLb   := label.new(bar_index, close, "план " + (isL ? "LONG" : "SHORT") + "\nвход " + str.tostring(close, format.mintick) + "\nSL " + str.tostring(pvStop, format.mintick) + "\nTP1 " + str.tostring(pv1, format.mintick) + "\nTP2 " + str.tostring(pv2, format.mintick) + (na(pvLot) ? "" : "\nобъём " + str.tostring(pvLot, "#.####")) + pvSoft, style = label.style_label_left, color = color.new(colSub, 30), textcolor = color.white, size = lblSz)
+    pvS0 := pvStop
+    pv30 := pv3
+    pvDir := isL ? 1 : -1
+    pvOn := true
+    // План №2 п.2: план появился впервые — уведомить до триггера
+    if pvStart and pvAlertOn
+        string pvJs = useJsonAlert ? "{\"type\":\"setup\",\"ticker\":\"" + syminfo.ticker + "\",\"tf\":\"" + timeframe.period + "\",\"dir\":\"" + (isL ? "LONG" : "SHORT") + "\",\"entry\":" + str.tostring(close, format.mintick) + ",\"sl\":" + str.tostring(pvStop, format.mintick) + ",\"tp1\":" + str.tostring(pv1, format.mintick) + ",\"tp2\":" + str.tostring(pv2, format.mintick) + ",\"session\":\"" + (useSessAuto ? sessName : sessIn) + "\"}" : "СЕТАП ГОТОВИТСЯ " + (isL ? "LONG" : "SHORT") + " " + syminfo.ticker + " " + timeframe.period + " | вход ~" + str.tostring(close, format.mintick) + " | SL " + str.tostring(pvStop, format.mintick) + " | TP1 " + str.tostring(pv1, format.mintick) + " | TP2 " + str.tostring(pv2, format.mintick)
+        alert(pvJs, alert.freq_once_per_bar_close)
+else if pvValid and pvOn
+    box.set_right(pvRisk, bar_index + 1)
+    box.set_right(pvRew, bar_index + 1)
+    line.set_x2(pvEnt, bar_index + 1)
+    line.set_x2(pvSl, bar_index + 1)
+    line.set_x2(pvT1, bar_index + 1)
+    line.set_x2(pvT2, bar_index + 1)
+    line.set_x2(pvT3, bar_index + 1)
+    label.set_x(pvLb, bar_index)
+else if pvOn
+    box.delete(pvRisk)
+    box.delete(pvRew)
+    line.delete(pvEnt)
+    line.delete(pvSl)
+    line.delete(pvT1)
+    line.delete(pvT2)
+    line.delete(pvT3)
+    label.delete(pvLb)
+    pvOn := false
+// ──────────────────────── ГРАФИКА ────────────────────────
+float zoneHi = emaTouchEff + zoneHalf
+float zoneLo = emaTouchEff - zoneHalf
+pHi = plot(showZone ? zoneHi : na, "Зона EMA200 · верх", color = color.new(colGold, 100))
+pLo = plot(showZone ? zoneLo : na, "Зона EMA200 · низ", color = color.new(colGold, 100))
+fill(pHi, pLo, color = color.new(colGold, 92), title = "Зона EMA200 ТФ касания")
+plot(emaTouchEff, "EMA200 (ТФ касания)", color = colGold, linewidth = 2)
+plot(showHtfEma ? htfEmaEff : na, "EMA200 контекста", color = color.new(colGold, 45), linewidth = 1)
+plot(showDEma ? dEma : na, "EMA200 дневная", color = color.new(colSub, 55), linewidth = 1)
+plot(showLtfE ? emaLtf : na, "EMA200 рабочего ТФ", color = color.new(colSoft, 25), linewidth = 1)
+plot(showEma50 ? ema50v : na, "EMA 50", color = color.new(colSoft, 50), linewidth = 1)
+// ──────────────────────── МЕТКИ СИГНАЛОВ ────────────────────────
+var array<label> mkL = array.new_label()
+var array<label> mkS = array.new_label()
+if showMarks and goLong
+    label nl = label.new(bar_index, low, "LONG", style = label.style_label_up, color = color.new(colOk, 20), textcolor = color.white, size = size.small)
+    array.push(mkL, nl)
+    if array.size(mkL) > keepCards
+        label.delete(array.shift(mkL))
+if showMarks and goShort
+    label ns = label.new(bar_index, high, "SHORT", style = label.style_label_down, color = color.new(colBad, 20), textcolor = color.white, size = size.small)
+    array.push(mkS, ns)
+    if array.size(mkS) > keepCards
+        label.delete(array.shift(mkS))
+// ──────────────────────── НАКЛОННЫЕ ЛИНИИ ПО ЭКСТРЕМУМАМ ────────────────────────
+// Линия строится по двум последним подтверждённым пивотам (появляется через pivR баров — без репейнта)
+float phVal = ta.pivothigh(high, pivL, pivR)
+float plVal = ta.pivotlow(low, pivL, pivR)
+var array<line>  hiLn = array.new_line()
+var array<line>  loLn = array.new_line()
+var int   hiPrevX = na
+var float hiPrevY = na
+var int   loPrevX = na
+var float loPrevY = na
+color colTL = color.new(colSub, 45)
+// канал: верхняя по двум последним хаям, нижняя по двум последним лоям
+var int   upX1 = na
+var float upY1 = na
+var line  chUp = na
+var int   dnX1 = na
+var float dnY1 = na
+var line  chDn = na
+if showTL and tlMode == "Канал" and not na(phVal)
+    int px = bar_index - pivR
+    if not na(upX1)
+        if na(chUp)
+            chUp := line.new(upX1, upY1, px, phVal, xloc = xloc.bar_index, extend = tlExtend ? extend.right : extend.none, color = colTL, style = line.style_dashed, width = 1)
+        else
+            line.set_xy1(chUp, upX1, upY1)
+            line.set_xy2(chUp, px, phVal)
+    upX1 := px
+    upY1 := phVal
+if showTL and tlMode == "Канал" and not na(plVal)
+    int px2 = bar_index - pivR
+    if not na(dnX1)
+        if na(chDn)
+            chDn := line.new(dnX1, dnY1, px2, plVal, xloc = xloc.bar_index, extend = tlExtend ? extend.right : extend.none, color = colTL, style = line.style_dashed, width = 1)
+        else
+            line.set_xy1(chDn, dnX1, dnY1)
+            line.set_xy2(chDn, px2, plVal)
+    dnX1 := px2
+    dnY1 := plVal
+if showTL and tlMode == "Веер" and not na(phVal)
+    int px = bar_index - pivR
+    if not na(hiPrevX)
+        line nl = line.new(hiPrevX, hiPrevY, px, phVal, xloc = xloc.bar_index, extend = tlExtend ? extend.right : extend.none, color = colTL, style = line.style_dashed, width = 1)
+        array.push(hiLn, nl)
+        if array.size(hiLn) > tlCount
+            line.delete(array.shift(hiLn))
+    hiPrevX := px
+    hiPrevY := phVal
+if showTL and tlMode == "Веер" and not na(plVal)
+    int px = bar_index - pivR
+    if not na(loPrevX)
+        line nl = line.new(loPrevX, loPrevY, px, plVal, xloc = xloc.bar_index, extend = tlExtend ? extend.right : extend.none, color = colTL, style = line.style_dashed, width = 1)
+        array.push(loLn, nl)
+        if array.size(loLn) > tlCount
+            line.delete(array.shift(loLn))
+    loPrevX := px
+    loPrevY := plVal
+// ──────────────────────── ЛИНИИ УРОВНЕЙ ────────────────────────
+// Перерисовываем на последнем баре: PDH/PWH/ON/IB появляются не на баре 0.
+// Слияние близких уровней — идея из Prior Levels [crlmx], чтобы подписи не стопкой.
+color colLv = color.new(colGold, 30)
+var array<line>   lvLines  = array.new_line()
+var array<label>  lvLabels = array.new_label()
+var array<float>  lvDrawPx = array.new_float()
+var array<string> lvDrawNm = array.new<string>()
+if showLv and barstate.islast
+    while array.size(lvLines) > 0
+        line.delete(array.pop(lvLines))
+    while array.size(lvLabels) > 0
+        label.delete(array.pop(lvLabels))
+    array.clear(lvDrawPx)
+    array.clear(lvDrawNm)
+    int x1 = lvDays == 0 ? 0 : int(math.max(0, bar_index - int(lvDays * 86400.0 / tfSec)))
+    float mergeTol = math.max(nz(atrChart, 0.0) * 0.05, syminfo.mintick * 5)
+    for i = 0 to array.size(LV) - 1
+        Lvl l = array.get(LV, i)
+        if l.act and not na(l.px)
+            color c = l.prio >= 10 ? colLv : l.prio >= 5 ? color.new(colSub, 45) : color.new(colSoft, 35)
+            bool isActive = (not na(lvPriceS) and math.abs(l.px - lvPriceS) <= lvTolAbs * 0.5) or (not na(lvPriceL) and math.abs(l.px - lvPriceL) <= lvTolAbs * 0.5)
+            int w = isActive ? 2 : 1
+            line ln = line.new(x1, l.px, bar_index + 1, l.px, extend = extend.right, color = c, width = w, style = l.prio >= 10 ? line.style_dashed : line.style_dotted)
+            array.push(lvLines, ln)
+            int mergeIdx = -1
+            if array.size(lvDrawPx) > 0
+                for k = 0 to array.size(lvDrawPx) - 1
+                    if math.abs(l.px - array.get(lvDrawPx, k)) <= mergeTol
+                        mergeIdx := k
+                        break
+            if mergeIdx >= 0
+                string txt = array.get(lvDrawNm, mergeIdx) + " / " + l.nm
+                array.set(lvDrawNm, mergeIdx, txt)
+                label.set_text(array.get(lvLabels, mergeIdx), txt)
+            else
+                label lb = label.new(x1, l.px, l.nm, style = label.style_label_right, color = color.new(c, 85), textcolor = colTxt, size = size.tiny)
+                array.push(lvLabels, lb)
+                array.push(lvDrawPx, l.px)
+                array.push(lvDrawNm, l.nm)
+// ──────────────────────── ТАБЛИЦА ЧЕК-ЛИСТА ────────────────────────
+posTbl  = tblPos == "Верх-право" ? position.top_right : tblPos == "Верх-лево" ? position.top_left : tblPos == "Низ-право" ? position.bottom_right : position.bottom_left
+posStat = tblPos == "Верх-право" ? position.bottom_right : tblPos == "Верх-лево" ? position.bottom_left : tblPos == "Низ-право" ? position.top_right : position.top_left
+posDiag = tblPos == "Верх-право" ? position.bottom_left : tblPos == "Верх-лево" ? position.bottom_right : tblPos == "Низ-право" ? position.top_left : position.top_right
+// цвета таблиц берутся из блока ПАЛИТРА выше
+f_row(table t, int r, string nm, bool ok, string info) =>
+    string rsz = tblCompact ? size.tiny : size.small
+    table.cell(t, 0, r, nm, text_color = colName, text_halign = text.align_left, text_size = rsz, bgcolor = colRowBg)
+    table.cell(t, 1, r, ok ? "✓" : "✗", text_color = ok ? colOk : colBad, text_halign = text.align_center, text_size = rsz, bgcolor = colRowBg)
+    table.cell(t, 2, r, tblCompact ? "" : info, text_color = colInfo, text_halign = text.align_left, text_size = rsz, bgcolor = colRowBg)
+    true
+f_row2(table t, int r, string nm, float p) =>
+    color c = p < 10.0 ? colBad : p < 30.0 ? colGold : colOk
+    table.cell(t, 0, r, nm, text_color = colName, text_halign = text.align_left, text_size = size.small, bgcolor = colRowBg)
+    table.cell(t, 1, r, f_num(p, "#") + "%", text_color = c, text_halign = text.align_right, text_size = size.small, bgcolor = colRowBg)
+    true
+var table tbl = table.new(posTbl, 3, 14, bgcolor = color.new(colBg, 6), border_width = 1, border_color = colBrd, frame_width = 1, frame_color = colBrd)
+var table tblS = table.new(posStat, 2, 14, bgcolor = color.new(colBg, 6), border_width = 1, border_color = colBrd, frame_width = 1, frame_color = colBrd)
+var table tblD = table.new(posDiag, 2, 13, bgcolor = color.new(colBg, 6), border_width = 1, border_color = colBrd, frame_width = 1, frame_color = colBrd)
+float vRisk = isL ? riskL : riskS
+float vRiskAtr = isL ? riskAtrL : riskAtrS
+float vLvPrice = isL ? lvPriceL : lvPriceS
+string vLvName = isL ? lvNameL : lvNameS
+int vLvAgo = isL ? lvAgoL : lvAgoS
+float vTouchPrice = isL ? lvTouchPriceL : lvTouchPriceS
+string vTouchName = isL ? lvTouchNameL : lvTouchNameS
+int vTouchAgo = isL ? lvTouchAgoL : lvTouchAgoS
+float vTgt  = isL ? tgtL : tgtS
+float vRR   = isL ? rrL : rrS
+int   vBarsTouch = isL ? barsTouchL : barsTouchS
+int   vBarsTest  = isL ? barsEmaTestL : barsEmaTestS
+int   vBarsTrig  = isL ? barsTrigL : barsTrigS
+int   vScore     = isL ? scoreL : scoreS
+bool  vSweep     = isL ? fSweepL : fSweepS
+bool  vBos       = isL ? fBosL : fBosS
+bool  vFvg       = isL ? fFvgL : fFvgS
+bool  vChok      = isL ? fChokL : fChokS
+bool  vUseLv    = isL ? useLvL : useLvS
+bool  vEmaSetup = isL ? emaSetupL : emaSetupS
+string emaTouchLbl = (touchWarn and tfFallback) ? "EMA200 ТФ графика" : "EMA200"
+string ctxName    = (tfWarn and tfFallback) ? "ТФ графика" : htfTf
+string tfNote     = (tfWarn ? (tfFallback ? " · контекст: ТФ графика" : " · ТФ контекста должен быть выше ТФ графика") : "") + (touchWarn ? (tfFallback ? " · касание: ТФ графика" : " · ТФ касания должен быть ≥ ТФ графика") : "")
+string infoTouch  = vUseLv and not na(vTouchPrice) ? vTouchName + " · " + str.tostring(vTouchAgo) + " бар назад" : (vEmaSetup and vBarsTouch <= touchBars ? emaTouchLbl + " · " + f_num(vBarsTouch * tfSec / 3600.0, "#.#") + " ч" : "касания нет")
+string infoSlope  = "наклон " + f_num(slopeVal, "#.###") + " ATR/бар · окно " + str.tostring(slopeLen) + (flatMkt ? " · ФЛЕТ" : "")
+string infoCtx    = not ctxKnown ? "нет данных старшего ТФ" + tfNote : (isL ? "цена выше EMA200" : "цена ниже EMA200") + " (" + f_num(htfEmaEff, format.mintick) + ")" + (useDayCtx ? (dayUp ? " · D ↑" : dayDn ? " · D ↓" : " · D —") : "") + tfNote
+string infoTest   = vUseLv and not na(vLvPrice) ? vLvName + " · отбой " + str.tostring(vLvAgo) + " бар" : (vEmaSetup and vBarsTest <= testLook ? emaTouchLbl + " · отбой " + str.tostring(vBarsTest) + " бар" : "теста нет")
+string infoTrig   = vBarsTrig <= trigLook ? "триггер " + str.tostring(vBarsTrig) + " бар(ов) назад" : "триггера нет"
+string infoRisk   = (riskAtrMode ? f_num(vRiskAtr, "#.##") + " ATR  (коридор " + f_num(riskMinAtr, "#.##") + "–" + f_num(riskMaxAtr, "#.##") + ")" : f_num(vRisk, "#.##") + "%  (коридор " + f_num(riskMin, "#.##") + "–" + f_num(riskMax, "#.##") + "%)") + (riskMinAtr > riskMaxAtr ? " ⚠" : "")
+string infoTarget = f_num(vTgt, "#.##") + "%  ·  R:R " + f_num(vRR, "#.#") + "  (" + f_num(tgtMin, "#.##") + "–" + f_num(tgtMax, "#.##") + "%)" + (useDayBud and not na(dayCap) ? "  ·  лимит " + f_num(dayCap, "#.##") + "%" : "") + (tgtMin > tgtMax ? " ⚠" : "")
+string infoChop   = "ER " + f_num(erVal, "#.##") + " · диапазон " + f_num(rngAtr, "#.#") + " ATR"
+string infoFac    = str.tostring(vScore) + "/" + str.tostring(facMax) + " · свип" + (vSweep ? "✓" : "✗") + " BOS" + (vBos ? "✓" : "✗") + " FVG" + (vFvg ? "✓" : "✗") + (useChoch ? " CHoCH" + (vChok ? "✓" : "✗") : "")
+string infoFltr   = (not useVwap and not useStack and not useMacd and not useRsi and not useDisc and not useSprd and not useEq and not useRvol and not useOb and not useDxy) ? "все выключены — не блокируют" : (useVwap ? "VWAP" + (okVwap ? "✓" : "✗") + " " : "") + (useStack ? "EMA" + (okStack ? "✓" : "✗") + " " : "") + (useMacd ? "MACD" + (okMacd ? "✓" : "✗") + " " : "") + (useRsi ? "RSI" + (okRsi ? "✓" : "✗") + " " : "") + (useSprd ? "спред" + (okSprd ? "✓" : "✗") + " " : "") + (useEq ? "пул" + (okEq ? "✓" : "✗") + " " : "") + (useRvol ? "rVol" + (okRvol ? "✓" : "✗") + " " : "") + (useOb ? "OB" + (okOb ? "✓" : "✗") + " " : "") + (useDxy ? "DXY" + (okDxy ? "✓" : "✗") + " " : "") + (useDisc ? "дисконт" + (okDisc ? "✓" : "✗") : "")
+array<string> sessArr = array.new_string()
+if sAsiaOn
+    array.push(sessArr, "Азия " + sAsiaTf + " (" + f_mskWin("Asia/Tokyo", sAsiaTf) + " МСК)")
+if sLdnOn
+    array.push(sessArr, "Лдн " + sLdnTf + " (" + f_mskWin("Europe/London", sLdnTf) + " МСК)")
+if sLnoOn
+    array.push(sessArr, "Лдн+НЙ " + sLnoTf + " (" + f_mskWin("Europe/London", sLnoTf) + " МСК)")
+if sNyOn
+    array.push(sessArr, "НЙ " + sNyTf + " (" + f_mskWin("America/New_York", sNyTf) + " МСК)")
+string sessListOn = array.size(sessArr) > 0 ? array.join(sessArr, " · ") : "нет включённых"
+string infoSess = (not sessTfOn ? "сессии не применяются на ТФ " + timeframe.period : inRollover ? "ролловер (НЙ) — вход заблокирован" : not useSess ? "фильтр сессий выключен" : useSessAuto ? (inSess ? "в сессии " + sessName + " · вкл: " + sessListOn : "вне сессий · вкл: " + sessListOn) : (inSess ? "в окне " + sessName : "вне окна " + sessName)) + (newsBlock ? " · новости" : "") + (kzOn and sessTfOn and not kzOk ? " · вне кильзоны" : "") + (not dayLimOk ? " · ЛИМИТ ДНЯ (" + str.tostring(dayTrades) + " сд., " + f_num(dayR, "#.##") + "R)" : "")
+string infoSide   = not ctxKnown ? "нет данных старшего ТФ" : isL ? "LONG (контекст " + ctxName + ")" : "SHORT (контекст " + ctxName + ")"
+string infoVerdict = allOk ? (isL ? "СИГНАЛ: LONG" : "СИГНАЛ: SHORT") : (modeSoft ? "МЯГКИЙ " + str.tostring(softCnt) + "/" + str.tostring(softNeed) + " · ждём " + str.tostring(missing) : "ЖДЁМ: не выполнено " + str.tostring(missing) + " п.")
+if showTbl and barstate.islast
+    table.cell(tbl, 0, 0, "KidzordFx V1.6 · P1", text_color = colGold, text_halign = text.align_left, text_size = size.normal, bgcolor = colHeadA)
+    table.cell(tbl, 1, 0, not ctxKnown ? "—" : isL ? "LONG" : "SHORT", text_color = not ctxKnown ? colSub : isL ? colOk : colBad, text_halign = text.align_center, text_size = size.normal, bgcolor = colHeadA)
+    table.cell(tbl, 2, 0, syminfo.ticker + " · " + timeframe.period + " · " + touchTf + "/" + htfTf + ((tfWarn or touchWarn) ? " ⚠" : ""), text_color = colSub, text_halign = text.align_left, text_size = size.normal, bgcolor = colHeadA)
+    f_row(tbl, 1, "1 · Сторона", r1, infoSide)
+    f_row(tbl, 2, "2 · Контекст " + ctxName + "+1D", r2, infoCtx)
+    f_row(tbl, 3, "3 · Касание уровня", r3, infoTouch)
+    f_row(tbl, 4, "4 · Не флет (наклон)", r4, infoSlope)
+    f_row(tbl, 5, "5 · Тест сетапа", r5, infoTest)
+    f_row(tbl, 6, "6 · Триггер", r6, infoTrig)
+    f_row(tbl, 7, "7 · Риск в коридоре", r7, infoRisk)
+    f_row(tbl, 8, "8 · Цель: следующая валидная", r8, infoTarget)
+    f_row(tbl, 9, "9 · ER / диапазон", r9, infoChop)
+    f_row(tbl, 10, "10 · Факторы SMC", r10, infoFac)
+    f_row(tbl, 11, "11 · Доп. фильтры", r11, infoFltr)
+    f_row(tbl, 12, "12 · Сессии и лимиты", r12, infoSess)
+    table.cell(tbl, 0, 13, "ИТОГ", text_color = colGold, text_halign = text.align_left, text_size = size.normal, bgcolor = allOk ? color.new(colOk, 82) : colHeadA)
+    table.cell(tbl, 1, 13, allOk ? "●" : "·", text_color = allOk ? colOk : colBad, text_halign = text.align_center, text_size = size.normal, bgcolor = allOk ? color.new(colOk, 82) : colHeadA)
+    table.cell(tbl, 2, 13, infoVerdict, text_color = allOk ? colTxt : colSub, text_halign = text.align_left, text_size = size.normal, bgcolor = allOk ? color.new(colOk, 82) : colHeadA)
+// ──────────────────────── ТАБЛИЦА СТАТИСТИКИ ────────────────────────
+float winRate = nTrades > 0 ? nWins / nTrades * 100.0 : 0.0
+float avgR    = nTrades > 0 ? sumR / nTrades : 0.0
+float pfVal   = sumLoss < 0.0 ? sumWin / math.abs(sumLoss) : na
+string statTf = timeframe.period + " · " + touchTf + "/" + htfTf
+string pfTxt  = na(pfVal) ? (sumWin > 0.0 ? "∞" : "—") : f_num(pfVal, "#.##")
+color  pfCol  = na(pfVal) ? colSub : pfVal >= 1.0 ? colOk : colBad
+string tpShareTxt = str.tostring(p1PctSafe) + "/" + str.tostring(p2PctSafe) + "/" + str.tostring(p3PctSafe) + "%" + ((p1Pct + p2Pct > 100 or tp1R >= tp2R or tp2R >= tp3R) ? " ⚠" : "")
+if showStats and barstate.islast
+    table.cell(tblS, 0, 0, "СТАТИСТИКА · " + statTf, text_color = colGold, text_halign = text.align_left, text_size = size.normal, bgcolor = colHeadA)
+    table.cell(tblS, 1, 0, str.tostring(nTrades) + " сд.", text_color = colSub, text_halign = text.align_right, text_size = size.normal, bgcolor = colHeadA)
+    table.cell(tblS, 0, 1, "Доля прибыльных", text_color = colName, text_halign = text.align_left, text_size = tblCompact ? size.tiny : size.small, bgcolor = colRowBg)
+    table.cell(tblS, 1, 1, nTrades > 0 ? f_num(winRate, "#.#") + "%" : "—", text_color = nTrades > 0 ? (winRate >= 50.0 ? colOk : colBad) : colSub, text_halign = text.align_right, text_size = tblCompact ? size.tiny : size.small, bgcolor = colRowBg)
+    table.cell(tblS, 0, 2, "Ср. R на сделку", text_color = colName, text_halign = text.align_left, text_size = tblCompact ? size.tiny : size.small, bgcolor = colRowBg)
+    table.cell(tblS, 1, 2, nTrades > 0 ? f_num(avgR, "#.##") : "—", text_color = nTrades > 0 ? (avgR >= 0.0 ? colOk : colBad) : colSub, text_halign = text.align_right, text_size = tblCompact ? size.tiny : size.small, bgcolor = colRowBg)
+    table.cell(tblS, 0, 3, "Profit factor", text_color = colName, text_halign = text.align_left, text_size = tblCompact ? size.tiny : size.small, bgcolor = colRowBg)
+    table.cell(tblS, 1, 3, pfTxt, text_color = pfCol, text_halign = text.align_right, text_size = tblCompact ? size.tiny : size.small, bgcolor = colRowBg)
+    table.cell(tblS, 0, 4, "Сумма R", text_color = colName, text_halign = text.align_left, text_size = tblCompact ? size.tiny : size.small, bgcolor = colRowBg)
+    table.cell(tblS, 1, 4, f_num(sumR, "#.##"), text_color = sumR >= 0.0 ? colOk : colBad, text_halign = text.align_right, text_size = tblCompact ? size.tiny : size.small, bgcolor = colRowBg)
+    if not tblCompact
+        table.cell(tblS, 0, 5, "Макс. просадка, R", text_color = colName, text_halign = text.align_left, text_size = size.small, bgcolor = colRowBg)
+        table.cell(tblS, 1, 5, f_num(ddR, "#.##"), text_color = colBad, text_halign = text.align_right, text_size = size.small, bgcolor = colRowBg)
+        table.cell(tblS, 0, 6, "TP / доли", text_color = colName, text_halign = text.align_left, text_size = size.small, bgcolor = colRowBg)
+        table.cell(tblS, 1, 6, f_num(tp1R, "#.#") + "/" + f_num(tp2R, "#.#") + "/" + f_num(tp3R, "#.#") + "R · " + tpShareTxt, text_color = colInfo, text_halign = text.align_right, text_size = size.small, bgcolor = colRowBg)
+        table.cell(tblS, 0, 7, "Исходы: SL / TP1 / TP2 / TP3 / время", text_color = colName, text_halign = text.align_left, text_size = size.small, bgcolor = colRowBg)
+        table.cell(tblS, 1, 7, str.tostring(cntSl) + " / " + str.tostring(cntTp1) + " / " + str.tostring(cntTp2) + " / " + str.tostring(cntFull) + " / " + str.tostring(cntTime), text_color = colInfo, text_halign = text.align_right, text_size = size.small, bgcolor = colRowBg)
+        table.cell(tblS, 0, 8, "Симуляция, без комиссий", text_color = color.new(colSub, 40), text_halign = text.align_left, text_size = size.tiny, bgcolor = colRowBg)
+        table.cell(tblS, 1, 8, "вход по закрытию", text_color = color.new(colSub, 40), text_halign = text.align_right, text_size = size.tiny, bgcolor = colRowBg)
+    // P3-1: сессии входа
+    if showSessStat and not tblCompact
+        array<string> sessNames = array.from("вне сессий", "Азия", "Лондон", "НЙ/окно")
+        int srow = 9
+        for i = 0 to 3
+            int sCnt = array.get(sessN, i)
+            if sCnt > 0
+                float sR = array.get(sessR, i)
+                float sWr = array.get(sessW, i) * 100.0 / sCnt
+                table.cell(tblS, 0, srow, array.get(sessNames, i), text_color = colName, text_halign = text.align_left, text_size = size.small, bgcolor = colRowBg)
+                table.cell(tblS, 1, srow, str.tostring(sCnt) + " сд · " + f_num(sR, "#.##") + "R · " + f_num(sWr, "#") + "%", text_color = sR >= 0.0 ? colOk : colBad, text_halign = text.align_right, text_size = size.small, bgcolor = colRowBg)
+                srow += 1
+        // лучший/худший день недели
+        array<string> dowNames = array.from("—", "Вс", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб")
+        int bestI = 0
+        int worstI = 0
+        float bestR = -1.0e10
+        float worstR = 1.0e10
+        for j = 1 to 7
+            if array.get(dowN, j) > 0
+                float dR = array.get(dowR, j)
+                if dR > bestR
+                    bestR := dR
+                    bestI := j
+                if dR < worstR
+                    worstR := dR
+                    worstI := j
+        if bestI > 0 and worstI > 0
+            table.cell(tblS, 0, srow, "Дни недели", text_color = colName, text_halign = text.align_left, text_size = size.small, bgcolor = colRowBg)
+            table.cell(tblS, 1, srow, array.get(dowNames, bestI) + " " + f_num(bestR, "#.##") + "R · " + array.get(dowNames, worstI) + " " + f_num(worstR, "#.##") + "R", text_color = colInfo, text_halign = text.align_right, text_size = size.small, bgcolor = colRowBg)
+// ──────────────────────── ДИАГНОСТИКА УСЛОВИЙ ────────────────────────
+// Какую долю баров в окне каждое условие было выполнено (красное = душит сигналы)
+int   nSigD = int(math.sum((longEvt or shortEvt) ? 1.0 : 0.0, diagLen))
+int   nEntD = int(math.sum((goLong or goShort) ? 1.0 : 0.0, diagLen))
+float d1  = math.sum(r1  ? 1.0 : 0.0, diagLen) / diagLen * 100.0
+float d2  = math.sum(r2  ? 1.0 : 0.0, diagLen) / diagLen * 100.0
+float d3  = math.sum(r3  ? 1.0 : 0.0, diagLen) / diagLen * 100.0
+float d4  = math.sum(r4  ? 1.0 : 0.0, diagLen) / diagLen * 100.0
+float d5  = math.sum(r5  ? 1.0 : 0.0, diagLen) / diagLen * 100.0
+float d6  = math.sum(r6  ? 1.0 : 0.0, diagLen) / diagLen * 100.0
+float d7  = math.sum(r7  ? 1.0 : 0.0, diagLen) / diagLen * 100.0
+float d8  = math.sum(r8  ? 1.0 : 0.0, diagLen) / diagLen * 100.0
+float d9  = math.sum(r9  ? 1.0 : 0.0, diagLen) / diagLen * 100.0
+float d10 = math.sum(r10 ? 1.0 : 0.0, diagLen) / diagLen * 100.0
+float d11 = math.sum(r11 ? 1.0 : 0.0, diagLen) / diagLen * 100.0
+float d12 = math.sum(r12 ? 1.0 : 0.0, diagLen) / diagLen * 100.0
+if showDiag and barstate.islast and not tblCompact
+    table.cell(tblD, 0, 0, "ДИАГНОСТИКА · " + str.tostring(diagLen) + " бар", text_color = colGold, text_halign = text.align_left, text_size = size.normal, bgcolor = colHeadA)
+    table.cell(tblD, 1, 0, "сигн. " + str.tostring(nSigD) + " / входов " + str.tostring(nEntD), text_color = colSub, text_halign = text.align_right, text_size = size.normal, bgcolor = colHeadA)
+    f_row2(tblD, 1, "1 · Сторона", d1)
+    f_row2(tblD, 2, "2 · Контекст", d2)
+    f_row2(tblD, 3, "3 · Касание 200", d3)
+    f_row2(tblD, 4, "4 · Наклон", d4)
+    f_row2(tblD, 5, "5 · Тест", d5)
+    f_row2(tblD, 6, "6 · Триггер", d6)
+    f_row2(tblD, 7, "7 · Риск", d7)
+    f_row2(tblD, 8, "8 · Цель/RR", d8)
+    f_row2(tblD, 9, "9 · Болтанка", d9)
+    f_row2(tblD, 10, "10 · Факторы", d10)
+    f_row2(tblD, 11, "11 · Фильтры", d11)
+    f_row2(tblD, 12, "12 · Окно", d12)
+// ──────────────────────── АЛЕРТЫ ────────────────────────
+alertcondition(goLong,  "Чек-лист: LONG",  "SMC EMA200: LONG {{ticker}} · {{interval}} · {{close}}")
+alertcondition(goShort, "Чек-лист: SHORT", "SMC EMA200: SHORT {{ticker}} · {{interval}} · {{close}}")

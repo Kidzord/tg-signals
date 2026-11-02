@@ -24,8 +24,10 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import feeds
+import mt5_screenshot
 import render as card
 import sonar
+import store
 import strategy as st
 import ta_core as ta
 import tg
@@ -67,14 +69,27 @@ ICT_FVG_WINDOW = int(os.getenv("ICT_FVG_WINDOW", "20"))
 ICT_RETEST_LOOK = int(os.getenv("ICT_RETEST_LOOK", "40"))
 ICT_STOP_BUF = float(os.getenv("ICT_STOP_BUF", "0.25"))
 STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             f"bot_state_{SYMBOL.replace('.', '_')}.json")
+                             f"bot_state_{SYMBOL.replace('.', '_')}_{STRATEGY}.json")
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "renders")
 # Дневной риск-гард: один журнал на все процессы (9 символов пишут в него стопы).
 RISK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "daily_risk.log")
 # Очередь опубликованных сигналов для premium-бота: он разошлёт их подписчикам сразу.
 QUEUE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "signals_queue.jsonl")
+# События закрытия/частичного выхода: premium-бот обновляет ими карточку входа.
+RESULTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results_queue.jsonl")
 # Журнал закрытых сделок: по нему autoposts.py собирает итог дня и итог недели.
 TRADES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trades.jsonl")
+# data_path терминала: через него ScreenshotEA и Python обмениваются файлами.
+MT5_DATA_PATH = ""
+# 1 — при выходе просить PNG у ScreenshotEA; 0 — всегда рисовать карточку сами.
+MT5_SCREENSHOT = os.getenv("MT5_SCREENSHOT", "1").strip().lower() in ("1", "true", "yes")
+# Группы коррелированных символов: 4 индекса — почти один рынок, мажоры доллара
+# тоже ходят вместе. Кросс-лок не даёт группе набрать стек одновременных ставок.
+RISK_GROUP = {
+    "US500": "indices", "EUSTX50": "indices", "UK100": "indices", "DE40": "indices",
+    "AUDUSD": "usd_fx", "USDCAD": "usd_fx", "GBPUSD": "usd_fx",
+    "XAUUSD": "metals",
+}
 # Задержка публикации сигнала в бесплатную группу, секунд (0 — без задержки).
 # Premium-подписчики получают сигнал мгновенно через очередь.
 FREE_DELAY_SEC = int(float(os.getenv("FREE_DELAY_SEC", "600") or 600))
@@ -88,17 +103,23 @@ LATE_MOVE_PCT = float(os.getenv("LATE_MOVE_PCT", "0.2") or 0.2)
 POSTMORTEM_ENABLED = os.getenv("POSTMORTEM_ENABLED", "1").strip().lower() in ("1", "true", "yes")
 # Подпись-дисклеймер (как в config.DISCLAIMER, но bot.py читает .env напрямую)
 DISCLAIMER = os.getenv("DISCLAIMER", "Не является инвестиционной рекомендацией.").strip()
-# «Пульс» бота: autoposts.py следит, что файл свежий (иначе алерт владельцу).
+# CTA в бесплатной группе: premium-бот без задержки и с расчётом под счёт.
+PREMIUM_URL = os.getenv("PREMIUM_URL", "").strip()
+PREMIUM_CTA = (f'\n\n⚡ Без задержки и под твой депозит — <a href="{PREMIUM_URL}">Premium</a>'
+               if PREMIUM_URL else "")
+# «Пульс» бота: monitor.py следит, что файл свежий (иначе алерт владельцу).
 HEARTBEAT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              f"hb_{SYMBOL.replace('.', '_')}.json")
-# Отложенные посты в бесплатную группу: (когда, файл, подпись, вход, сторона)
-PENDING: list[tuple[float, str, str, float, str]] = []
+                              f"hb_{SYMBOL.replace('.', '_')}_{STRATEGY}.json")
 
 PARAMS = st.Params(
     use_ib=False,
     side_allow="Обе",
     mode_soft=True,
     soft_need=2,
+    # комбо из честного бэктеста KidzordEA (XAUUSD M15: +12%/90д против +4.8% базы):
+    # узкий стоп-коридор и R:R >= 2; env-ручки на случай отката
+    risk_max_atr=float(os.getenv("CL_RISK_MAX_ATR", "2.0")),
+    min_rr=float(os.getenv("CL_MIN_RR", "2.0")),
 )
 
 
@@ -116,6 +137,13 @@ class MT5Data:
         if not mt5.initialize(timeout=20000):
             raise RuntimeError(f"MT5 не отвечает: {mt5.last_error()}")
         self._off: dict[str, int] = {}
+        global MT5_DATA_PATH
+        try:
+            info = mt5.terminal_info()
+            self.data_path = info.data_path if info else ""
+        except Exception:
+            self.data_path = ""
+        MT5_DATA_PATH = self.data_path
 
     def offset(self, symbol: str) -> int:
         """MT5 отдаёт время сервера как есть — не сдвигаем.
@@ -180,17 +208,50 @@ def load_frames(data: MT5Data, symbol: str, tf: str, bars: int):
 # ------------------------------------------------------------------ состояние
 
 def load_state() -> dict:
-    if os.path.exists(STATE_PATH):
+    default = {"last_signal_bar": 0, "trade": None,
+               "stats": {"n": 0, "wins": 0, "sum_r": 0.0}}
+    if not os.path.exists(STATE_PATH):
+        return default
+    try:
+        with open(STATE_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        # битый state = потеря открытой сделки и кулдаунов: сохраняем копию для разбора
+        bad = f"{STATE_PATH}.corrupt-{int(time.time())}"
         try:
-            return json.load(open(STATE_PATH, encoding="utf-8"))
-        except Exception:
+            os.replace(STATE_PATH, bad)
+        except OSError:
             pass
-    return {"last_signal_bar": 0, "trade": None, "stats": {"n": 0, "wins": 0, "sum_r": 0.0}}
+        print(f"состояние повреждено ({e}) — начал с чистого, копия: {bad}")
+        return default
 
 
 def save_state(state: dict) -> None:
-    with open(STATE_PATH, "w", encoding="utf-8") as f:
+    """Атомарная запись: убийство процесса не должно оставлять обрезанный JSON."""
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    for attempt in range(5):
+        try:
+            os.replace(tmp, STATE_PATH)
+            return
+        except PermissionError:
+            # Windows: читатель может на миг держать файл открытым
+            time.sleep(0.1 * (attempt + 1))
+    os.replace(tmp, STATE_PATH)
+
+
+def write_heartbeat(info: dict) -> None:
+    """Отметка «бот жив»: monitor.py сравнивает mtime и шлёт алерт при простое."""
+    try:
+        with open(HEARTBEAT_PATH, "w", encoding="utf-8") as f:
+            json.dump({"ts": time.time(), "pid": os.getpid(),
+                       "symbol": SYMBOL, "strategy": STRATEGY,
+                       "bar": info.get("bar"), "ok": bool(info.get("ok"))}, f)
+    except OSError:
+        pass
 
 
 def _utc_day(bar_ts: float) -> str:
@@ -246,33 +307,167 @@ def threads_text(sig: card.Signal, source: str = "MT5") -> str:
     return "\n".join(lines)
 
 
-def queue_signal(path: str, caption: str) -> None:
-    """Кладём сигнал в очередь — premium-бот разошлёт его подписчикам сразу."""
-    rec = {"ts": time.time(), "path": os.path.abspath(path), "caption": caption}
+def append_jsonl(path: str, rec: dict) -> None:
+    """Добавить запись в общий jsonl под блокировкой.
+
+    В файл пишут 9+ процессов; обычный append в Windows не гарантирует
+    атомарность строки, а по signals_queue.jsonl premium-бот разносит
+    сигналы подписчикам. msvcrt.locking даёт взаимное исключение.
+    """
+    import msvcrt
+    line = (json.dumps(rec, ensure_ascii=False) + "\n").encode("utf-8")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
     try:
-        with open(QUEUE_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+        try:
+            os.write(fd, line)
+        finally:
+            try:
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
     except OSError as e:
-        print("очередь premium недоступна:", e)
+        print("журнал недоступен:", e)
+    finally:
+        os.close(fd)
 
 
-def flush_pending() -> None:
-    """Посты в бесплатную группу, у которых вышла задержка."""
-    now = time.time()
-    keep = []
-    for due, path, cap in PENDING:
-        if now >= due:
-            ok, info = tg.send_photo(path, cap)
-            print("группа (с задержкой):", ok, info)
+def trade_id_for(sig: card.Signal, bar_ts: float | None = None) -> str:
+    """Стабильный ID сделки: по нему premium-бот связывает вход и результат."""
+    ts = int(bar_ts if bar_ts is not None else sig.when.timestamp())
+    return f"{sig.symbol}_{ts}"
+
+
+def queue_signal(path: str, caption: str, *, trade_id: str, sig: card.Signal) -> None:
+    """Кладём сигнал в очередь — premium-бот разошлёт его подписчикам сразу."""
+    rec = {
+        "ts": time.time(), "kind": "entry", "trade_id": trade_id,
+        "path": os.path.abspath(path), "caption": caption,
+        "symbol": sig.symbol, "side": sig.side, "tf": sig.tf,
+        "entry": sig.entry, "sl": sig.sl,
+        "tp1": sig.tp1, "tp2": sig.tp2, "tp3": sig.tp3,
+        "strategy": STRATEGY,
+    }
+    append_jsonl(QUEUE_PATH, rec)
+
+
+def queue_result(*, trade_id: str, kind: str, side: str, r: float,
+                 total_r: float, entry: float, stop: float | None,
+                 exit_px: float | None, note: str = "",
+                 symbol: str | None = None) -> None:
+    """Событие сделки для premium-бота: он обновит подпись карточки входа."""
+    rec = {
+        "ts": time.time(), "kind": "result", "event": kind, "trade_id": trade_id,
+        "symbol": symbol or SYMBOL, "side": side, "r": round(float(r), 4),
+        "total_r": round(float(total_r), 4), "entry": entry, "stop": stop,
+        "exit": exit_px, "note": note, "strategy": STRATEGY,
+    }
+    append_jsonl(RESULTS_PATH, rec)
+
+
+def _late_note(row, data: "MT5Data | None") -> str:
+    """Пометка «цена ушла» для отложенного поста в бесплатную группу."""
+    if not LATE_ENABLED or data is None or row["entry"] is None:
+        return ""
+    try:
+        sym = str(row["symbol"] or SYMBOL)
+        # MT5Data.frame требует минимум 50 баров — 3 не хватало и пометка не работала
+        frame = data.frame(sym, TF, 60)
+        price = float(frame.c[-1])
+        entry = float(row["entry"])
+    except Exception:
+        return ""
+    if entry <= 0:
+        return ""
+    side = str(row["side"] or "")
+    if side == "LONG" and price < entry * (1 - LATE_MOVE_PCT / 100.0):
+        pass
+    elif side == "SHORT" and price > entry * (1 + LATE_MOVE_PCT / 100.0):
+        pass
+    else:
+        return ""
+    return "\n⚠️ Цена ушла от входа — входить по текущей, не по карточке."
+
+
+def flush_pending(data: "MT5Data | None" = None) -> None:
+    """Доставить посты в бесплатную группу, у которых вышла задержка.
+
+    Очередь в SQLite, поэтому перезапуск бота не теряет отложенный сигнал.
+    429 уважаем, сетевые ошибки повторяем с нарастающей паузой.
+    """
+    for row in store.claim_group():
+        cap = str(row["caption"] or "")
+        if row["kind"] == "entry" and "Итог:" not in cap:
+            cap += _late_note(row, data)
+        path = str(row["path"] or "")
+        if path and os.path.exists(path):
+            res = tg.send_photo_result(path, cap)
         else:
-            keep.append((due, path, cap))
-    PENDING[:] = keep
+            res = tg.send_message_result(cap)
+        if res.ok:
+            store.mark_group_sent(row["id"])
+            print("группа:", "ок", row["trade_id"], row["kind"])
+        elif res.retry_after:
+            store.mark_group_retry(row["id"], res.error, res.retry_after)
+            print(f"группа: 429, повтор через {res.retry_after:.0f} с")
+        elif int(row["attempts"]) + 1 >= 6:
+            store.mark_group_terminal(row["id"], "failed", res.error)
+            print("группа: не доставлено", row["trade_id"], res.error)
+        else:
+            delay = min(300, 15 * (2 ** int(row["attempts"])))
+            store.mark_group_retry(row["id"], res.error, delay)
+            print(f"группа: ошибка ({res.error[:80]}), повтор через {delay} с")
 
 
-def post_signal(sig: card.Signal, chart: st.Frame, regime: str | None = None) -> bool:
+def open_trades_in_group(group: str) -> int:
+    """Открытые сделки соседних ботов той же группы (по их state-файлам).
+
+    Сделка считается живой, если она моложе 36 ч (максимум 120 баров M15 +
+    запас на простой бота) — иначе state умершего бота не блокирует группу.
+    """
+    root = os.path.dirname(os.path.abspath(__file__))
+    now = time.time()
+    n = 0
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return 0
+    for name in names:
+        if not (name.startswith("bot_state_") and name.endswith(".json")):
+            continue
+        parts = name[len("bot_state_"):-len(".json")].split("_")
+        sym = parts[0] if parts else ""
+        if sym == SYMBOL or RISK_GROUP.get(sym, sym) != group:
+            continue
+        try:
+            with open(os.path.join(root, name), encoding="utf-8") as f:
+                other = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        tr = other.get("trade") if isinstance(other, dict) else None
+        if not tr:
+            continue
+        age_h = (now - float(tr.get("ts_saved") or tr.get("bar_ts", 0))) / 3600.0
+        if 0 <= age_h <= 36:
+            n += 1
+    return n
+
+
+def post_signal(sig: card.Signal, chart: st.Frame, regime: str | None = None,
+                trade_id: str | None = None) -> bool:
+    # кросс-символьный риск-лок: не больше CROSS_MAX_OPEN открытых сделок
+    # в группе коррелированных символов
+    max_open = int(os.getenv("CROSS_MAX_OPEN", "2"))
+    group = RISK_GROUP.get(SYMBOL, SYMBOL)
+    if max_open > 0:
+        same = open_trades_in_group(group)
+        if same >= max_open:
+            print(f"кросс-лок: группа {group} уже несёт {same} открытых — сигнал пропущен")
+            return False
     if DRY:
         print("[dry] сигнал:", sig.side, sig.entry, "SL", sig.sl, "TP", sig.tp1, sig.tp2, sig.tp3)
         return True
+    tid = trade_id or trade_id_for(sig)
     os.makedirs(OUT_DIR, exist_ok=True)
     path = os.path.join(OUT_DIR, f"signal_{sig.when:%Y%m%d_%H%M%S}.png")
     bars = [feeds.Bar(dt.datetime.fromtimestamp(float(chart.t[j]), dt.timezone.utc),
@@ -280,22 +475,29 @@ def post_signal(sig: card.Signal, chart: st.Frame, regime: str | None = None) ->
             for j in range(len(chart.t))]
     card.render_card(sig, bars, "MT5", False, path)
     caption = voice.signal_caption(sig, regime=regime, source="MT5")
-    # premium-подписчики получают сигнал сразу, бесплатная группа — с задержкой
-    queue_signal(path, caption)
+    if STRATEGY not in ("range", "sonar"):
+        caption += "\nстратегия: " + STRATEGY
+    # premium-подписчики получают сигнал сразу, бесплатная группа — с задержкой.
+    # CTA добавляем только в групповую версию: подписчику бота она не нужна.
+    queue_signal(path, caption, trade_id=tid, sig=sig)
+    due = time.time() + max(0, FREE_DELAY_SEC)
+    store.enqueue_group(trade_id=tid, kind="entry", path=path,
+                        caption=caption + PREMIUM_CTA,
+                        due_ts=due, entry=sig.entry, side=sig.side, symbol=sig.symbol)
     if FREE_DELAY_SEC > 0:
-        PENDING.append((time.time() + FREE_DELAY_SEC, path, caption))
         print(f"в группу уйдёт через {FREE_DELAY_SEC} с")
-        ok = True
     else:
-        ok, info = tg.send_photo(path, caption)
-        print("отправка:", ok, info)
+        flush_pending()
     if threads.enabled():
         ok2, info2 = threads.post(threads_text(sig))
         print("threads:", ok2, info2)
-    return ok
+    return True
 
 
-def note_trade(kind: str, side: str, r: float) -> None:
+def note_trade(kind: str, side: str, r: float, *, trade_id: str = "",
+               total_r: float | None = None, entry: float | None = None,
+               stop: float | None = None, exit_px: float | None = None,
+               note: str = "", image: str | None = None) -> None:
     """Записать итог закрытой сделки в журнал (autoposts.py считает по нему итоги).
 
     Частичные выходы (tp1/tp2) не пишем: сделка попадает в журнал один раз —
@@ -303,43 +505,129 @@ def note_trade(kind: str, side: str, r: float) -> None:
     """
     if kind in ("tp1", "tp2"):
         return
-    rec = {"ts": time.time(), "symbol": SYMBOL, "side": side,
-           "kind": kind, "r": round(float(r), 4)}
-    try:
-        with open(TRADES_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except OSError as e:
-        print("журнал сделок недоступен:", e)
+    rec = {"ts": time.time(), "symbol": SYMBOL, "side": side, "kind": kind,
+           "r": round(float(r), 4), "strategy": STRATEGY,
+           "trade_id": trade_id, "tf": TF,
+           "total_r": round(float(total_r if total_r is not None else r), 4),
+           "entry": entry, "stop": stop, "exit": exit_px, "note": note,
+           "image": image}
+    append_jsonl(TRADES_PATH, rec)
 
 
 def post_result(kind: str, side: str, r: float, *, entry: float | None = None,
                 stop: float | None = None, exit_px: float | None = None,
-                note: str = "") -> None:
-    """Результат сделки: карточка-исход + подпись. Если рендер не удался — текст."""
-    text = voice.event_text(kind, SYMBOL, side, r, note)
+                note: str = "", trade_id: str = "",
+                total_r: float | None = None,
+                chart: "st.Frame | None" = None,
+                entry_ts: float | None = None, exit_idx: int | None = None,
+                tp1: float | None = None, tp2: float | None = None,
+                tp3: float | None = None) -> None:
+    """Результат сделки: premium обновляет карточку, группа получает исход."""
+    text = voice.event_text(kind, SYMBOL, side, r, note) + PREMIUM_CTA
     if DRY:
         print("[dry]", text.replace("\n", " | "))
         return
-    note_trade(kind, side, r)
+    total = float(total_r if total_r is not None else r)
+    tid = trade_id or f"{SYMBOL}_{int(time.time())}"
+    # Сначала premium: событие durable в jsonl, subbot разложит его по outbox.
+    queue_result(trade_id=tid, kind=kind, side=side, r=r, total_r=total,
+                 entry=float(entry or 0), stop=stop, exit_px=exit_px, note=note)
+
+    path = ""
     try:
         os.makedirs(OUT_DIR, exist_ok=True)
         path = os.path.join(OUT_DIR, f"result_{SYMBOL}_{int(time.time() * 1000)}.png")
-        card.render_result_card(symbol=SYMBOL, side=side, kind=kind, r=r, entry=entry,
-                                stop=stop, exit_px=exit_px, note=note, tf=TF,
-                                out_path=path)
-        ok, info = tg.send_photo(path, text)
+        rendered = False
+        # 1) настоящий скриншот терминала через ScreenshotEA (если он запущен)
+        if MT5_SCREENSHOT and MT5_DATA_PATH and entry is not None and stop is not None:
+            exit_ts = None
+            if chart is not None and exit_idx is not None and 0 <= int(exit_idx) < len(chart.t):
+                exit_ts = float(chart.t[int(exit_idx)])
+            shot = mt5_screenshot.request(
+                SYMBOL, TF, data_path=MT5_DATA_PATH, side=side,
+                entry=float(entry), stop=float(stop),
+                tp1=tp1, tp2=tp2, tp3=tp3, exit_px=exit_px,
+                label=kind, r=r, entry_ts=entry_ts, exit_ts=exit_ts,
+                timeout=12)
+            if shot:
+                path = shot
+                rendered = True
+        # 2) иначе — свой график по данным MT5
+        if not rendered and chart is not None and entry is not None and stop is not None and exit_idx is not None:
+            bars_all = [
+                feeds.Bar(dt.datetime.fromtimestamp(float(chart.t[j]), dt.timezone.utc),
+                          float(chart.o[j]), float(chart.h[j]),
+                          float(chart.l[j]), float(chart.c[j]))
+                for j in range(len(chart.t))
+            ]
+            n = len(bars_all)
+            ex_i = max(0, min(int(exit_idx), n - 1))
+            if entry_ts is not None:
+                en_i = min(range(n), key=lambda j: abs(float(chart.t[j]) - float(entry_ts)))
+            else:
+                en_i = max(0, ex_i - 60)
+            lo = max(0, min(en_i, ex_i) - 10)
+            hi = min(n, max(en_i, ex_i) + 10)
+            window = bars_all[lo:hi]
+            if window:
+                card.render_trade_chart(
+                    symbol=SYMBOL, side=side, kind=kind, r=r,
+                    entry=float(entry), stop=float(stop), exit_px=exit_px,
+                    bars=window, tf=TF, entry_idx=en_i - lo, exit_idx=ex_i - lo,
+                    out_path=path, tp1=tp1, tp2=tp2, tp3=tp3, note=note)
+                rendered = True
+        if not rendered:
+            card.render_result_card(symbol=SYMBOL, side=side, kind=kind, r=r,
+                                    entry=entry, stop=stop, exit_px=exit_px,
+                                    note=note, tf=TF, out_path=path)
     except Exception as e:
         print("карточка результата недоступна:", e)
-        ok, info = tg.send_message(text)
-    print("результат:", ok, info)
+        path = ""
+    note_trade(kind, side, r, trade_id=tid, total_r=total,
+               entry=entry, stop=stop, exit_px=exit_px, note=note,
+               image=path or None)
+    deliver_group_result(trade_id=tid, kind=kind, r=r, note=note, text=text,
+                         path=path, entry=entry, side=side)
+    flush_pending()
+
+
+def deliver_group_result(*, trade_id: str, kind: str, r: float, note: str,
+                         text: str, path: str, entry: float | None,
+                         side: str) -> None:
+    """Доставить исход сделки в бесплатную группу.
+
+    Если отложенный вход ещё не ушёл (FREE_DELAY_SEC), итог клеится к его
+    карточке — подписчик видит одну карточку «вход + итог» вместо сигнала
+    и результата подряд.
+    """
+    if store.append_group_outcome(trade_id, voice.outcome_line(kind, r, note)):
+        print("группа: итог в карточке входа", trade_id, kind)
+        return
+    # Результат не должен обгонять отложенный вход.
+    entry_due = store.group_entry_due(trade_id) or 0.0
+    due = max(time.time(), entry_due + 1.0)
+    store.enqueue_group(trade_id=trade_id, kind=kind, path=path, caption=text,
+                        due_ts=due, entry=entry, side=side, symbol=SYMBOL)
 
 
 # ------------------------------------------------------------------ ведение сделки
+
+def _level_key(price: float) -> str:
+    """Ключ уровня с точностью инструмента: round(0.70224, 2) схлопывал все зоны AUDUSD."""
+    p = float(price)
+    return f"{p:.5f}" if abs(p) < 10 else f"{p:.2f}"
+
 
 def manage_trade(state: dict, chart: st.Frame, i: int) -> None:
     tr = state.get("trade")
     if not tr:
         return
+    bar_ts = float(chart.t[i])
+    # один и тот же закрытый бар обрабатываем ровно один раз: иначе повторный
+    # прогон после переноса стопа в БУ закрывает сделку там, где бэктест её держит
+    if bar_ts <= float(tr.get("last_mgd_ts", 0)):
+        return
+    tr["last_mgd_ts"] = bar_ts
     hi, lo = float(chart.h[i]), float(chart.l[i])
     is_long = tr["dir"] == 1
     side = "LONG" if is_long else "SHORT"
@@ -354,22 +642,61 @@ def manage_trade(state: dict, chart: st.Frame, i: int) -> None:
     done = float(tr.get("done", 0.0))
     rp = float(tr.get("r_partial", 0.0))
 
+    def chart_tps() -> tuple[float | None, float | None, float | None]:
+        """Для одной цели не дублируем TP1/TP2/TP3 на графике результата."""
+        if single:
+            return tr.get("tp1"), None, None
+        return tr.get("tp1"), tr.get("tp2"), tr.get("tp3")
+
+    def postmortem() -> str:
+        """Короткий разбор к результату: был ли вход по чек-листу."""
+        if not POSTMORTEM_ENABLED or tr.get("marks") is None:
+            return ""
+        try:
+            missing = int(tr.get("missing", 0))
+        except (TypeError, ValueError):
+            return ""
+        if missing <= 0:
+            return "Разбор: вход по чек-листу без пропусков."
+        return f"Разбор: вход с пропусками чек-листа ({missing}) — сделка по правилам, сетап не идеальный."
+
     def close(r: float, kind: str, note: str = "", exit_px: float | None = None) -> None:
         stats = state.setdefault("stats", {"n": 0, "wins": 0, "sum_r": 0.0})
         stats["n"] += 1
         stats["sum_r"] += r
         if r > 0:
             stats["wins"] += 1
+        full_note = (note + " " + postmortem()).strip()
+        t1, t2, t3 = chart_tps()
         post_result(kind, side, r, entry=tr["entry"], stop=tr["stop"],
-                    exit_px=exit_px, note=note)
+                    exit_px=exit_px, note=full_note,
+                    trade_id=str(tr.get("trade_id", "")), total_r=r,
+                    chart=chart, entry_ts=tr.get("bar_ts"), exit_idx=i,
+                    tp1=t1, tp2=t2, tp3=t3)
         state["trade"] = None
+
+    # трейлинг UT Bot: подтяжка по закрытию предыдущего бара, со следующего после TP1
+    if (PARAMS.use_trail and tr.get("hit1") and PARAMS.trail_after == 1
+            and i > 0 and not np.isnan(ta.atr(chart.h, chart.l, chart.c, 14)[i - 1])):
+        a_prev = float(ta.atr(chart.h, chart.l, chart.c, 14)[i - 1])
+        c_prev = float(chart.c[i - 1])
+        if is_long:
+            tr["stop"] = max(float(tr["stop"]), c_prev - PARAMS.trail_k * a_prev)
+        else:
+            tr["stop"] = min(float(tr["stop"]), c_prev + PARAMS.trail_k * a_prev)
 
     stop = tr["stop"]
     if (lo <= stop if is_long else hi >= stop):
-        r = rp + (0.0 if tr["be"] else -(1.0 - done))
+        sgn_t = 1.0 if is_long else -1.0
+        stop_r = sgn_t * (float(stop) - float(tr["entry"])) / float(tr["risk"])
+        # безубыток — это stop_r ≈ 0; отдельная ветка «be» обнуляла прибыль трейлинга
+        if PARAMS.use_trail and tr.get("hit1"):
+            r = rp + (1.0 - done) * stop_r
+        else:
+            r = rp - (1.0 - done)
         # уровень, от которого вошли, «сломан» стопом: считаем промахи и
         # блокируем его, пока он не исчезнет из таблицы зон (структурная инвалидация).
-        key = f"{round(float(tr['entry']), 2)}|{'sup' if is_long else 'res'}"
+        key = f"{_level_key(tr.get('level', tr['entry']))}|{'sup' if is_long else 'res'}"
         stops = state.setdefault("stops", {})
         stops[key] = stops.get(key, 0) + 1
         risk_note_stop(float(chart.t[i]))
@@ -389,8 +716,12 @@ def manage_trade(state: dict, chart: st.Frame, i: int) -> None:
         done += p1
         tr["r_partial"], tr["done"] = rp, done
         note = "стоп в безубыток" if PARAMS.be_after == 1 else ""
+        t1, t2, t3 = chart_tps()
         post_result("tp1", side, add, entry=tr["entry"], stop=tr["stop"],
-                    exit_px=tp1, note=note)
+                    exit_px=tp1, note=note,
+                    trade_id=str(tr.get("trade_id", "")), total_r=rp,
+                    chart=chart, entry_ts=tr.get("bar_ts"), exit_idx=i,
+                    tp1=t1, tp2=t2, tp3=t3)
         if PARAMS.be_after == 1:
             tr["stop"], tr["be"] = tr["entry"], True
 
@@ -400,7 +731,11 @@ def manage_trade(state: dict, chart: st.Frame, i: int) -> None:
         rp += add
         done += p2
         tr["r_partial"], tr["done"] = rp, done
-        post_result("tp2", side, add, entry=tr["entry"], stop=tr["stop"], exit_px=tp2)
+        t1, t2, t3 = chart_tps()
+        post_result("tp2", side, add, entry=tr["entry"], stop=tr["stop"], exit_px=tp2,
+                    trade_id=str(tr.get("trade_id", "")), total_r=rp,
+                    chart=chart, entry_ts=tr.get("bar_ts"), exit_idx=i,
+                    tp1=t1, tp2=t2, tp3=t3)
         if PARAMS.be_after == 2:
             tr["stop"], tr["be"] = tr["entry"], True
 
@@ -409,10 +744,30 @@ def manage_trade(state: dict, chart: st.Frame, i: int) -> None:
         close(rp + (1.0 - done) * r3, "tp3", exit_px=tp3)
         return
 
-    if i - tr["bar_idx"] > PARAMS.max_bars:
+    # Время в сделке считаем по барам, а не по индексу: len(chart) постоянен,
+    # поэтому i - bar_idx всегда 0 и выход по времени раньше не срабатывал.
+    bar_sec = feeds.TF_MINUTES.get(TF.upper(), 15) * 60
+    if bar_sec > 0 and (bar_ts - float(tr.get("bar_ts", bar_ts))) / bar_sec > PARAMS.max_bars:
         c = float(chart.c[i])
         mtm = ((c - tr["entry"]) if is_long else (tr["entry"] - c)) / tr["risk"]
         close(rp + (1.0 - done) * mtm, "time", exit_px=c)
+
+
+def manage_open_trade(state: dict, chart: st.Frame, i: int) -> None:
+    """Провести сделку по всем барам с прошлого прохода, а не только по последнему.
+
+    После простоя/перезапуска бот видел лишь текущий закрытый бар: стоп мог
+    сработать на пропущенном баре, а более поздний бар давал ложную цель.
+    """
+    tr = state.get("trade")
+    if not tr:
+        return
+    start = float(tr.get("last_mgd_ts", tr.get("bar_ts", 0)))
+    first = int(np.searchsorted(chart.t, start, side="right"))
+    for j in range(max(0, first), i + 1):
+        if not state.get("trade"):
+            return
+        manage_trade(state, chart, j)
 
 
 def smt_reference(data: MT5Data, chart: st.Frame):
@@ -457,37 +812,71 @@ def step(data: MT5Data, state: dict) -> dict:
     }
 
     # ведём открытую сделку по закрытым барам
+    cl = state.setdefault("cl", {"state": 0, "side": 0, "last_exit_ts": 0.0, "last_bar": 0.0})
     if state.get("trade") and bar_ts > state["trade"]["bar_ts"]:
-        manage_trade(state, chart, i)
+        manage_open_trade(state, chart, i)
+        if not state.get("trade"):
+            cl["last_exit_ts"] = float(bar_ts)   # кулдаун после выхода
         save_state(state)
-
     if state.get("trade"):
         return info
 
+    # дневной риск-гард общий для всех стратегий (раньше был только у range/ict)
+    if MAX_DAILY_STOPS > 0 and risk_stops_today(bar_ts) >= MAX_DAILY_STOPS:
+        info["marks"] += " · дневной лимит стопов"
+        return info
+
+    # автомат сетапа: один переход на новый закрытый бар
+    entry = False
+    prev_state = int(cl["state"])
+    if bar_ts > cl["last_bar"]:
+        cl["last_bar"] = float(bar_ts)
+        m = {"state": int(cl["state"]), "side": int(cl["side"]),
+             "last_exit": None, "in_trade": bool(state.get("trade"))}
+        entry, m = cl_gate(res, i, m, PARAMS)
+        cl["state"], cl["side"] = int(m["state"]), int(m["side"])
+
+    # тизер: сетап вооружился, но триггера ещё нет — предупреждаем группу
+    if (TEASER_ENABLED and not entry and not state.get("trade")
+            and prev_state == 0 and int(cl["state"]) == 1
+            and bar_ts > float(state.get("last_teaser_bar", 0))):
+        t_side = "LONG" if bool(res["is_long"][i]) else "SHORT"
+        stop_lvl = float(res["stop_l"][i] if t_side == "LONG" else res["stop_s"][i])
+        px = float(chart.c[i])
+        dist = abs(px - stop_lvl) / max(px, 1e-9) * 100.0
+        if dist <= TEASER_NEAR_PCT:
+            ok, info_t = tg.send_message(
+                f"⏳ <b>Готовится вход {t_side} {SYMBOL}</b>\n"
+                "Сетап собран, ждём триггер. Это не вход, а предупреждение.")
+            print("тизер:", ok, info_t)
+            state["last_teaser_bar"] = bar_ts
+            save_state(state)
+
     if bar_ts <= state.get("last_signal_bar", 0):
         return info
-
-    long_evt = bool(res["long_evt"][i])
-    short_evt = bool(res["short_evt"][i])
-    if not (long_evt or short_evt):
+    bar_sec = feeds.TF_MINUTES.get(TF.upper(), 15) * 60
+    if (bar_ts - cl["last_exit_ts"]) < PARAMS.re_entry_bars * bar_sec:
+        return info
+    if not entry:
         return info
 
-    side = "LONG" if long_evt else "SHORT"
-    sweep_ago = float(res["since_sweep_l"][i] if long_evt else res["since_sweep_s"][i])
-    if sweep_ago < PARAMS.sweep_delay:
-        return info
-
+    side = "LONG" if bool(res["is_long"][i]) else "SHORT"
     sig = make_signal(res, chart, i, side)
     if sig.risk <= 0:
         return info
 
-    if post_signal(sig, chart):
+    tid = trade_id_for(sig, bar_ts)
+    if post_signal(sig, chart, trade_id=tid):
         state["last_signal_bar"] = bar_ts
         state["trade"] = {
-            "dir": 1 if long_evt else -1,
+            "trade_id": tid,
+            "marks": info.get("marks", ""),
+            "missing": info.get("missing", 0),
+            "dir": 1 if side == "LONG" else -1,
             "entry": sig.entry, "stop": sig.sl, "risk": sig.risk,
             "tp1": sig.tp1, "tp2": sig.tp2, "tp3": sig.tp3,
             "bar_idx": i, "bar_ts": bar_ts,
+            "last_mgd_ts": bar_ts, "ts_saved": time.time(),
             "hit1": False, "hit2": False, "hit3": False, "be": False,
             "done": 0.0, "r_partial": 0.0,
         }
@@ -498,6 +887,36 @@ def step(data: MT5Data, state: dict) -> dict:
     return info
 
 
+def cl_gate(res: dict, i: int, m: dict, p: "st.Params") -> tuple[bool, dict]:
+    """Автомат сетапа KidzordFx (Pine): IDLE -> SETUP -> ENTRY.
+
+    Вход только когда сетап (r1,r2,r3,r5,r12) вооружился на предыдущих барах
+    (состояние 1), на текущем баре есть триггер+риск+цель (r6,r7,r8), нет
+    открытой сделки, прошёл кулдаун и задержка после свипа. m = {"state",
+    "side", "last_exit", "in_trade"}; мутируется на каждом баре.
+    """
+    is_l = bool(res["is_long"][i])
+    side = 1 if is_l else -1
+    if side != m["side"]:
+        m["state"], m["side"] = 0, side
+    r = res["r"]
+    setup_now = bool(r[0][i] and r[1][i] and r[2][i] and r[4][i] and r[11][i])
+    trig_now = bool(r[5][i] and r[6][i] and r[7][i])
+    if not setup_now:
+        m["state"] = 0
+    elif m["state"] == 0:
+        m["state"] = 1
+    if m["in_trade"]:
+        m["state"] = 2
+    cool_ok = m["last_exit"] is None or (i - m["last_exit"]) >= p.re_entry_bars
+    sweep_ago = float(res["since_sweep_l"][i] if is_l else res["since_sweep_s"][i])
+    sweep_ok = sweep_ago >= p.sweep_delay
+    entry = setup_now and trig_now and m["state"] == 1 and not m["in_trade"] and cool_ok and sweep_ok
+    if entry:
+        m["state"] = 2
+    return entry, m
+
+
 def simulate(res: dict, chart: st.Frame, p: st.Params) -> list[dict]:
     """Прогон по истории теми же правилами, что ведёт живой бот."""
     n = len(chart.c)
@@ -505,19 +924,34 @@ def simulate(res: dict, chart: st.Frame, p: st.Params) -> list[dict]:
     p2 = p.p2_pct / 100.0
     trades: list[dict] = []
     tr = None
+    m = {"state": 0, "side": 0, "last_exit": None, "in_trade": False}
+    atr = ta.atr(chart.h, chart.l, chart.c, 14)
 
     for i in range(n):
         if tr:
             hi, lo = float(chart.h[i]), float(chart.l[i])
             is_long = tr["dir"] == 1
+            # трейлинг UT Bot: подтяжка стопа по закрытию ПРЕДЫДУЩЕГО бара
+            # (эффектен с текущего бара, стоп никогда не отдаляется)
+            if p.use_trail and tr.get("h1") and p.trail_after == 1 and i > tr["i"] and not np.isnan(atr[i - 1]):
+                if is_long:
+                    tr["stop"] = max(tr["stop"], float(chart.c[i - 1]) - p.trail_k * float(atr[i - 1]))
+                else:
+                    tr["stop"] = min(tr["stop"], float(chart.c[i - 1]) + p.trail_k * float(atr[i - 1]))
             hit_sl = lo <= tr["stop"] if is_long else hi >= tr["stop"]
             hit1 = hi >= tr["tp1"] if is_long else lo <= tr["tp1"]
             hit2 = hi >= tr["tp2"] if is_long else lo <= tr["tp2"]
             hit3 = hi >= tr["tp3"] if is_long else lo <= tr["tp3"]
 
             if hit_sl:
-                total = tr["r"] + (0.0 if tr["be"] else -(1.0 - tr["done"]))
+                sgn_t = 1.0 if is_long else -1.0
+                stop_r = sgn_t * (tr["stop"] - tr["entry"]) / tr["risk"]
+                if p.use_trail and tr.get("h1"):
+                    total = tr["r"] + (1.0 - tr["done"]) * stop_r
+                else:
+                    total = tr["r"] - (1.0 - tr["done"])
                 trades.append({**tr, "r": total, "exit": "SL", "ei": i, "exit_price": tr["stop"]})
+                m["last_exit"] = i
                 tr = None
                 continue
             if hit1 and not tr["h1"]:
@@ -535,6 +969,7 @@ def simulate(res: dict, chart: st.Frame, p: st.Params) -> list[dict]:
             if hit3 and tr["h2"] and not tr["h3"]:
                 tr["r"] += (1.0 - tr["done"]) * p.tp3_r
                 trades.append({**tr, "exit": "TP3", "ei": i, "exit_price": tr["tp3"]})
+                m["last_exit"] = i
                 tr = None
                 continue
             if i - tr["i"] > p.max_bars:
@@ -542,11 +977,14 @@ def simulate(res: dict, chart: st.Frame, p: st.Params) -> list[dict]:
                 mtm = ((c - tr["entry"]) if is_long else (tr["entry"] - c)) / tr["risk"]
                 tr["r"] += (1.0 - tr["done"]) * mtm
                 trades.append({**tr, "exit": "TIME", "ei": i, "exit_price": c})
+                m["last_exit"] = i
                 tr = None
                 continue
 
-        if not tr and (res["long_evt"][i] or res["short_evt"][i]):
-            is_long = bool(res["long_evt"][i])
+        m["in_trade"] = tr is not None
+        entry, m = cl_gate(res, i, m, p)
+        if entry and not tr:
+            is_long = bool(res["is_long"][i])
             c = float(chart.c[i])
             stop = float(res["stop_l"][i] if is_long else res["stop_s"][i])
             risk = abs(c - stop)
@@ -720,11 +1158,14 @@ def step_sonar(state: dict, chart: st.Frame, htf: dict) -> dict:
             "trade": bool(state.get("trade"))}
 
     if state.get("trade") and bar_ts > state["trade"]["bar_ts"]:
-        manage_trade(state, chart, i)
+        manage_open_trade(state, chart, i)
         save_state(state)
     if state.get("trade"):
         return info
     if bar_ts <= state.get("last_signal_bar", 0):
+        return info
+    if MAX_DAILY_STOPS > 0 and risk_stops_today(bar_ts) >= MAX_DAILY_STOPS:
+        info["marks"] += " · дневной лимит стопов"
         return info
 
     sig = sonar.detect_at(chart, atr, lv, i)
@@ -749,15 +1190,18 @@ def step_sonar(state: dict, chart: st.Frame, htf: dict) -> dict:
 
     csig = card.Signal(side=side, symbol=SYMBOL, tf=TF,
                        entry=entry, sl=stop, tp1=tp, when=when)
-    if not post_signal(csig, chart):
+    tid = trade_id_for(csig, bar_ts)
+    if not post_signal(csig, chart, trade_id=tid):
         return info
 
     state["last_signal_bar"] = bar_ts
     state["trade"] = {
+        "trade_id": tid,
         "dir": sgn, "entry": csig.entry, "stop": csig.sl,
         "risk": abs(csig.entry - csig.sl),
         "tp1": tp, "tp2": tp, "tp3": tp,
         "bar_idx": i, "bar_ts": bar_ts,
+        "last_mgd_ts": bar_ts, "ts_saved": time.time(),
         "hit1": False, "hit2": False, "hit3": False, "be": False,
         "done": 0.0, "r_partial": 0.0, "p1": 1.0, "p2": 0.0,
         "single": True, "r1": SONAR_TARGET_R,
@@ -770,7 +1214,7 @@ def step_sonar(state: dict, chart: st.Frame, htf: dict) -> dict:
 
 
 def step_range(state: dict, chart: st.Frame, htf: dict, smt=None) -> dict:
-    """Вход от границы зоны старшего ТФ (MSNR): лимитка у уровня, короткий стоп."""
+    """Вход от границы зоны старшего ТФ (MSNR) по рынку на закрытии бара."""
     import range_v2
 
     i = len(chart.c) - 1
@@ -789,7 +1233,7 @@ def step_range(state: dict, chart: st.Frame, htf: dict, smt=None) -> dict:
             "trade": bool(state.get("trade"))}
 
     if state.get("trade") and bar_ts > state["trade"]["bar_ts"]:
-        manage_trade(state, chart, i)
+        manage_open_trade(state, chart, i)
         save_state(state)
     if state.get("trade"):
         return info
@@ -814,13 +1258,13 @@ def step_range(state: dict, chart: st.Frame, htf: dict, smt=None) -> dict:
     # пока он не исчезнет из таблицы зон (т.е. пока его не сломали по структуре).
     # RANGE_MAX_STOPS=0 — механизм выключен.
     stops = state.get("stops", {})
-    present = {f"{round(float(l['price']), 2)}|{l['kind']}" for l in levels}
+    present = {f"{_level_key(float(l['price']))}|{l['kind']}" for l in levels}
     state["stops"] = {k: v for k, v in stops.items() if k in present}
     stops = state["stops"]
     sig = None
     for lv in levels:
         price = float(lv["price"])
-        if RANGE_MAX_STOPS > 0 and stops.get(f"{round(price, 2)}|{lv['kind']}", 0) >= RANGE_MAX_STOPS:
+        if RANGE_MAX_STOPS > 0 and stops.get(f"{_level_key(price)}|{lv['kind']}", 0) >= RANGE_MAX_STOPS:
             continue
         if lv["kind"] == "sup" and chart.l[i] <= price and chart.c[i] > price:
             sig = ("LONG", price)
@@ -831,7 +1275,7 @@ def step_range(state: dict, chart: st.Frame, htf: dict, smt=None) -> dict:
     if not sig:
         return info
 
-    side, entry = sig
+    side, _level_px = sig
     sgn = 1 if side == "LONG" else -1
 
     # SMT-подтверждение: парный инструмент (серебро) не снял тот же экстремум
@@ -846,6 +1290,10 @@ def step_range(state: dict, chart: st.Frame, htf: dict, smt=None) -> dict:
         risk = float(a_c) * RANGE_STOP_ATR
     else:
         risk = RANGE_STOP_PTS
+    # Вход — по рынку на закрытии сигнального бара, как next_open в бэктесте.
+    # Цена уровня уже в прошлом: публиковать её как цену входа нельзя, иначе
+    # карточка обещает R, который подписчик физически не может получить.
+    entry = float(chart.c[i])
     stop = entry - sgn * risk
     # стоп мог выбить на баре входа — тогда сделки не было
     if (side == "LONG" and chart.l[i] <= stop) or (side == "SHORT" and chart.h[i] >= stop):
@@ -862,15 +1310,19 @@ def step_range(state: dict, chart: st.Frame, htf: dict, smt=None) -> dict:
     if SMT_LOOK > 0 and smt is not None:
         regime += " · SMT"
     csig_regime = regime
-    if not post_signal(csig, chart, regime=csig_regime):
+    tid = trade_id_for(csig, bar_ts)
+    if not post_signal(csig, chart, regime=csig_regime, trade_id=tid):
         return info
 
     state["last_signal_bar"] = bar_ts
     state["trade"] = {
+        "trade_id": tid,
         "dir": sgn, "entry": csig.entry, "stop": csig.sl,
         "risk": abs(csig.entry - csig.sl),
         "tp1": csig.tp1, "tp2": csig.tp1, "tp3": csig.tp1,
         "bar_idx": i, "bar_ts": bar_ts,
+        "last_mgd_ts": bar_ts, "ts_saved": time.time(),
+        "level": float(_level_px),
         "hit1": False, "hit2": False, "hit3": False, "be": False,
         "done": 0.0, "r_partial": 0.0, "p1": 1.0, "p2": 0.0,
         "single": True, "r1": abs(target - entry) / risk,
@@ -901,7 +1353,7 @@ def step_ict(state: dict, chart: st.Frame) -> dict:
             "trade": bool(state.get("trade"))}
 
     if state.get("trade") and bar_ts > state["trade"]["bar_ts"]:
-        manage_trade(state, chart, i)
+        manage_open_trade(state, chart, i)
         save_state(state)
 
     # машина состояний идёт по каждому закрытому бару, даже пока открыта
@@ -938,15 +1390,18 @@ def step_ict(state: dict, chart: st.Frame) -> dict:
 
     csig = card.Signal(side=side, symbol=SYMBOL, tf=TF,
                        entry=entry, sl=stop, tp1=tp, when=when)
-    if not post_signal(csig, chart, regime="ICT · свип → FVG"):
+    tid = trade_id_for(csig, bar_ts)
+    if not post_signal(csig, chart, regime="ICT · свип → FVG", trade_id=tid):
         return info
 
     state["last_signal_bar"] = bar_ts
     state["trade"] = {
+        "trade_id": tid,
         "dir": sgn, "entry": csig.entry, "stop": csig.sl,
         "risk": abs(csig.entry - csig.sl),
         "tp1": tp, "tp2": tp, "tp3": tp,
         "bar_idx": i, "bar_ts": bar_ts,
+        "last_mgd_ts": bar_ts, "ts_saved": time.time(),
         "hit1": False, "hit2": False, "hit3": False, "be": False,
         "done": 0.0, "r_partial": 0.0, "p1": 1.0, "p2": 0.0,
         "single": True, "r1": ICT_TP_R,
@@ -978,6 +1433,7 @@ def connect() -> MT5Data | None:
 
 
 def main() -> None:
+    store.init_db()
     state = load_state()
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
 
@@ -993,7 +1449,9 @@ def main() -> None:
             scan(data)
             return
         if cmd == "once":
-            show(step(data, state))
+            info = step(data, state)
+            write_heartbeat(info)
+            show(info)
             return
 
         print(f"бот запущен: {SYMBOL} {feeds.tf_label(TF)} · опрос {POLL_SEC} с · "
@@ -1011,6 +1469,7 @@ def main() -> None:
 
             try:
                 info = step(data, state)
+                write_heartbeat(info)
             except Exception as e:
                 print("ошибка шага:", repr(e), "— переподключаюсь к MT5")
                 try:
@@ -1036,7 +1495,7 @@ def main() -> None:
                     last_beat = now
             else:
                 last_beat = now
-            flush_pending()
+            flush_pending(data)
             time.sleep(POLL_SEC)
     except KeyboardInterrupt:
         print("остановлено вручную")

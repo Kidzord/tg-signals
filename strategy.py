@@ -82,10 +82,12 @@ class Params:
     bos_len: int = 20
     fvg_look: int = 30
     range_len: int = 30
-    range_min_p: float = 0.30
-    range_max_p: float = 6.00
+    range_min_atr: float = 2.0
+    range_max_atr: float = 20.0
+    er_min: float = 0.20
     fac_look: int = 30
-    need_fac: int = 3
+    need_fac: int = 2
+    min_trig_pow: int = 1
     # доп. фильтры
     use_vwap: bool = False
     use_stack: bool = False
@@ -112,8 +114,12 @@ class Params:
     be_after: int = 1
     max_bars: int = 120
     sweep_delay: int = 1
-    use_sess: bool = False
-    sess_in: str = "1630-2300"
+    re_entry_bars: int = 10
+    # трейлинг UT Bot: со следующего бара после TP № trail_after
+    use_trail: bool = True
+    trail_after: int = 1
+    trail_k: float = 2.0
+    use_sess: bool = True
     tz_name: str = "Europe/Moscow"
 
 
@@ -174,6 +180,79 @@ def _session_mask(epoch_utc: np.ndarray, session: str, tz_name: str) -> np.ndarr
     return out
 
 
+def _ago_with_reset(event: np.ndarray, px_changed: np.ndarray) -> np.ndarray:
+    """Баров с события, но только если оно случилось ПОСЛЕ последней смены цены.
+
+    V1.6 сбрасывает касания/отбои уровня при смене его цены (PDH меняется
+    ежедневно) — иначе вчерашнее касание прилипает к сегодняшнему уровню.
+    """
+    ev_ago = ta.barssince(event)
+    chg_ago = ta.barssince(px_changed)
+    # ">=": событие на самом баре смены цены валидно (EA сбрасывает счётчики
+    # и тут же пишет касание текущего бара)
+    return np.where(chg_ago >= ev_ago, ev_ago, BIG)
+
+
+_EET = ZoneInfo("Europe/Minsk")          # GMT+3, серверное время как EET/EEST
+_TZ_LDN = ZoneInfo("Europe/London")
+_TZ_NY = ZoneInfo("America/New_York")
+
+
+def _eu_dst_active(local_date: dt.date) -> bool:
+    """EU DST: с последнего воскресенья марта по последнее воскресенье октября."""
+    last_sun = lambda y, m: (dt.date(y + (m == 12), (m % 12) + 1, 1)
+                             - dt.timedelta(days=1))
+    d = last_sun(local_date.year, local_date.month)
+    while d.weekday() != 6:
+        d -= dt.timedelta(days=1)
+    if local_date.month < 3 or local_date.month > 10:
+        return False
+    if local_date.month > 3 and local_date.month < 10:
+        return True
+    start = last_sun(local_date.year, 3)
+    while start.weekday() != 6:
+        start -= dt.timedelta(days=1)
+    end = last_sun(local_date.year, 10)
+    while end.weekday() != 6:
+        end -= dt.timedelta(days=1)
+    return start <= local_date < end
+
+
+def _server_to_utc(epoch_arr: np.ndarray) -> np.ndarray:
+    """Сервер = EET (UTC+2, летом +3). Возвращает истинный UTC epoch."""
+    out = np.empty_like(epoch_arr)
+    cache: dict[dt.date, float] = {}
+    for i, v in enumerate(epoch_arr):
+        d = dt.datetime.fromtimestamp(int(v), _EET).date()
+        if d not in cache:
+            cache[d] = 10800.0 if _eu_dst_active(d) else 7200.0
+        out[i] = v - cache[d]
+    return out
+
+
+def _local_minutes(utc_epoch: float, tz: ZoneInfo) -> int:
+    return dt.datetime.fromtimestamp(utc_epoch, tz).hour * 60 + \
+           dt.datetime.fromtimestamp(utc_epoch, tz).minute
+
+
+def _v16_sessions(epoch_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(в сессии, блокировано) — Лдн 08:00-17:00, НЙ 09:30-16:00 по местному
+    времени бирж (DST автоматически), минус ролловер 16:55-17:05 НЙ,
+    минус новостные окна 08:28-08:34 и 13:58-14:04 НЙ."""
+    utc = _server_to_utc(epoch_arr)
+    in_sess = np.zeros(len(epoch_arr), dtype=bool)
+    blocked = np.zeros(len(epoch_arr), dtype=bool)
+    for i, u in enumerate(utc):
+        m_ldn = _local_minutes(u, _TZ_LDN)
+        m_ny = _local_minutes(u, _TZ_NY)
+        sess = (480 <= m_ldn < 1020) or (570 <= m_ny < 960)
+        roll = 1015 <= m_ny < 1025
+        news = (508 <= m_ny < 514) or (838 <= m_ny < 844)
+        in_sess[i] = sess
+        blocked[i] = roll or news
+    return in_sess, ~blocked
+
+
 def evaluate(frame: Frame, htf: dict[str, Frame], p: Params) -> dict:
     """Возвращает массивы условий и значений. Последний элемент — текущий бар."""
     t, o, h, l, c = frame.t, frame.o, frame.h, frame.l, frame.c
@@ -219,17 +298,19 @@ def evaluate(frame: Frame, htf: dict[str, Frame], p: Params) -> dict:
     touch_l_recent = bars_touch_l <= touch_bars
     touch_s_recent = bars_touch_s <= touch_bars
 
-    # ---------------- нет болтанки ----------------
-    flips = ta.cross(c, ema_touch).astype(float)
-    cross_cnt = _nz_big(ta.rolling_sum(flips, p.chop_len))
-    no_chop = cross_cnt <= p.max_cross
+    # ---------------- нет болтанки: ER Kaufman (V1.6) ----------------
+    c_prev_n = _shift(c, p.chop_len)
+    er_num = np.abs(c - c_prev_n)
+    er_den = ta.rolling_sum(np.abs(np.diff(c, prepend=c[:1])), p.chop_len)
+    er_val = np.where(er_den > 0, er_num / np.where(er_den > 0, er_den, 1.0), 0.0)
+    no_chop = er_val >= p.er_min
 
-    # ---------------- тест EMA200 рабочего ТФ ----------------
+    # ---------------- тест EMA200: та же линия ТФ касания, что и касание (V1.6) ----
     ema_ltf = ta.ema(c, p.ltf_ema_len)
     atr_chart = ta.atr(h, l, c, 14)
-    test_band = _nz(atr_chart) * p.tol_ltf
-    test_l = (l <= ema_ltf + test_band) & (c >= ema_ltf)
-    test_s = (h >= ema_ltf - test_band) & (c <= ema_ltf)
+    test_band = _nz(atr_touch) * p.tol_ltf
+    test_l = (l <= ema_touch + test_band) & (c > ema_touch)
+    test_s = (h >= ema_touch - test_band) & (c < ema_touch)
     bars_test_l = _nz_big(ta.barssince(test_l))
     bars_test_s = _nz_big(ta.barssince(test_s))
     test_l_recent = bars_test_l <= p.test_look
@@ -242,20 +323,22 @@ def evaluate(frame: Frame, htf: dict[str, Frame], p: Params) -> dict:
     hi_cl = ta.rolling_max(c, p.lv_persist)
     lo_cl = ta.rolling_min(c, p.lv_persist)
 
-    levels: list[tuple[str, np.ndarray]] = []
+    # kind: +1 сопротивление (цель только для лонга), -1 поддержка (для шорта),
+    # 0 — обе стороны (ручные уровни); как в V1.6
+    levels: list[tuple[str, np.ndarray, int]] = []
     for i, px in enumerate(p.lv[:5], start=1):
         if px > 0 and lv_src_on:
-            levels.append((f"LV{i}", np.full(n, float(px))))
+            levels.append((f"LV{i}", np.full(n, float(px)), 0))
 
     if p.use_auto and lv_src_on:
         D = htf.get("1D")
         W = htf.get("1W")
         if D is not None and len(D.c) > 2:
-            levels.append(("PDH", _htf(t, D, D.h, 1)))
-            levels.append(("PDL", _htf(t, D, D.l, 1)))
+            levels.append(("PDH", _htf(t, D, D.h, 1), 1))
+            levels.append(("PDL", _htf(t, D, D.l, 1), -1))
         if W is not None and len(W.c) > 2:
-            levels.append(("PWH", _htf(t, W, W.h, 1)))
-            levels.append(("PWL", _htf(t, W, W.l, 1)))
+            levels.append(("PWH", _htf(t, W, W.h, 1), 1))
+            levels.append(("PWL", _htf(t, W, W.l, 1), -1))
 
     lv_touch_s = false_arr.copy()
     lv_test_s = false_arr.copy()
@@ -268,51 +351,83 @@ def evaluate(frame: Frame, htf: dict[str, Frame], p: Params) -> dict:
     lv_name_s = np.array([""] * n, dtype=object)
     lv_name_l = np.array([""] * n, dtype=object)
 
-    for name, px in levels:
+    # сетап уровня: касание И отбой ОДНОГО уровня (V1.6 lvSetupOk), выбор по
+    # свежайшему отбою; касания/отбои сбрасываются при смене цены уровня
+    # V1.6: шортовые сетапы — только от сопротивлений (kind >= 0), лонговые —
+    # только от поддержек (kind <= 0); у сопротивлений не пишутся лонговые
+    # касания и наоборот. Ручные уровни (kind 0) работают в обе стороны.
+    setup_s_ago = np.full(n, BIG)
+    setup_l_ago = np.full(n, BIG)
+    setup_s_px = nan_arr.copy()
+    setup_l_px = nan_arr.copy()
+    lv_touch_s_ago = np.full(n, BIG)
+    lv_touch_l_ago = np.full(n, BIG)
+    for name, px, kind in levels:
         act = ~np.isnan(px)
         px_safe = np.where(act, px, NAN)
+        px_changed = act & (px_safe != _shift(px_safe, 1))
+        kind_ok_s = kind >= 0
+        kind_ok_l = kind <= 0
 
         # сопротивление: цена консолидируется ниже уровня
-        dn = act & (hi_cl < px_safe)
-        s_touch = _nz_big(ta.barssince(act & (h >= px_safe - lv_tol_abs)))
-        m_rej = _nz_big(ta.barssince(act & (h >= px_safe - lv_tol_abs) & (c < px_safe)))
+        dn = act & (hi_cl < px_safe) & kind_ok_s
+        ev_s = act & kind_ok_s & (h >= px_safe - lv_tol_abs)
+        ev_rej_s = ev_s & (c < px_safe)
+        s_touch = _ago_with_reset(ev_s, px_changed)
+        m_rej = _ago_with_reset(ev_rej_s, px_changed)
         lv_touch_s |= dn & (s_touch <= p.lv_look)
-        lv_test_s |= dn & (m_rej <= p.lv_look)
-        better = m_rej < best_s_ago
-        best_s_ago = np.where(better, m_rej, best_s_ago)
-        lv_price_s = np.where(better, px_safe, lv_price_s)
-        lv_name_s = np.where(better, name, lv_name_s)
+        lv_touch_s_ago = np.where(dn & (s_touch < lv_touch_s_ago), s_touch, lv_touch_s_ago)
+        setup_here = dn & (s_touch <= p.lv_look) & (m_rej <= p.lv_look)
+        better = setup_here & (m_rej < setup_s_ago)
+        setup_s_ago = np.where(better, m_rej, setup_s_ago)
+        setup_s_px = np.where(better, px_safe, setup_s_px)
 
         # поддержка: цена консолидируется выше уровня
-        up = act & (lo_cl > px_safe)
-        l_touch = _nz_big(ta.barssince(act & (l <= px_safe + lv_tol_abs)))
-        l_rej = _nz_big(ta.barssince(act & (l <= px_safe + lv_tol_abs) & (c > px_safe)))
+        up = act & (lo_cl > px_safe) & kind_ok_l
+        ev_l = act & kind_ok_l & (l <= px_safe + lv_tol_abs)
+        ev_rej_l = ev_l & (c > px_safe)
+        l_touch = _ago_with_reset(ev_l, px_changed)
+        l_rej = _ago_with_reset(ev_rej_l, px_changed)
         lv_touch_l |= up & (l_touch <= p.lv_look)
-        lv_test_l |= up & (l_rej <= p.lv_look)
-        better = l_rej < best_l_ago
-        best_l_ago = np.where(better, l_rej, best_l_ago)
-        lv_price_l = np.where(better, px_safe, lv_price_l)
-        lv_name_l = np.where(better, name, lv_name_l)
+        lv_touch_l_ago = np.where(up & (l_touch < lv_touch_l_ago), l_touch, lv_touch_l_ago)
+        setup_here_l = up & (l_touch <= p.lv_look) & (l_rej <= p.lv_look)
+        better_l = setup_here_l & (l_rej < setup_l_ago)
+        setup_l_ago = np.where(better_l, l_rej, setup_l_ago)
+        setup_l_px = np.where(better_l, px_safe, setup_l_px)
+
+    lv_touch_s = lv_touch_s_ago <= p.lv_look
+    lv_touch_l = lv_touch_l_ago <= p.lv_look
+    lv_test_s = setup_s_ago < BIG
+    lv_test_l = setup_l_ago < BIG
+    best_s_ago = setup_s_ago
+    best_l_ago = setup_l_ago
+    lv_price_s = setup_s_px
+    lv_price_l = setup_l_px
 
     lv_price_s = np.where(lv_test_s, lv_price_s, NAN)
     lv_price_l = np.where(lv_test_l, lv_price_l, NAN)
 
-    # цели по уровням: ближайший в сторону сделки
+    # цели по уровням: для лонга только сопротивления (kind >= 0) выше цены,
+    # для шорта только поддержки (kind <= 0) ниже; V1.6 берёт ближайший уровень,
+    # ПРОШЕДШИЙ фильтры (tgt_min/max, RR) — ближайший может провалить RR
     tgt_lv_s = np.full(n, NAN)
     tgt_lv_l = np.full(n, NAN)
-    for name, px in levels:
-        below = (~np.isnan(px)) & (px < c)
-        above = (~np.isnan(px)) & (px > c)
-        tgt_lv_s = np.where(below & (np.isnan(tgt_lv_s) | (px > tgt_lv_s)), px, tgt_lv_s)  # ближайший снизу = максимальный
-        tgt_lv_l = np.where(above & (np.isnan(tgt_lv_l) | (px < tgt_lv_l)), px, tgt_lv_l)  # ближайший сверху = минимальный
 
-    touch_ok_l = (ema_src_on & touch_l_recent) | (lv_src_on & lv_touch_l)
-    touch_ok_s = (ema_src_on & touch_s_recent) | (lv_src_on & lv_touch_s)
-    test_ok_l = (ema_src_on & test_l_recent) | (lv_src_on & lv_test_l)
-    test_ok_s = (ema_src_on & test_s_recent) | (lv_src_on & lv_test_s)
+    ema_setup_l = ema_src_on & touch_l_recent & test_l_recent
+    ema_setup_s = ema_src_on & touch_s_recent & test_s_recent
+    lv_setup_ok_l = lv_src_on & (setup_l_ago < BIG)
+    lv_setup_ok_s = lv_src_on & (setup_s_ago < BIG)
+    use_lv_l = lv_setup_ok_l & (~ema_setup_l | (setup_l_ago <= bars_test_l))
+    use_lv_s = lv_setup_ok_s & (~ema_setup_s | (setup_s_ago <= bars_test_s))
 
-    ref_l = np.where(~np.isnan(lv_price_l), lv_price_l, ema_ltf)
-    ref_s = np.where(~np.isnan(lv_price_s), lv_price_s, ema_ltf)
+    touch_ok_l = np.where(use_lv_l, lv_touch_l, ema_setup_l & touch_l_recent)
+    touch_ok_s = np.where(use_lv_s, lv_touch_s, ema_setup_s & touch_s_recent)
+    test_ok_l = np.where(use_lv_l, lv_test_l, ema_setup_l & test_l_recent)
+    test_ok_s = np.where(use_lv_s, lv_test_s, ema_setup_s & test_s_recent)
+
+    # опорная цена сетапа: уровень или та же линия ТФ касания (V1.6)
+    ref_l = np.where(use_lv_l, setup_l_px, ema_touch)
+    ref_s = np.where(use_lv_s, setup_s_px, ema_touch)
 
     # ---------------- триггер ----------------
     rng = h - l
@@ -341,13 +456,6 @@ def evaluate(frame: Frame, htf: dict[str, Frame], p: Params) -> dict:
     ifvg_tol_abs = _nz(atr_chart) * p.ifvg_tol
     inv_s = p.use_ifvg & (~np.isnan(fvg_bot_s)) & (fvg_ago_s <= p.ifvg_look) & (c < fvg_bot_s) & (h >= fvg_bot_s - ifvg_tol_abs)
     inv_l = p.use_ifvg & (~np.isnan(fvg_top_l)) & (fvg_ago_l <= p.ifvg_look) & (c > fvg_top_l) & (l <= fvg_top_l + ifvg_tol_abs)
-
-    pat_l = (((pin_l | eng_l) & big_enough) | mic_l | inv_l) & (c > ref_l)
-    pat_s = (((pin_s | eng_s) & big_enough) | mic_s | inv_s) & (c < ref_s)
-    bars_trig_l = _nz_big(ta.barssince(pat_l))
-    bars_trig_s = _nz_big(ta.barssince(pat_s))
-    trig_l = bars_trig_l <= p.trig_look
-    trig_s = bars_trig_s <= p.trig_look
 
     # ---------------- риск ----------------
     piv_hi = ta.pivot_high(h, p.frac_l, p.frac_r)
@@ -392,44 +500,135 @@ def evaluate(frame: Frame, htf: dict[str, Frame], p: Params) -> dict:
         risk_ok_l = (~np.isnan(risk_l)) & (risk_l >= p.risk_min) & (risk_l <= p.risk_max)
         risk_ok_s = (~np.isnan(risk_s)) & (risk_s >= p.risk_min) & (risk_s <= p.risk_max)
 
+    # ---------------- триггер (V1.6): пин 1 / поглощение 2 / IFVG 3 / BOS 4 ----
+    # паттерн может сработать и за пределами ref, если цена вернулась за
+    # свипнутый экстремум (reclaim); pin/eng требуют big_enough как в V1.6
+    pow_l = np.where(mic_l, 4, np.where(inv_l, 3, np.where(eng_l & big_enough, 2, np.where(pin_l & big_enough, 1, 0))))
+    pow_s = np.where(mic_s, 4, np.where(inv_s, 3, np.where(eng_s & big_enough, 2, np.where(pin_s & big_enough, 1, 0))))
+    reclaim_l = (since_sweep_l <= p.trig_look) & (~np.isnan(manip_lo)) & (c > manip_lo)
+    reclaim_s = (since_sweep_s <= p.trig_look) & (~np.isnan(manip_hi)) & (c < manip_hi)
+    pat_l = (pow_l >= p.min_trig_pow) & ((c > ref_l) | reclaim_l)
+    pat_s = (pow_s >= p.min_trig_pow) & ((c < ref_s) | reclaim_s)
+    bars_trig_l = _nz_big(ta.barssince(pat_l))
+    bars_trig_s = _nz_big(ta.barssince(pat_s))
+    trig_l = bars_trig_l <= p.trig_look
+    trig_s = bars_trig_s <= p.trig_look
+
     # ---------------- цель ----------------
     swing_hi = _shift(ta.rolling_max(h, p.liq_len), 1)
     swing_lo = _shift(ta.rolling_min(l, p.liq_len), 1)
-    liq_l = np.where(~np.isnan(tgt_lv_l), tgt_lv_l, swing_hi)
-    liq_s = np.where(~np.isnan(tgt_lv_s), tgt_lv_s, swing_lo)
+    # V1.6: каждый кандидат (уровень, свинг) проходит фильтры цели отдельно
+    # (tgt_min/max %, RR, дневной бюджет), затем берётся ближайший валидный
+    def _pick_target(cand_px: np.ndarray, is_long: bool) -> tuple[np.ndarray, np.ndarray]:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t_pct = np.where(~np.isnan(cand_px) & (cand_px > c if is_long else cand_px < c),
+                             (np.abs(cand_px - c)) / c * 100.0, NAN)
+            ok = (~np.isnan(t_pct)) & (t_pct >= p.tgt_min) & (t_pct <= p.tgt_max) & \
+                 (risk_l > 0) & (t_pct / risk_l >= p.min_rr) if is_long else \
+                 (~np.isnan(t_pct)) & (t_pct >= p.tgt_min) & (t_pct <= p.tgt_max) & \
+                 (risk_s > 0) & (t_pct / risk_s >= p.min_rr)
+        best = np.full(len(cand_px), NAN)
+        better = ok & (np.isnan(best) | (cand_px < best)) if is_long else \
+                 ok & (np.isnan(best) | (cand_px > best))
+        best = np.where(better, cand_px, best)
+        return best
+
+    # кандидаты собираются последовательно: сначала уровень, затем свинг
+    best_l = np.full(n, NAN)
+    for _name, _px, _kind in levels:
+        above = (~np.isnan(_px)) & (_px > c) & (_kind >= 0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t_lvl = np.where(above, (_px - c) / c * 100.0, NAN)
+            lvl_ok = above & (t_lvl >= p.tgt_min) & (t_lvl <= p.tgt_max) & \
+                     (risk_l > 0) & (t_lvl / risk_l >= p.min_rr)
+        take = lvl_ok & (np.isnan(best_l) | (_px < best_l))
+        best_l = np.where(take, _px, best_l)
+    ok_l = ~np.isnan(best_l)
+    t_ok = (~np.isnan(swing_hi)) & (swing_hi > c)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t_sw = np.where(t_ok, (swing_hi - c) / c * 100.0, NAN)
+        sw_ok = t_ok & (t_sw >= p.tgt_min) & (t_sw <= p.tgt_max) & (risk_l > 0) & (t_sw / risk_l >= p.min_rr)
+        # свинг валиден и ближе уровня (или уровня нет)
+        take_sw_l = sw_ok & (~ok_l | (swing_hi < best_l))
+        best_l = np.where(take_sw_l, swing_hi, best_l)
+        ok_l = ok_l | sw_ok
+
+    best_s = np.full(n, NAN)
+    for _name, _px, _kind in levels:
+        below = (~np.isnan(_px)) & (_px < c) & (_kind <= 0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t_lvl = np.where(below, (c - _px) / c * 100.0, NAN)
+            lvl_ok = below & (t_lvl >= p.tgt_min) & (t_lvl <= p.tgt_max) & \
+                     (risk_s > 0) & (t_lvl / risk_s >= p.min_rr)
+        take = lvl_ok & (np.isnan(best_s) | (_px > best_s))
+        best_s = np.where(take, _px, best_s)
+    ok_s = ~np.isnan(best_s)
+    t_ok_s = (~np.isnan(swing_lo)) & (swing_lo < c)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t_sw_s = np.where(t_ok_s, (c - swing_lo) / c * 100.0, NAN)
+        sw_ok_s = t_ok_s & (t_sw_s >= p.tgt_min) & (t_sw_s <= p.tgt_max) & (risk_s > 0) & (t_sw_s / risk_s >= p.min_rr)
+        take_sw_s = sw_ok_s & (~ok_s | (swing_lo > best_s))
+        best_s = np.where(take_sw_s, swing_lo, best_s)
+        ok_s = ok_s | sw_ok_s
 
     with np.errstate(divide="ignore", invalid="ignore"):
-        tgt_l = np.where(~np.isnan(liq_l) & (liq_l > c), (liq_l - c) / c * 100.0, NAN)
-        tgt_s = np.where(~np.isnan(liq_s) & (liq_s < c), (c - liq_s) / c * 100.0, NAN)
+        tgt_l = np.where(ok_l, (best_l - c) / c * 100.0, NAN)
+        tgt_s = np.where(ok_s, (c - best_s) / c * 100.0, NAN)
         rr_l = np.where((~np.isnan(tgt_l)) & (risk_l > 0), tgt_l / risk_l, NAN)
         rr_s = np.where((~np.isnan(tgt_s)) & (risk_s > 0), tgt_s / risk_s, NAN)
 
-    tgt_ok_l = (~np.isnan(tgt_l)) & (tgt_l >= p.tgt_min) & (tgt_l <= p.tgt_max) & (~np.isnan(rr_l)) & (rr_l >= p.min_rr)
-    tgt_ok_s = (~np.isnan(tgt_s)) & (tgt_s >= p.tgt_min) & (tgt_s <= p.tgt_max) & (~np.isnan(rr_s)) & (rr_s >= p.min_rr)
+    tgt_ok_l = ok_l & (~np.isnan(rr_l)) & (rr_l >= p.min_rr)
+    tgt_ok_s = ok_s & (~np.isnan(rr_s)) & (rr_s >= p.min_rr)
 
     # ---------------- SMC-факторы ----------------
     f_sweep_l = since_sweep_l <= p.fac_look
     f_sweep_s = since_sweep_s <= p.fac_look
     bos_ref_l = _shift(ta.rolling_max(h, p.bos_len), 1)
     bos_ref_s = _shift(ta.rolling_min(l, p.bos_len), 1)
+    bos_ref_l = np.where(np.isnan(frac_hi), bos_ref_l, np.maximum(frac_hi, bos_ref_l))
+    bos_ref_s = np.where(np.isnan(frac_lo), bos_ref_s, np.minimum(frac_lo, bos_ref_s))
     bos_l = c > bos_ref_l
     bos_s = c < bos_ref_s
     f_bos_l = _nz_big(ta.barssince(bos_l)) <= p.fac_look
     f_bos_s = _nz_big(ta.barssince(bos_s)) <= p.fac_look
-    f_fvg_l = _nz_big(ta.barssince(bull_fvg)) <= p.fvg_look
-    f_fvg_s = _nz_big(ta.barssince(bear_fvg)) <= p.fvg_look
+    # CHoCH (V1.6 O-1): слом структуры против текущего тренда
+    trend = np.zeros(n, dtype=int)
+    choch_up = np.zeros(n, dtype=bool)
+    choch_dn = np.zeros(n, dtype=bool)
+    tr_prev = 0
+    for _i in range(n):
+        if bos_l[_i]:
+            choch_up[_i] = tr_prev == -1
+            trend[_i] = 1
+            tr_prev = 1
+        if bos_s[_i]:
+            choch_dn[_i] = tr_prev == 1
+            trend[_i] = -1
+            tr_prev = -1
+    f_chok_l = _nz_big(ta.barssince(choch_up)) <= p.fac_look
+    f_chok_s = _nz_big(ta.barssince(choch_dn)) <= p.fac_look
+    # FVG-фактор: не просто «был гэп», а цена рядом с ним (V1.6)
+    fvg_top_bull = ta.valuewhen(bull_fvg, l)
+    fvg_bot_bear = ta.valuewhen(bear_fvg, h)
+    fvg_prox = _nz(atr_chart) * 0.5
+    near_bull = (~np.isnan(fvg_bot_s)) & (~np.isnan(fvg_top_bull)) & \
+                (c >= fvg_bot_s - fvg_prox) & (c <= fvg_top_bull + fvg_prox)
+    near_bear = (~np.isnan(fvg_top_l)) & (~np.isnan(fvg_bot_bear)) & \
+                (c <= fvg_top_l + fvg_prox) & (c >= fvg_bot_bear - fvg_prox)
+    f_fvg_l = (_nz_big(ta.barssince(bull_fvg)) <= p.fvg_look) & near_bull
+    f_fvg_s = (_nz_big(ta.barssince(bear_fvg)) <= p.fvg_look) & near_bear
 
     rng_hi = ta.rolling_max(h, p.range_len)
     rng_lo = ta.rolling_min(l, p.range_len)
     with np.errstate(divide="ignore", invalid="ignore"):
-        rng_pct = (rng_hi - rng_lo) / c * 100.0
+        rng_atr_v = (rng_hi - rng_lo) / atr_chart
         rng_pos = np.where(rng_hi > rng_lo, (c - rng_lo) / (rng_hi - rng_lo), 0.5)
-    f_range = (rng_pct >= p.range_min_p) & (rng_pct <= p.range_max_p)
+    f_range = (rng_atr_v >= p.range_min_atr) & (rng_atr_v <= p.range_max_atr)
     f_disc_l = rng_pos <= 0.5
     f_disc_s = rng_pos >= 0.5
 
-    score_l = f_sweep_l.astype(int) + f_bos_l.astype(int) + f_fvg_l.astype(int) + f_disc_l.astype(int)
-    score_s = f_sweep_s.astype(int) + f_bos_s.astype(int) + f_fvg_s.astype(int) + f_disc_s.astype(int)
+    score_l = f_sweep_l.astype(int) + f_bos_l.astype(int) + f_fvg_l.astype(int) + f_chok_l.astype(int)
+    score_s = f_sweep_s.astype(int) + f_bos_s.astype(int) + f_fvg_s.astype(int) + f_chok_s.astype(int)
 
     # ---------------- доп. фильтры ----------------
     if p.use_stack:
@@ -469,7 +668,8 @@ def evaluate(frame: Frame, htf: dict[str, Frame], p: Params) -> dict:
     allow_s = p.side_allow != "Только лонг"
 
     if p.use_sess:
-        sess_mask = _session_mask(frame.t, p.sess_in, p.tz_name)
+        sess_ok_v16, no_block_v16 = _v16_sessions(frame.t)
+        sess_mask = sess_ok_v16 & no_block_v16
     else:
         sess_mask = np.ones(n, dtype=bool)
 
