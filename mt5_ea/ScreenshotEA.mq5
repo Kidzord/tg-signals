@@ -24,10 +24,12 @@ input int InpWaitMs   = 1500;   // сколько ждать отрисовки 
 input int InpRightMargin = 8;   // сколько баров оставить справа от выхода
 
 string REQ  = "kz_screenshot_request.txt";
-string DONE = "kz_screenshot_done.txt";
-string HB   = "kz_screenshot_heartbeat.txt";
+string DONE = "kz_screenshot_done.txt";string HB   = "kz_screenshot_heartbeat.txt";
 
 string g_last_out = "";
+double g_fix_max = 0.0;   // ценовая шкала, выставленная под сделку
+double g_fix_min = 0.0;
+string g_fix_note = "";   // диагностика кадра в done-файле
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -72,6 +74,8 @@ void WriteDone(string status, string out, string error)
    FileWrite(h, "status=" + status);
    FileWrite(h, "out=" + out);
    FileWrite(h, "error=" + error);
+   if(g_fix_note != "")
+      FileWrite(h, "graph=" + g_fix_note);
    FileClose(h);
 }
 
@@ -137,7 +141,7 @@ int PickScale(int span)
 {
    if(span <= 0)
       return(-1);
-   int need = span * 3 + 20;
+   int need = span + 2 * InpRightMargin + 20;
    if(need <= 45)  return(5);
    if(need <= 90)  return(4);
    if(need <= 180) return(3);
@@ -183,6 +187,7 @@ void FixPriceRange(long chart, string symbol, ENUM_TIMEFRAMES tf,
    if(hi <= 0 || lo <= 0)
       return;
 
+   int i_entry = ShiftOf(symbol, tf, entry_ts);
    int i_exit = ShiftOf(symbol, tf, exit_ts);
    if(i_exit < 0)
       i_exit = 0;
@@ -191,7 +196,10 @@ void FixPriceRange(long chart, string symbol, ENUM_TIMEFRAMES tf,
       span = 40;
    int margin = (int)MathMax(0, MathMin(50, InpRightMargin));
    int right = (int)MathMax(0, i_exit - margin);
-   int left  = i_exit + (int)MathMin(500, MathMax(30, span * 3));
+   // Только окно сделки (+ запас баров до входа): если захватить всю
+   // историю, дневные размахи до входа растянут шкалу.
+   int back = (i_entry > 0) ? i_entry + margin : i_exit + span + margin;
+   int left = (int)MathMin(right + 500, back);
    int count = (int)MathMax(10, left - right + 1);
 
    double highs[], lows[];
@@ -206,8 +214,22 @@ void FixPriceRange(long chart, string symbol, ENUM_TIMEFRAMES tf,
 
    double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
    double pad = MathMax((hi - lo) * 0.08, point * 20);
-   ChartSetDouble(chart, CHART_FIXED_MAX, hi + pad);
-   ChartSetDouble(chart, CHART_FIXED_MIN, lo - pad);
+   g_fix_max = hi + pad;
+   g_fix_min = lo - pad;
+   ApplyFixedRange(chart);
+}
+
+// ChartSetDouble асинхронный, а первый рендер нового графика может
+// пересчитать автошкалу — поэтому выставляем диапазон ещё раз после
+// отрисовки, а геттер синхронно дожидается применения.
+void ApplyFixedRange(long chart)
+{
+   if(g_fix_max <= 0 || g_fix_min <= 0)
+      return;
+   ChartSetDouble(chart, CHART_FIXED_MAX, g_fix_max);
+   ChartSetDouble(chart, CHART_FIXED_MIN, g_fix_min);
+   ChartGetDouble(chart, CHART_FIXED_MAX, 0);
+   ChartGetDouble(chart, CHART_FIXED_MIN, 0);
 }
 
 void HLine(long chart, string name, double price, color clr,
@@ -346,6 +368,9 @@ void CheckRequest()
    if(scale < 0)
       scale = (int)MathMax(0, MathMin(5, InpScale));
 
+   g_fix_max = 0.0;
+   g_fix_min = 0.0;
+   g_fix_note = "";
    ConfigureChart(chart, scale);
    FocusChart(chart, symbol, tf, entry_ts, exit_ts);
    FixPriceRange(chart, symbol, tf, entry_ts, exit_ts,
@@ -353,7 +378,13 @@ void CheckRequest()
    DrawLevels(chart, symbol, side, label, entry, stop, tp1, tp2, tp3, exit_px, r);
    ChartRedraw(chart);
    Sleep(InpWaitMs);
+   ApplyFixedRange(chart);
    ChartRedraw(chart);
+   Sleep(250);
+   g_fix_note = DoubleToString(ChartGetDouble(chart, CHART_FIXED_MIN, 0), 3) + ".." +
+                DoubleToString(ChartGetDouble(chart, CHART_FIXED_MAX, 0), 3) +
+                " scale=" + IntegerToString((int)ChartGetInteger(chart, CHART_SCALE)) +
+                " now=" + IntegerToString(Bars(symbol, tf));
 
    bool ok = ChartScreenShot(chart, out, (int)MathMax(320, width),
                              (int)MathMax(240, height), ALIGN_RIGHT);
