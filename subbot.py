@@ -259,6 +259,8 @@ def apply_payment(users: dict, *, provider: str, external_id: str, uid: str,
         return False
     until = until_ts if until_ts and until_ts > 0 else time.time() + days * 86400
     grant(users, uid, until)
+    if provider in ("stars", "crypto"):
+        store.cancel_nurture(uid)
     return True
 
 
@@ -381,6 +383,67 @@ def process_deliveries(users: dict) -> None:
             store.mark_delivery_retry(row["id"], res.error, delay)
 
 
+# ---------------------------------------------------- nurture триала (0/1/3)
+
+def process_nurture(users: dict) -> None:
+    """День 1 — как читать карточку; день 3 — окончание триала."""
+    for row in store.claim_nurture(20):
+        uid = str(row["uid"])
+        step = str(row["step"])
+        user = users.get(uid) or {}
+        if user.get("blocked"):
+            store.mark_nurture_terminal(row["id"], "blocked", "пользователь заблокирован")
+            continue
+        if store.has_paid_subscription(uid):
+            store.mark_nurture_terminal(row["id"], "skipped", "уже оплатил")
+            continue
+
+        markup = None
+        if step == "trial_day1":
+            text = (
+                "📊 <b>Как читать карточку</b>\n\n"
+                "Вход — цена, по которой открываем. Стоп — уровень, где идея ломается. "
+                "Цели 1/2/3 — где фиксируем части позиции.\n\n"
+                "R — единица риска. Риск 0,5% депозита и результат +2R = +1% депозита. "
+                "Считать в R удобнее, чем в деньгах: результат не зависит от размера счёта.\n\n"
+                "Проверь свой план: депозит, риск и лимиты."
+            )
+            markup = {"inline_keyboard": [[
+                {"text": "📊 Мой счёт", "callback_data": "card"},
+                {"text": "⚙️ Настройки", "callback_data": "set:menu"}]]}
+        elif step == "trial_day3":
+            until = paid_until(users, uid)
+            text = (
+                "⏳ <b>Пробный доступ заканчивается</b>\n\n"
+                f"Доступ активен до <b>{_date(until)}</b>.\n\n"
+                "Если сигналы и расчёт под твой счёт подходят — продли подписку. "
+                "Если нет — останешься в бесплатной группе: сигналы там с задержкой 30 минут."
+            )
+            markup = {"inline_keyboard": [[
+                {"text": f"⚡ Продлить — {cfg.SUB_PRICE_STARS} ⭐",
+                 "callback_data": "buy"}]]}
+        else:
+            store.mark_nurture_terminal(row["id"], "skipped", "неизвестный шаг")
+            continue
+
+        res = tg.send_message_result(text, token=TOKEN, chat_id=uid, markup=markup)
+        if res.ok:
+            store.mark_nurture_sent(row["id"])
+        elif res.blocked:
+            users.setdefault(uid, {})["blocked"] = 1
+            save_json(USERS_PATH, users)
+            store.mark_nurture_terminal(row["id"], "blocked", res.error)
+            alert_owner(f"⛔ Подписчик <code>{uid}</code> заблокировал бота (nurture).")
+        elif res.retry_after:
+            store.mark_nurture_retry(row["id"], res.error, res.retry_after)
+        elif int(row["attempts"]) + 1 >= cfg.DELIVERY_MAX_ATTEMPTS:
+            store.mark_nurture_terminal(row["id"], "failed", res.error)
+            alert_owner(f"❗ Nurture {step} не доставлен → <code>{uid}</code>\n{res.error[:200]}")
+        else:
+            delay = min(1800, 60 * (2 ** int(row["attempts"])))
+            store.mark_nurture_retry(row["id"], res.error, delay)
+
+
 # ---------------------------------------------------- статистика, рефералы, проба
 
 def load_trades() -> list[dict]:
@@ -451,27 +514,48 @@ def bind_referrer(users: dict, uid: str, payload: str) -> None:
 
 
 def reward_referrer(users: dict, uid: str) -> None:
-    """После оплаты: начислить пригласившему +REF_DAYS. Один раз на пользователя."""
-    u = users.get(uid) or {}
+    """После оплаты: бонус пригласившему и приглашённому. Один раз на пользователя."""
+    if not cfg.REF_ENABLED:
+        return
+    u = users.setdefault(uid, {})
     ref = str(u.get("ref_by", "") or "")
-    if not cfg.REF_ENABLED or not ref or u.get("ref_rewarded"):
+    if not ref:
         return
-    u["ref_rewarded"] = True
-    if ref != uid and ref in users:
-        r = users[ref]
-        until = max(paid_until(users, ref), time.time()) + cfg.REF_DAYS * 86400
-        r["paid_until"] = until
-        r["refs"] = int(r.get("refs", 0) or 0) + 1
-        save_json(USERS_PATH, users)
-        store.record_payment(provider="ref", external_id=f"ref:{uid}", uid=ref,
-                             amount=0.0, days=cfg.REF_DAYS,
-                             raw={"invited": uid, "source": "referral"})
+    changed = False
+
+    # Пригласивший: +REF_DAYS к подписке и зачёт реферала.
+    if not u.get("ref_rewarded"):
+        u["ref_rewarded"] = True
+        changed = True
+        if ref != uid and ref in users:
+            r = users[ref]
+            until = max(paid_until(users, ref), time.time()) + cfg.REF_DAYS * 86400
+            r["paid_until"] = until
+            r["refs"] = int(r.get("refs", 0) or 0) + 1
+            store.record_payment(provider="ref", external_id=f"ref:{uid}", uid=ref,
+                                 amount=0.0, days=cfg.REF_DAYS,
+                                 raw={"invited": uid, "source": "referral"})
+            tg.send_message(
+                f"🎁 По твоей ссылке оформили Premium — начислил <b>+{cfg.REF_DAYS} дн.</b>\n"
+                f"Доступ активен до <b>{_date(until)}</b>. Спасибо, что приводишь своих.",
+                token=TOKEN, chat_id=ref)
+
+    # Приглашённый: +REF_DAYS_FRIEND после первой оплаты (двусторонняя программа).
+    if cfg.REF_DAYS_FRIEND > 0 and not u.get("ref_friend_rewarded"):
+        u["ref_friend_rewarded"] = True
+        until = max(paid_until(users, uid), time.time()) + cfg.REF_DAYS_FRIEND * 86400
+        u["paid_until"] = until
+        changed = True
+        store.record_payment(provider="ref_friend", external_id=f"ref_friend:{uid}",
+                             uid=uid, amount=0.0, days=cfg.REF_DAYS_FRIEND,
+                             raw={"referrer": ref, "source": "referral_friend"})
         tg.send_message(
-            f"🎁 По твоей ссылке оформили Premium — начислил <b>+{cfg.REF_DAYS} дн.</b>\n"
-            f"Доступ активен до <b>{_date(until)}</b>. Спасибо, что приводишь своих.",
-            token=TOKEN, chat_id=ref)
-        return
-    save_json(USERS_PATH, users)
+            f"🎁 Ты пришёл по приглашению — начислил <b>+{cfg.REF_DAYS_FRIEND} дн.</b>\n"
+            f"Доступ активен до <b>{_date(until)}</b>.",
+            token=TOKEN, chat_id=uid)
+
+    if changed:
+        save_json(USERS_PATH, users)
 
 
 def trial_available(users: dict, uid: str) -> bool:
@@ -486,11 +570,15 @@ def grant_trial(users: dict, uid: str) -> None:
     """Выдать пробные дни один раз: отмечаем trial_used и включаем подписку."""
     u = users.setdefault(uid, {})
     u["trial_used"] = True
-    until = time.time() + cfg.TRIAL_DAYS * 86400
+    now = time.time()
+    until = now + cfg.TRIAL_DAYS * 86400
     users[uid]["paid_until"] = max(paid_until(users, uid), until)
     save_json(USERS_PATH, users)
     store.record_payment(provider="trial", external_id=f"trial:{uid}", uid=uid,
                          amount=0.0, days=cfg.TRIAL_DAYS, raw={"source": "trial"})
+    # День 0 — сразу; день 1 — как читать карточку; день 3 — окончание.
+    store.enqueue_nurture(uid, "trial_day1", now + 86400)
+    store.enqueue_nurture(uid, "trial_day3", now + 2 * 86400 + 12 * 3600)
     tg.send_message(
         f"🎁 <b>Пробный доступ открыт на {cfg.TRIAL_DAYS} дн.</b>\n\n"
         + onboard_text(until), token=TOKEN, chat_id=uid,
@@ -684,8 +772,9 @@ def send_status(uid: str, users: dict) -> None:
     if link:
         refs = int((users.get(uid) or {}).get("refs", 0) or 0)
         text += (f"\n\n🎁 <b>Пригласи друга</b>\n"
-                 f"За каждого, кто оформит Premium по твоей ссылке, — "
-                 f"+{cfg.REF_DAYS} дн. бесплатно. Уже приглашено: {refs}.\n{link}")
+                 f"За каждого, кто оформит Premium по твоей ссылке: "
+                 f"тебе +{cfg.REF_DAYS} дн., другу +{cfg.REF_DAYS_FRIEND} дн. "
+                 f"Уже приглашено: {refs}.\n{link}")
         rows.append([{"text": "🎁 Поделиться ссылкой", "url": link}])
     cb = channel_buttons()
     if cb:
@@ -1082,6 +1171,13 @@ def handle(users: dict, uid: str, raw: str, name: str = "") -> dict | None:
     if cmd in ("start", "menu"):
         if args:
             bind_referrer(users, uid, args[0])
+            if args[0].startswith("src_"):
+                src = args[0][4:].strip()[:32]
+                if src:
+                    u = users.setdefault(uid, {})
+                    if not u.get("source"):
+                        u["source"] = src
+                        save_json(USERS_PATH, users)
         send_welcome(users, uid, name)
         return None
 
@@ -1339,6 +1435,10 @@ def remind_expiring(users: dict) -> None:
         until = paid_until(users, uid)
         if until <= now or until - now > REMIND_BEFORE_SEC:
             continue
+        # Триал ведёт nurture-цепочка (день 1 и день 3), а не общий reminder:
+        # иначе сообщение об окончании приходит сразу после выдачи триала.
+        if users[uid].get("trial_used") and not store.has_paid_subscription(uid):
+            continue
         if users[uid].get("reminded_for") == until:
             continue
         tg.send_message(
@@ -1539,8 +1639,11 @@ def main() -> None:
         ("start", "Меню"),
         ("buy", f"Подписка — {pay_note} / месяц"),
         ("status", "Статус подписки"),
+        ("promo", "Активировать промокод"),
         ("stats", "Статистика сигналов"),
         ("mycard", "Карточка счёта"),
+        ("symbols", "Фильтр инструментов"),
+        ("maxday", "Лимит сигналов в сутки"),
         ("help", "Помощь"),
     ], token=TOKEN)
     if not ok:
@@ -1561,6 +1664,7 @@ def main() -> None:
             poll_signals(users, state)
             poll_results(users, state)
             process_deliveries(users)
+            process_nurture(users)
             if time.time() >= next_remind:
                 remind_expiring(users)
                 next_remind = time.time() + REMIND_EVERY_SEC

@@ -270,6 +270,36 @@ def set_commands(commands: list[tuple[str, str]], token: str | None = None) -> t
     return _api("setMyCommands", data, token=token)
 
 
+def get_chat(chat_id: str | int | None = None,
+             token: str | None = None) -> tuple[bool, object]:
+    """Информация о чате: заголовок, закреплённое сообщение, описание."""
+    chat = cfg.CHAT_ID if chat_id is None else str(chat_id)
+    return _api_json("getChat", {"chat_id": chat}, token=token)
+
+
+def set_chat_description(description: str, chat_id: str | int | None = None,
+                         token: str | None = None) -> tuple[bool, str]:
+    chat = cfg.CHAT_ID if chat_id is None else str(chat_id)
+    return _api("setChatDescription",
+                {"chat_id": chat, "description": description[:255]}, token=token)
+
+
+def pin_chat_message(chat_id: str | int | None, message_id: int | str,
+                     token: str | None = None) -> tuple[bool, str]:
+    chat = cfg.CHAT_ID if chat_id is None else str(chat_id)
+    return _api("pinChatMessage", {"chat_id": chat, "message_id": str(message_id),
+                                   "disable_notification": "true"}, token=token)
+
+
+def unpin_chat_message(chat_id: str | int | None, message_id: int | str | None = None,
+                       token: str | None = None) -> tuple[bool, str]:
+    chat = cfg.CHAT_ID if chat_id is None else str(chat_id)
+    data = {"chat_id": chat}
+    if message_id is not None:
+        data["message_id"] = str(message_id)
+    return _api("unpinChatMessage", data, token=token)
+
+
 def get_updates(offset: int | None = None, timeout: int = 30,
                 token: str | None = None) -> list[dict]:
     """Long polling: разовая порция апдейтов. Пустой список — таймаут или ошибка."""

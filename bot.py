@@ -98,6 +98,10 @@ LATE_MOVE_PCT = float(os.getenv("LATE_MOVE_PCT", "0.2") or 0.2)
 POSTMORTEM_ENABLED = os.getenv("POSTMORTEM_ENABLED", "1").strip().lower() in ("1", "true", "yes")
 # Подпись-дисклеймер (как в config.DISCLAIMER, но bot.py читает .env напрямую)
 DISCLAIMER = os.getenv("DISCLAIMER", "Не является инвестиционной рекомендацией.").strip()
+# CTA в бесплатной группе: premium-бот без задержки и с расчётом под счёт.
+PREMIUM_URL = os.getenv("PREMIUM_URL", "").strip()
+PREMIUM_CTA = (f'\n\n⚡ Без задержки и под твой депозит — <a href="{PREMIUM_URL}">Premium</a>'
+               if PREMIUM_URL else "")
 # «Пульс» бота: monitor.py следит, что файл свежий (иначе алерт владельцу).
 HEARTBEAT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               f"hb_{SYMBOL.replace('.', '_')}_{STRATEGY}.json")
@@ -438,10 +442,12 @@ def post_signal(sig: card.Signal, chart: st.Frame, regime: str | None = None,
     caption = voice.signal_caption(sig, regime=regime, source="MT5")
     if STRATEGY not in ("range", "sonar"):
         caption += "\nстратегия: " + STRATEGY
-    # premium-подписчики получают сигнал сразу, бесплатная группа — с задержкой
+    # premium-подписчики получают сигнал сразу, бесплатная группа — с задержкой.
+    # CTA добавляем только в групповую версию: подписчику бота она не нужна.
     queue_signal(path, caption, trade_id=tid, sig=sig)
     due = time.time() + max(0, FREE_DELAY_SEC)
-    store.enqueue_group(trade_id=tid, kind="entry", path=path, caption=caption,
+    store.enqueue_group(trade_id=tid, kind="entry", path=path,
+                        caption=caption + PREMIUM_CTA,
                         due_ts=due, entry=sig.entry, side=sig.side, symbol=sig.symbol)
     if FREE_DELAY_SEC > 0:
         print(f"в группу уйдёт через {FREE_DELAY_SEC} с")
@@ -474,7 +480,7 @@ def post_result(kind: str, side: str, r: float, *, entry: float | None = None,
                 note: str = "", trade_id: str = "",
                 total_r: float | None = None) -> None:
     """Результат сделки: premium обновляет карточку, группа получает исход."""
-    text = voice.event_text(kind, SYMBOL, side, r, note)
+    text = voice.event_text(kind, SYMBOL, side, r, note) + PREMIUM_CTA
     if DRY:
         print("[dry]", text.replace("\n", " | "))
         return

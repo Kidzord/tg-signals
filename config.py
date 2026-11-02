@@ -129,6 +129,8 @@ TRIAL_DAYS = int(_float("TRIAL_DAYS", 3.0))
 # Реферальная программа: сколько дней получает пригласивший за оплату друга
 REF_ENABLED = _flag("REF_ENABLED", "1")
 REF_DAYS = int(_float("REF_DAYS", 7.0))
+# Бонус приглашённому после его первой оплаты (двусторонняя рефералка).
+REF_DAYS_FRIEND = int(_float("REF_DAYS_FRIEND", 3.0))
 # Промокоды: CODE:DAYS через запятую, например NEW20:20,OLD30:30.
 # Один код — один раз на пользователя.
 PROMO_CODES: dict[str, int] = {}

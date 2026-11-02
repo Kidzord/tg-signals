@@ -91,6 +91,21 @@ CREATE TABLE IF NOT EXISTS group_outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_group_due ON group_outbox(status, next_try);
 
+CREATE TABLE IF NOT EXISTS nurture (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    uid         TEXT NOT NULL,
+    step        TEXT NOT NULL,
+    due_ts      REAL NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    next_try    REAL NOT NULL DEFAULT 0,
+    last_error  TEXT,
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL,
+    UNIQUE(uid, step)
+);
+CREATE INDEX IF NOT EXISTS idx_nurture_due ON nurture(status, next_try);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -118,6 +133,7 @@ def init_db() -> None:
             con.execute("ALTER TABLE group_outbox ADD COLUMN symbol TEXT NOT NULL DEFAULT ''")
         _recover_stale(con, "deliveries")
         _recover_stale(con, "group_outbox")
+        _recover_stale(con, "nurture")
     finally:
         con.close()
 
@@ -493,6 +509,117 @@ def group_pending_count() -> int:
             "SELECT COUNT(*) AS n FROM group_outbox WHERE status IN ('pending','sending')"
         ).fetchone()
         return int(row["n"]) if row else 0
+    finally:
+        con.close()
+
+
+# ------------------------------------------------------------------ nurture
+
+def enqueue_nurture(uid: str, step: str, due_ts: float) -> bool:
+    now = time.time()
+    con = connect()
+    try:
+        cur = con.execute(
+            "INSERT OR IGNORE INTO nurture "
+            "(uid, step, due_ts, status, attempts, next_try, created_at, updated_at) "
+            "VALUES (?,?,?,'pending',0,?,?,?)",
+            (str(uid), step, due_ts, due_ts, now, now),
+        )
+        return cur.rowcount > 0
+    finally:
+        con.close()
+
+
+def claim_nurture(limit: int = 20) -> list[sqlite3.Row]:
+    now = time.time()
+    con = connect()
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        rows = con.execute(
+            "SELECT * FROM nurture WHERE status='pending' AND next_try <= ? "
+            "ORDER BY id LIMIT ?", (now, limit),
+        ).fetchall()
+        if rows:
+            ids = [r["id"] for r in rows]
+            q = ",".join("?" * len(ids))
+            con.execute(
+                f"UPDATE nurture SET status='sending', updated_at=? WHERE id IN ({q})",
+                (now, *ids),
+            )
+        con.execute("COMMIT")
+        return rows
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+    finally:
+        con.close()
+
+
+def mark_nurture_sent(row_id: int) -> None:
+    con = connect()
+    try:
+        con.execute(
+            "UPDATE nurture SET status='sent', last_error=NULL, updated_at=? WHERE id=?",
+            (time.time(), row_id),
+        )
+    finally:
+        con.close()
+
+
+def mark_nurture_retry(row_id: int, error: str, delay: float) -> None:
+    now = time.time()
+    con = connect()
+    try:
+        con.execute(
+            "UPDATE nurture SET status='pending', attempts=attempts+1, "
+            "next_try=?, last_error=?, updated_at=? WHERE id=?",
+            (now + max(1.0, delay), str(error)[:500], now, row_id),
+        )
+    finally:
+        con.close()
+
+
+def mark_nurture_terminal(row_id: int, status: str, error: str = "") -> None:
+    con = connect()
+    try:
+        con.execute(
+            "UPDATE nurture SET status=?, last_error=?, updated_at=? WHERE id=?",
+            (status, str(error)[:500], time.time(), row_id),
+        )
+    finally:
+        con.close()
+
+
+def cancel_nurture(uid: str, steps: tuple[str, ...] = ()) -> None:
+    """Отменить запланированные сообщения (например, после оплаты)."""
+    con = connect()
+    try:
+        if steps:
+            q = ",".join("?" * len(steps))
+            con.execute(
+                f"UPDATE nurture SET status='skipped', updated_at=? "
+                f"WHERE uid=? AND status IN ('pending','sending') AND step IN ({q})",
+                (time.time(), str(uid), *steps),
+            )
+        else:
+            con.execute(
+                "UPDATE nurture SET status='skipped', updated_at=? "
+                "WHERE uid=? AND status IN ('pending','sending')",
+                (time.time(), str(uid)),
+            )
+    finally:
+        con.close()
+
+
+def has_paid_subscription(uid: str) -> bool:
+    """Была ли реальная оплата (Stars/крипта), а не триал или промокод."""
+    con = connect()
+    try:
+        row = con.execute(
+            "SELECT 1 FROM payments WHERE uid=? AND status='paid' "
+            "AND provider IN ('stars','crypto') LIMIT 1", (str(uid),),
+        ).fetchone()
+        return row is not None
     finally:
         con.close()
 
