@@ -462,7 +462,7 @@ def post_signal(sig: card.Signal, chart: st.Frame, regime: str | None = None,
 def note_trade(kind: str, side: str, r: float, *, trade_id: str = "",
                total_r: float | None = None, entry: float | None = None,
                stop: float | None = None, exit_px: float | None = None,
-               note: str = "") -> None:
+               note: str = "", image: str | None = None) -> None:
     """Записать итог закрытой сделки в журнал (autoposts.py считает по нему итоги).
 
     Частичные выходы (tp1/tp2) не пишем: сделка попадает в журнал один раз —
@@ -474,14 +474,19 @@ def note_trade(kind: str, side: str, r: float, *, trade_id: str = "",
            "r": round(float(r), 4), "strategy": STRATEGY,
            "trade_id": trade_id, "tf": TF,
            "total_r": round(float(total_r if total_r is not None else r), 4),
-           "entry": entry, "stop": stop, "exit": exit_px, "note": note}
+           "entry": entry, "stop": stop, "exit": exit_px, "note": note,
+           "image": image}
     append_jsonl(TRADES_PATH, rec)
 
 
 def post_result(kind: str, side: str, r: float, *, entry: float | None = None,
                 stop: float | None = None, exit_px: float | None = None,
                 note: str = "", trade_id: str = "",
-                total_r: float | None = None) -> None:
+                total_r: float | None = None,
+                chart: "st.Frame | None" = None,
+                entry_ts: float | None = None, exit_idx: int | None = None,
+                tp1: float | None = None, tp2: float | None = None,
+                tp3: float | None = None) -> None:
     """Результат сделки: premium обновляет карточку, группа получает исход."""
     text = voice.event_text(kind, SYMBOL, side, r, note) + PREMIUM_CTA
     if DRY:
@@ -492,19 +497,45 @@ def post_result(kind: str, side: str, r: float, *, entry: float | None = None,
     # Сначала premium: событие durable в jsonl, subbot разложит его по outbox.
     queue_result(trade_id=tid, kind=kind, side=side, r=r, total_r=total,
                  entry=float(entry or 0), stop=stop, exit_px=exit_px, note=note)
-    note_trade(kind, side, r, trade_id=tid, total_r=total,
-               entry=entry, stop=stop, exit_px=exit_px, note=note)
 
     path = ""
     try:
         os.makedirs(OUT_DIR, exist_ok=True)
         path = os.path.join(OUT_DIR, f"result_{SYMBOL}_{int(time.time() * 1000)}.png")
-        card.render_result_card(symbol=SYMBOL, side=side, kind=kind, r=r, entry=entry,
-                                stop=stop, exit_px=exit_px, note=note, tf=TF,
-                                out_path=path)
+        rendered = False
+        if chart is not None and entry is not None and stop is not None and exit_idx is not None:
+            bars_all = [
+                feeds.Bar(dt.datetime.fromtimestamp(float(chart.t[j]), dt.timezone.utc),
+                          float(chart.o[j]), float(chart.h[j]),
+                          float(chart.l[j]), float(chart.c[j]))
+                for j in range(len(chart.t))
+            ]
+            n = len(bars_all)
+            ex_i = max(0, min(int(exit_idx), n - 1))
+            if entry_ts is not None:
+                en_i = min(range(n), key=lambda j: abs(float(chart.t[j]) - float(entry_ts)))
+            else:
+                en_i = max(0, ex_i - 60)
+            lo = max(0, min(en_i, ex_i) - 10)
+            hi = min(n, max(en_i, ex_i) + 10)
+            window = bars_all[lo:hi]
+            if window:
+                card.render_trade_chart(
+                    symbol=SYMBOL, side=side, kind=kind, r=r,
+                    entry=float(entry), stop=float(stop), exit_px=exit_px,
+                    bars=window, tf=TF, entry_idx=en_i - lo, exit_idx=ex_i - lo,
+                    out_path=path, tp1=tp1, tp2=tp2, tp3=tp3, note=note)
+                rendered = True
+        if not rendered:
+            card.render_result_card(symbol=SYMBOL, side=side, kind=kind, r=r,
+                                    entry=entry, stop=stop, exit_px=exit_px,
+                                    note=note, tf=TF, out_path=path)
     except Exception as e:
         print("карточка результата недоступна:", e)
         path = ""
+    note_trade(kind, side, r, trade_id=tid, total_r=total,
+               entry=entry, stop=stop, exit_px=exit_px, note=note,
+               image=path or None)
     # Результат в группе не должен обгонять отложенный вход.
     entry_due = store.group_entry_due(tid) or 0.0
     due = max(time.time(), entry_due + 1.0)
@@ -554,7 +585,9 @@ def manage_trade(state: dict, chart: st.Frame, i: int) -> None:
         full_note = (note + " " + postmortem()).strip()
         post_result(kind, side, r, entry=tr["entry"], stop=tr["stop"],
                     exit_px=exit_px, note=full_note,
-                    trade_id=str(tr.get("trade_id", "")), total_r=r)
+                    trade_id=str(tr.get("trade_id", "")), total_r=r,
+                    chart=chart, entry_ts=tr.get("bar_ts"), exit_idx=i,
+                    tp1=tr.get("tp1"), tp2=tr.get("tp2"), tp3=tr.get("tp3"))
         state["trade"] = None
 
     # трейлинг UT Bot: подтяжка по закрытию предыдущего бара, со следующего после TP1
@@ -601,7 +634,9 @@ def manage_trade(state: dict, chart: st.Frame, i: int) -> None:
         note = "стоп в безубыток" if PARAMS.be_after == 1 else ""
         post_result("tp1", side, add, entry=tr["entry"], stop=tr["stop"],
                     exit_px=tp1, note=note,
-                    trade_id=str(tr.get("trade_id", "")), total_r=rp)
+                    trade_id=str(tr.get("trade_id", "")), total_r=rp,
+                    chart=chart, entry_ts=tr.get("bar_ts"), exit_idx=i,
+                    tp1=tr.get("tp1"), tp2=tr.get("tp2"), tp3=tr.get("tp3"))
         if PARAMS.be_after == 1:
             tr["stop"], tr["be"] = tr["entry"], True
 
@@ -612,7 +647,9 @@ def manage_trade(state: dict, chart: st.Frame, i: int) -> None:
         done += p2
         tr["r_partial"], tr["done"] = rp, done
         post_result("tp2", side, add, entry=tr["entry"], stop=tr["stop"], exit_px=tp2,
-                    trade_id=str(tr.get("trade_id", "")), total_r=rp)
+                    trade_id=str(tr.get("trade_id", "")), total_r=rp,
+                    chart=chart, entry_ts=tr.get("bar_ts"), exit_idx=i,
+                    tp1=tr.get("tp1"), tp2=tr.get("tp2"), tp3=tr.get("tp3"))
         if PARAMS.be_after == 2:
             tr["stop"], tr["be"] = tr["entry"], True
 

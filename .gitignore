@@ -24,6 +24,11 @@ monitor_state.json
 autoposts_state.json
 backups/
 crypto_paid.json
+tg_posts_used.json
+vk_used.json
+dzen_used.json
+threads_img/generated/
+threads_img/1??.png
 sub_state.json
 threads_used.json
 x_used.json

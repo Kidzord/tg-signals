@@ -46,6 +46,7 @@ import config as cfg
 import render as card
 import revenue
 import ru_post
+import telegram_editor
 import tg
 import threads_editor
 import track_record
@@ -294,6 +295,17 @@ def remind_threads() -> bool:
     return ok
 
 
+def post_tg_content() -> bool:
+    """Превью Telegram-поста владельцу; публикация — по кнопке в боте."""
+    chat = owner_chat()
+    if not chat:
+        log.warning("нет чата владельца для Telegram-поста")
+        return False
+    ok = telegram_editor.send_next(chat, cfg.SUB_BOT_TOKEN or cfg.BOT_TOKEN)
+    log.info("превью Telegram-поста -> %s", ok)
+    return ok
+
+
 def remind_x() -> bool:
     """Прислать владельцу в личку следующий неопубликованный пост для X (EN)."""
     chat = owner_chat()
@@ -410,6 +422,8 @@ def build_scheduler() -> BackgroundScheduler:
     ]
     if cfg.PROMO_ENABLED:
         plan.append(("promo", cfg.PROMO_TIME, "*", post_promo))
+    if cfg.TG_CONTENT_ENABLED:
+        plan.append(("tgcontent", cfg.TG_CONTENT_TIME, "*", post_tg_content))
     for name, when, dow, job in plan:
         hm = _hhmm(when)
         if not hm:
@@ -458,6 +472,7 @@ def main() -> None:
         jobs = {"plan": post_plan, "day": post_day_summary, "week": post_week_summary,
                 "promo": post_promo, "threads": remind_threads, "x": remind_x,
                 "revenue": revenue.send_report, "backup": backup.snapshot,
+                "tgcontent": post_tg_content,
                 "vk": lambda: remind_ru("vk"), "dzen": lambda: remind_ru("dzen")}
         job = jobs.get(what)
         if not job:

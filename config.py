@@ -111,6 +111,9 @@ PREMIUM_URL = os.getenv("PREMIUM_URL", "https://t.me/KidzordPremim_bot").strip()
 PLAN_TIME = os.getenv("PLAN_TIME", "08:00").strip()
 DAY_SUMMARY_TIME = os.getenv("DAY_SUMMARY_TIME", "23:30").strip()
 WEEK_SUMMARY_TIME = os.getenv("WEEK_SUMMARY_TIME", "23:50").strip()
+# Пост-превью для Telegram: раз в день владельцу, публикация — по кнопке.
+TG_CONTENT_ENABLED = _flag("TG_CONTENT_ENABLED", "1")
+TG_CONTENT_TIME = os.getenv("TG_CONTENT_TIME", "12:00").strip()
 # Напоминания о постах Threads в личку: список времён через запятую
 THREADS_REMIND_ENABLED = _flag("THREADS_REMIND_ENABLED", "1")
 THREADS_REMIND_TIMES = os.getenv("THREADS_REMIND_TIMES", "09:00,14:00,19:00").strip()

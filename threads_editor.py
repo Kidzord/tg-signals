@@ -17,12 +17,14 @@ from __future__ import annotations
 
 import json
 import os
+import textwrap
 import time
 import urllib.parse
 
 import config as cfg
 import render as card
 import tg
+import theme
 import threads
 import threads_post
 import track_record
@@ -82,6 +84,38 @@ def _send(chat_id: str, token: str | None, image: str | None,
     return True
 
 
+def _generic_image(n: int, post: dict) -> str:
+    """Карточка для постов, под которые ещё нет нарисованной картинки."""
+    gen_dir = os.path.join(str(threads_post.IMG_DIR), "generated")
+    os.makedirs(gen_dir, exist_ok=True)
+    path = os.path.join(gen_dir, f"{n:02d}.png")
+    if os.path.exists(path):
+        return path
+    c = theme.Card(10.8, 13.5)
+    c.text(0.06, 0.945, "@KIDZORDFX", size=13, weight="bold",
+           display=True, color=theme.LABEL)
+    c.text(0.06, 0.905, theme.spaced("ЖУРНАЛ СДЕЛОК"), size=8.5,
+           color=theme.LABEL3)
+    c.text(0.94, 0.945, f"#{n:02d}", size=13, color=theme.ACCENT, ha="right")
+    c.hairline(0.06, 0.94, 0.875)
+
+    y = 0.80
+    for line in textwrap.wrap(post.get("title", "").upper(), width=16)[:2]:
+        c.text(0.06, y, line, size=26, weight="bold", display=True)
+        y -= 0.065
+    y -= 0.03
+    body = " ".join(str(post.get("text", "")).splitlines()[:4])
+    for line in textwrap.wrap(body, width=30)[:7]:
+        c.text(0.06, y, line, size=17, color=theme.LABEL2, va="top")
+        y -= 0.052
+
+    c.hairline(0.06, 0.94, 0.15)
+    c.text(0.06, 0.105, "t.me/KidzordFX", size=13, color=theme.ACCENT)
+    c.text(0.06, 0.065, "не является инвестиционной рекомендацией",
+           size=8, color=theme.LABEL3)
+    return c.save(path)
+
+
 def _read_last(path: str) -> dict | None:
     if not os.path.exists(path):
         return None
@@ -111,7 +145,7 @@ def send_next(chat_id: str, token: str | None = None, number: int | None = None)
         return False
     post = threads_post.POSTS[n - 1]
     text = _finish(post["text"])
-    image = str(threads_post.IMG_DIR / f"{n:02d}.png")
+    image = _generic_image(n, post)
     caption = (f"📝 <b>Пост #{n} · {post['title']}</b>\n"
                "Картинка 1080×1350 готова. Текст ниже — скопируй одним нажатием.")
     ok = _send(chat_id, token, image, caption, text)
@@ -166,18 +200,20 @@ def send_result(chat_id: str, token: str | None = None) -> bool:
             f"{label}\nПубликую и минусы, и плюсы — это и есть журнал.")
     text = _finish(body)
 
-    image = None
-    try:
-        os.makedirs(RENDERS, exist_ok=True)
-        path = os.path.join(RENDERS, f"threads_result_{int(float(rec.get('ts', time.time())))}.png")
-        card.render_result_card(
-            symbol=symbol, side=side, kind=kind or "sl", r=r,
-            entry=rec.get("entry"), stop=rec.get("stop"), exit_px=rec.get("exit"),
-            note=str(rec.get("note", "") or ""), tf=str(rec.get("tf", "15")),
-            out_path=path)
-        image = path
-    except Exception as e:
-        print("threads_editor: карточка результата не отрисовалась:", e)
+    image = str(rec.get("image") or "")
+    if not image or not os.path.exists(image):
+        image = ""
+        try:
+            os.makedirs(RENDERS, exist_ok=True)
+            path = os.path.join(RENDERS, f"threads_result_{int(float(rec.get('ts', time.time())))}.png")
+            card.render_result_card(
+                symbol=symbol, side=side, kind=kind or "sl", r=r,
+                entry=rec.get("entry"), stop=rec.get("stop"), exit_px=rec.get("exit"),
+                note=str(rec.get("note", "") or ""), tf=str(rec.get("tf", "15")),
+                out_path=path)
+            image = path
+        except Exception as e:
+            print("threads_editor: карточка результата не отрисовалась:", e)
 
     caption = (f"🏁 <b>Результат {symbol}</b>\n"
                "Карточка готова. Текст ниже — для Threads.")

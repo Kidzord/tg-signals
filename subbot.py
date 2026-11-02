@@ -42,6 +42,8 @@ import crypto_pay
 import render as card
 import revenue
 import store
+import telegram_editor
+import telegram_posts
 import tg
 import threads_editor
 import track_record
@@ -1026,6 +1028,15 @@ def handle_callback(users: dict, uid: str, chat_id: str, mid: int, data: str) ->
             threads_editor.send_result(uid, TOKEN)
         return None
 
+    # Превью/публикация Telegram-поста — только владельцу.
+    if data.startswith("tgpost:") and str(uid) == str(cfg.OWNER_CHAT_ID):
+        parts = data.split(":")
+        if len(parts) >= 2 and parts[1] == "next":
+            telegram_editor.send_next(uid, TOKEN)
+        elif len(parts) >= 3 and parts[1] == "pub" and parts[2].isdigit():
+            telegram_editor.publish(int(parts[2]), uid, TOKEN)
+        return None
+
     if data == "buy":
         send_buy(uid)
         return None
@@ -1182,7 +1193,9 @@ def handle(users: dict, uid: str, raw: str, name: str = "") -> dict | None:
                        "по расписанию, чтобы ты не забывал публиковать.\n\n"
                        "В любой момент: /post — следующий пост, /post signal — "
                        "последний сигнал, /post week — итог недели, /post result — "
-                       "последняя закрытая сделка.")
+                       "последняя закрытая сделка.\n"
+                       "Telegram: /tgpost — превью поста с кнопкой «Опубликовать», "
+                       "/tgpost now — опубликовать сразу.")
             return None
 
     if cmd in ("start", "menu"):
@@ -1281,6 +1294,19 @@ def handle(users: dict, uid: str, raw: str, name: str = "") -> dict | None:
                 threads_editor.send_next(uid, TOKEN, int(arg))
             else:
                 threads_editor.send_next(uid, TOKEN)
+            return None
+        if cmd == "tgpost":
+            arg = args[0].lower() if args else "preview"
+            if arg in ("now", "publish"):
+                n = telegram_posts.next_unused()
+                if n is None:
+                    reply(uid, "Банк Telegram-постов закончился.")
+                else:
+                    telegram_editor.publish(n, uid, TOKEN)
+            elif arg.isdigit():
+                telegram_editor.send_next(uid, TOKEN, int(arg))
+            else:
+                telegram_editor.send_next(uid, TOKEN)
             return None
 
     # остальное — только по активной подписке
