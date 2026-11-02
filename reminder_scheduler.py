@@ -1,13 +1,20 @@
 """Простой планировщик напоминаний о постах (без зависимостей)."""
 import json
+import os
 import subprocess
+import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-# Конфигурация
-TG_BOT_TOKEN = "8957215002:AAGHuG07sM9CCBZTBEnb7wmMWa21tpQUZlU"
-OWNER_CHAT_ID = "36685705"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import config as cfg
+
+# Токен и чат владельца — только из .env.
+TG_BOT_TOKEN = cfg.SUB_BOT_TOKEN or cfg.BOT_TOKEN
+OWNER_CHAT_ID = cfg.OWNER_CHAT_ID
+if not TG_BOT_TOKEN or not OWNER_CHAT_ID:
+    raise SystemExit("нет SUB_BOT_TOKEN/TG_BOT_TOKEN или OWNER_CHAT_ID в .env")
 REMIND_TIMES = ["09:00", "14:00", "19:00"]  # по Москве
 
 # Русские тексты для Threads (все 28 постов)

@@ -16,6 +16,15 @@ hb_*.json
 daily_risk.log
 trades.jsonl
 signals_queue.jsonl
+results_queue.jsonl
+state.db
+state.db-wal
+state.db-shm
+monitor_state.json
+autoposts_state.json
+backups/
+crypto_paid.json
+sub_state.json
 threads_used.json
 x_used.json
 month_post/

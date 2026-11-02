@@ -241,8 +241,14 @@ async def tradingview(secret: str, request: Request):
     if secret != cfg.WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="forbidden")
 
-    # Rate limiting по IP
-    client_ip = request.client.host if request.client else "unknown"
+    # Rate limiting по IP. За cloudflared request.client.host — это 127.0.0.1,
+    # поэтому сначала смотрим заголовки туннеля, иначе все клиенты попадут
+    # в один bucket и один шумный источник заблокирует остальных.
+    client_ip = (
+        request.headers.get("cf-connecting-ip")
+        or (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+        or (request.client.host if request.client else "unknown")
+    )
     allowed, retry_after = rate_limit.check_webhook(client_ip)
     if not allowed:
         logger_config.metrics.increment("webhook_rate_limited")
@@ -255,6 +261,11 @@ async def tradingview(secret: str, request: Request):
 
     raw = (await request.body()).decode("utf-8", "replace")
     log.info("вебхук: %s", raw[:300].replace("\n", " "))
+
+    # Индикатор шлёт "EXIT ..." при закрытии сделки. Это не новый сигнал,
+    # поэтому выходим тихо, не засоряя метрику webhook_parse_failed.
+    if raw.lstrip().upper().startswith("EXIT"):
+        return {"ok": True, "ignored": "exit"}
 
     sig = parse_alert(raw)
     if not sig:

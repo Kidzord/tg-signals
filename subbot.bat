@@ -8,7 +8,13 @@ call "%~dp0pyfind.bat"
 if not defined PY goto nopython
 
 echo Интерпретатор: %PY%
-"%PY%" -u subbot.py %*
+
+rem файловый лог: вывод идёт и в окно, и в logs\subbot.log
+if not exist logs mkdir logs
+set "BOTS_LOG=logs\subbot.log"
+echo === старт %date% %time% === >> "%BOTS_LOG%"
+set "PYTHONIOENCODING=utf-8"
+powershell -NoProfile -Command "[Console]::OutputEncoding=[Text.Encoding]::UTF8; & '%PY%' -u subbot.py %* 2>&1 | ForEach-Object { Write-Host $_; Add-Content -Path '%BOTS_LOG%' -Value $_ -Encoding UTF8 }"
 echo.
 echo Код выхода: %errorlevel%
 if "%~1"=="" pause

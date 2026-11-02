@@ -40,6 +40,9 @@ PLAN_TOTAL_PCT = _float("PLAN_TOTAL_PCT", 10.0)
 # --- Premium-подписка (Telegram Stars) ---
 # Цена подписки в Stars (1–10000). У Telegram период подписки только 30 дней.
 SUB_PRICE_STARS = int(_float("SUB_PRICE_STARS", 500.0))
+# Годовой план: разовый счёт Stars (подписка Telegram умеет только 30 дней).
+# 0 — годовой план выключен.
+SUB_PRICE_STARS_YEAR = int(_float("SUB_PRICE_STARS_YEAR", "0"))
 SUB_TITLE = os.getenv("SUB_TITLE", "KidzordFX Premium").strip()
 SUB_DESCRIPTION = os.getenv(
     "SUB_DESCRIPTION",
@@ -58,6 +61,8 @@ CRYPTO_PAY_TOKEN = os.getenv("CRYPTO_PAY_TOKEN", "").strip()
 CRYPTO_PAY_TESTNET = _flag("CRYPTO_PAY_TESTNET", "0")
 # Цена подписки в крипте (0 — способ оплаты выключен). ~500 ⭐ ≈ 8 USDT.
 CRYPTO_PRICE_USDT = _float("CRYPTO_PRICE_USDT", 8.0)
+# Годовая цена в крипте (0 — годовой план выключен).
+CRYPTO_PRICE_USDT_YEAR = _float("CRYPTO_PRICE_USDT_YEAR", "0.0")
 # Валюта счёта: USDT, TON, BTC, ETH и т.п.
 CRYPTO_ASSET = os.getenv("CRYPTO_ASSET", "USDT").strip().upper() or "USDT"
 
@@ -124,6 +129,17 @@ TRIAL_DAYS = int(_float("TRIAL_DAYS", 3.0))
 # Реферальная программа: сколько дней получает пригласивший за оплату друга
 REF_ENABLED = _flag("REF_ENABLED", "1")
 REF_DAYS = int(_float("REF_DAYS", 7.0))
+# Промокоды: CODE:DAYS через запятую, например NEW20:20,OLD30:30.
+# Один код — один раз на пользователя.
+PROMO_CODES: dict[str, int] = {}
+for _item in os.getenv("PROMO_CODES", "").split(","):
+    _item = _item.strip()
+    if ":" in _item:
+        _code, _days = _item.split(":", 1)
+        try:
+            PROMO_CODES[_code.strip().upper()] = int(float(_days))
+        except ValueError:
+            continue
 # username premium-бота без @ — из него собирается реферальная ссылка ?start=ref_<id>
 SUB_BOT_USERNAME = os.getenv("SUB_BOT_USERNAME", "").strip().lstrip("@")
 # ссылка «Поддержка» (t.me/username или инвайт) — кнопка в меню бота
@@ -138,6 +154,14 @@ MONITOR_ENABLED = _flag("MONITOR_ENABLED", "1")
 MONITOR_EVERY_MIN = int(_float("MONITOR_EVERY_MIN", 15.0))
 # если пульса нет дольше M минут — алерт владельцу в личку
 MONITOR_STALE_MIN = int(_float("MONITOR_STALE_MIN", 15.0))
+# сколько процессов bot.py должно работать (range AUDUSD+USDCAD + classic XAUUSD)
+EXPECTED_BOTS = int(_float("HEARTBEAT_EXPECT_BOTS", 3.0))
+# Внешний dead-man switch: URL healthchecks.io (или аналога). Пока ПК жив,
+# monitor.py раз в цикл пингует его; если ПК упал — сервис шлёт алерт.
+HEALTHCHECK_URL = os.getenv("HEALTHCHECK_URL", "").strip()
+# Доставка: сколько попыток и максимальная пауза между ними.
+DELIVERY_MAX_ATTEMPTS = int(_float("DELIVERY_MAX_ATTEMPTS", 6.0))
+DELIVERY_ALERT = _flag("DELIVERY_ALERT", "1")
 
 # --- Прочее ---
 DEDUP_TTL_SEC = int(os.getenv("DEDUP_TTL_SEC", "900"))

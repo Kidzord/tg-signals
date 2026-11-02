@@ -36,10 +36,14 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import brand
+import backup
 import config as cfg
 import crypto_pay
 import render as card
+import revenue
+import store
 import tg
+import track_record
 import ui_components
 import subbot_ui
 
@@ -47,6 +51,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 USERS_PATH = os.path.join(HERE, "users.json")
 STATE_PATH = os.path.join(HERE, "sub_state.json")
 QUEUE_PATH = os.path.join(HERE, "signals_queue.jsonl")
+# События закрытия сделок (пишет bot.py) — ими обновляем карточку входа.
+RESULTS_PATH = os.path.join(HERE, "results_queue.jsonl")
 # Журнал закрытых сделок (пишет bot.py) — по нему считаем публичную статистику.
 TRADES_PATH = os.path.join(HERE, "trades.jsonl")
 OUT_DIR = os.path.join(HERE, "renders")
@@ -76,10 +82,14 @@ TOTAL_MIN, TOTAL_MAX = 1.0, 80.0
 
 def price_line() -> str:
     """Строка с ценой подписки: Stars и, если подключена, крипта."""
+    parts = [f"{cfg.SUB_PRICE_STARS} ⭐/мес"]
+    if cfg.SUB_PRICE_STARS_YEAR > 0:
+        parts.append(f"{cfg.SUB_PRICE_STARS_YEAR} ⭐/год")
     if crypto_pay.enabled():
-        return (f"{cfg.SUB_PRICE_STARS} ⭐ или {cfg.CRYPTO_PRICE_USDT:g} "
-                f"{cfg.CRYPTO_ASSET} в месяц")
-    return f"{cfg.SUB_PRICE_STARS} ⭐ в месяц"
+        parts.append(f"{cfg.CRYPTO_PRICE_USDT:g} {cfg.CRYPTO_ASSET}/мес")
+        if cfg.CRYPTO_PRICE_USDT_YEAR > 0:
+            parts.append(f"{cfg.CRYPTO_PRICE_USDT_YEAR:g} {cfg.CRYPTO_ASSET}/год")
+    return " · ".join(parts)
 
 
 HELP = (
@@ -93,6 +103,7 @@ HELP = (
     "<b>Команды (если удобнее текстом):</b>\n"
     f"/buy — подписка, {price_line()}\n"
     "/status — до какого числа активна\n"
+    "/promo КОД — активировать промокод\n"
     "/stats — статистика сигналов (7 и 30 дней)\n"
     "/faq — частые вопросы\n"
     "/mycard — карточка счёта\n"
@@ -223,6 +234,34 @@ def grant(users: dict, uid: str, until_ts: float) -> None:
     save_json(USERS_PATH, users)
 
 
+def alert_owner(text: str) -> None:
+    """Технический алерт владельцу. Не влияет на обслуживание подписчика."""
+    if not cfg.DELIVERY_ALERT or not cfg.OWNER_CHAT_ID:
+        return
+    tg.send_message(text, token=TOKEN, chat_id=cfg.OWNER_CHAT_ID)
+
+
+def apply_payment(users: dict, *, provider: str, external_id: str, uid: str,
+                  amount: float = 0.0, currency: str = "", days: int = 30,
+                  until_ts: float | None = None,
+                  raw: dict | None = None) -> bool:
+    """Идемпотентно записать платёж и выдать/продлить подписку.
+
+    ``external_id`` — уникальный ID платежа у провайдера (charge_id Stars,
+    invoice_id крипты). Повторный апдейт с тем же ID вернёт False и ничего
+    не продлит.
+    """
+    new = store.record_payment(
+        provider=provider, external_id=external_id, uid=uid,
+        amount=amount, currency=currency, days=days, raw=raw,
+    )
+    if not new:
+        return False
+    until = until_ts if until_ts and until_ts > 0 else time.time() + days * 86400
+    grant(users, uid, until)
+    return True
+
+
 def stops_today() -> int:
     """Стопы за сегодня (UTC) — из общего журнала сигнального бота."""
     day = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
@@ -231,6 +270,115 @@ def stops_today() -> int:
             return sum(1 for line in f if line.strip() == day)
     except FileNotFoundError:
         return 0
+
+
+# ---------------------------------------------------- доставка (durable outbox)
+
+def result_status(rec: dict) -> str:
+    """Человеческая строка статуса сделки для подписи под карточкой входа."""
+    event = str(rec.get("event", "")).lower()
+    total = float(rec.get("total_r", rec.get("r", 0)) or 0)
+    add = float(rec.get("r", 0) or 0)
+    icons = {"tp1": "✅", "tp2": "✅", "tp3": "🏁", "tp": "🎯",
+             "sl": "🛑", "be": "⚪", "time": "⏱"}
+    icon = icons.get(event, "📌")
+    if event in ("tp1", "tp2"):
+        text = f"{icon} {event.upper()} взят · +{add:.1f}R · всего {total:+.1f}R"
+    elif event == "sl":
+        text = f"{icon} Стоп · итог {total:+.1f}R"
+    elif event == "be":
+        text = f"{icon} Безубыток · итог {total:+.1f}R"
+    elif event == "time":
+        text = f"{icon} Закрыто по времени · итог {total:+.1f}R"
+    else:
+        text = f"{icon} Сделка закрыта · итог {total:+.1f}R"
+    note = str(rec.get("note", "") or "").strip()
+    if note:
+        text += f"\n{note}"
+    return text
+
+
+def _with_status(base: str, status: str) -> str:
+    """Подпись карточки + статус, не выходя за лимит Telegram (1024)."""
+    base = base or ""
+    room = tg.CAPTION_LIMIT - len(status) - 2
+    if len(base) > room:
+        base = base[: max(0, room - 1)] + "…"
+    return (base + "\n\n" + status).strip()
+
+
+def _symbol_allowed(user: dict, symbol: str) -> bool:
+    flt = user.get("symbols") or []
+    if isinstance(flt, str):
+        flt = [x.strip().upper() for x in flt.split(",") if x.strip()]
+    return not flt or symbol.upper() in [str(x).upper() for x in flt]
+
+
+def process_deliveries(users: dict) -> None:
+    """Отправить пачку сообщений из outbox с retry/429/блокировками."""
+    for row in store.claim_deliveries(20):
+        uid = str(row["uid"])
+        kind = str(row["kind"])
+        user = users.get(uid) or {}
+        if user.get("blocked"):
+            store.mark_delivery_terminal(row["id"], "blocked", "пользователь заблокирован")
+            continue
+
+        if kind == "entry":
+            if not is_paid(users, uid):
+                store.mark_delivery_terminal(row["id"], "skipped", "подписка закончилась")
+                continue
+            if not _symbol_allowed(user, str(row["symbol"] or "")):
+                store.mark_delivery_terminal(row["id"], "skipped", "фильтр символов")
+                continue
+            maxday = int(user.get("maxday", 0) or 0)
+            if maxday > 0 and store.sent_entries_today(uid, time.time() - 86400) >= maxday:
+                store.mark_delivery_terminal(row["id"], "skipped", "дневной лимит сигналов")
+                continue
+            path = str(row["image_path"] or "")
+            if path and os.path.exists(path):
+                res = tg.send_photo_result(path, row["caption"], token=TOKEN,
+                                           chat_id=row["chat_id"])
+            else:
+                res = tg.send_message_result(row["caption"], token=TOKEN,
+                                             chat_id=row["chat_id"])
+        else:
+            mid = store.entry_message_id(str(row["trade_id"]), uid)
+            if mid is None:
+                if store.entry_pending_exists(str(row["trade_id"]), uid):
+                    # вход ещё не ушёл — результат подождёт, иначе он обгонит карточку
+                    store.mark_delivery_retry(row["id"], "ждём карточку входа", 60)
+                    continue
+                res = tg.send_message_result(row["caption"], token=TOKEN,
+                                             chat_id=row["chat_id"])
+            else:
+                caption = _with_status(
+                    store.entry_caption(str(row["trade_id"]), uid), row["caption"])
+                res = tg.edit_caption_result(row["chat_id"], mid, caption, token=TOKEN)
+                if not res.ok and not res.blocked and not res.retry_after:
+                    res = tg.send_message_result(row["caption"], token=TOKEN,
+                                                 chat_id=row["chat_id"])
+
+        if res.ok:
+            sent_mid = None
+            if isinstance(res.result, dict):
+                sent_mid = res.result.get("message_id")
+            store.mark_delivery_sent(row["id"], sent_mid)
+        elif res.blocked:
+            users.setdefault(uid, {})["blocked"] = 1
+            save_json(USERS_PATH, users)
+            store.mark_user_blocked(uid, res.error)
+            alert_owner(f"⛔ Подписчик <code>{uid}</code> заблокировал бота — "
+                        "исключён из рассылки.")
+        elif res.retry_after:
+            store.mark_delivery_retry(row["id"], res.error, res.retry_after)
+        elif int(row["attempts"]) + 1 >= cfg.DELIVERY_MAX_ATTEMPTS:
+            store.mark_delivery_terminal(row["id"], "failed", res.error)
+            alert_owner(f"❗ Не доставлено {row['kind']} {row['trade_id']} "
+                        f"→ <code>{uid}</code>\n{res.error[:200]}")
+        else:
+            delay = min(1800, 30 * (2 ** int(row["attempts"])))
+            store.mark_delivery_retry(row["id"], res.error, delay)
 
 
 # ---------------------------------------------------- статистика, рефералы, проба
@@ -258,27 +406,29 @@ def load_trades() -> list[dict]:
 
 
 def _stats_line(days: int, label: str) -> str:
-    cut = time.time() - days * 86400
-    rs = [t["r"] for t in load_trades() if t["ts"] >= cut]
-    if not rs:
-        return f"<b>{label}</b>: сделок не было."
-    wins = sum(1 for r in rs if r > 0)
-    return (f"<b>{label}</b>: сделок {len(rs)} · прибыльных {wins} "
-            f"({wins / len(rs) * 100:.0f}%) · итог <b>{sum(rs):+.1f}R</b>")
+    return track_record.short_line(days, label)
 
 
-def send_stats(uid: str) -> None:
-    """Публичный послужной список канала: неделя и месяц."""
+def send_stats(uid: str, users: dict | None = None) -> None:
+    """Публичный послужной список канала: неделя и месяц + equity-картинка."""
     tail = ""
     if channel_link():
         tail = (f'\n\nВсе сигналы публикуем открыто — вход, стоп и результат. '
                 f'Полный поток: <a href="{channel_link()}">{cfg.CHANNEL_HANDLE or "группа"}</a>.')
-    reply(uid,
-          "📈 <b>Статистика сигналов</b>\n\n"
-          + _stats_line(7, "7 дней") + "\n"
-          + _stats_line(30, "30 дней") +
-          "\n\n<i>R — размер результата в рисках: +1R — заработали один риск, "
-          "−1R — отдали. Публикуем и плюсы, и стопы.</i>" + tail)
+    text = (
+        "📈 <b>Статистика сигналов</b>\n\n"
+        + _stats_line(7, "7 дней") + "\n"
+        + _stats_line(30, "30 дней") +
+        "\n\n<i>R — размер результата в рисках. PF — profit factor, "
+        "DD — максимальная просадка. Публикуем и плюсы, и стопы.</i>" + tail
+    )
+    img = track_record.render_equity(30)
+    if img:
+        ok, _ = tg.send_photo(img, text, token=TOKEN, chat_id=uid,
+                              markup=menu_markup(users, uid) if users else None)
+        if ok:
+            return
+    reply(uid, text)
 
 
 def ref_link(uid: str) -> str:
@@ -313,6 +463,9 @@ def reward_referrer(users: dict, uid: str) -> None:
         r["paid_until"] = until
         r["refs"] = int(r.get("refs", 0) or 0) + 1
         save_json(USERS_PATH, users)
+        store.record_payment(provider="ref", external_id=f"ref:{uid}", uid=ref,
+                             amount=0.0, days=cfg.REF_DAYS,
+                             raw={"invited": uid, "source": "referral"})
         tg.send_message(
             f"🎁 По твоей ссылке оформили Premium — начислил <b>+{cfg.REF_DAYS} дн.</b>\n"
             f"Доступ активен до <b>{_date(until)}</b>. Спасибо, что приводишь своих.",
@@ -336,6 +489,8 @@ def grant_trial(users: dict, uid: str) -> None:
     until = time.time() + cfg.TRIAL_DAYS * 86400
     users[uid]["paid_until"] = max(paid_until(users, uid), until)
     save_json(USERS_PATH, users)
+    store.record_payment(provider="trial", external_id=f"trial:{uid}", uid=uid,
+                         amount=0.0, days=cfg.TRIAL_DAYS, raw={"source": "trial"})
     tg.send_message(
         f"🎁 <b>Пробный доступ открыт на {cfg.TRIAL_DAYS} дн.</b>\n\n"
         + onboard_text(until), token=TOKEN, chat_id=uid,
@@ -409,15 +564,22 @@ def send_card(uid: str, users: dict, name: str = "") -> None:
 
 def send_buy(uid: str) -> None:
     """Оплата подписки: карточка выгод и выбор способа (Stars / крипта)."""
-    if not crypto_pay.enabled():
+    if not crypto_pay.enabled() and cfg.SUB_PRICE_STARS_YEAR <= 0:
         send_stars(uid)
         return
-    rows = [
-        [{"text": f"⭐ Telegram Stars — {cfg.SUB_PRICE_STARS} ⭐",
+    rows: list[list[dict]] = [
+        [{"text": f"⭐ Telegram Stars — {cfg.SUB_PRICE_STARS} ⭐ / мес",
           "callback_data": "pay:stars"}],
-        [{"text": f"💠 Крипта — {cfg.CRYPTO_PRICE_USDT:g} {cfg.CRYPTO_ASSET}",
-          "callback_data": "pay:crypto"}],
     ]
+    if cfg.SUB_PRICE_STARS_YEAR > 0:
+        rows.append([{"text": f"⭐ Stars — {cfg.SUB_PRICE_STARS_YEAR} ⭐ / год",
+                      "callback_data": "pay:stars:year"}])
+    if crypto_pay.enabled():
+        rows.append([{"text": f"💠 Крипта — {cfg.CRYPTO_PRICE_USDT:g} {cfg.CRYPTO_ASSET} / мес",
+                      "callback_data": "pay:crypto"}])
+    if crypto_pay.enabled() and cfg.CRYPTO_PRICE_USDT_YEAR > 0:
+        rows.append([{"text": f"💠 Крипта — {cfg.CRYPTO_PRICE_USDT_YEAR:g} {cfg.CRYPTO_ASSET} / год",
+                      "callback_data": "pay:crypto:year"}])
     cb = channel_buttons()
     if cb:
         rows.append(cb)
@@ -425,9 +587,14 @@ def send_buy(uid: str) -> None:
     caption = (
         f"<b>{cfg.SUB_TITLE}</b>\n\n{cfg.SUB_DESCRIPTION}\n\n"
         "Выбери, как удобнее оплатить:\n"
-        f"• <b>Stars</b> — {cfg.SUB_PRICE_STARS} ⭐, продление автоматическое\n"
-        f"• <b>Крипта</b> — {cfg.CRYPTO_PRICE_USDT:g} {cfg.CRYPTO_ASSET}, оплата разовая"
+        f"• <b>Stars</b> — {cfg.SUB_PRICE_STARS} ⭐ в месяц, продление автоматическое\n"
     )
+    if cfg.SUB_PRICE_STARS_YEAR > 0:
+        caption += (f"• <b>Stars, год</b> — {cfg.SUB_PRICE_STARS_YEAR} ⭐ разово, "
+                    "без автопродления\n")
+    if crypto_pay.enabled():
+        caption += (f"• <b>Крипта</b> — {cfg.CRYPTO_PRICE_USDT:g} {cfg.CRYPTO_ASSET}, "
+                    "оплата разовая\n")
     offer = asset("offer")
     if offer and os.path.exists(offer):
         sent, _ = tg.send_photo(offer, caption, token=TOKEN, chat_id=uid, markup=markup)
@@ -436,24 +603,32 @@ def send_buy(uid: str) -> None:
     tg.send_message(caption, token=TOKEN, chat_id=uid, markup=markup)
 
 
-def send_stars(uid: str) -> None:
-    """Карточка выгод + счёт в Stars: кнопка на оплату подписки."""
+def send_stars(uid: str, days: int = 30) -> None:
+    """Карточка выгод + счёт в Stars: подписка (авто) или годовой пакет."""
+    year = days > 30
+    stars = cfg.SUB_PRICE_STARS_YEAR if year else cfg.SUB_PRICE_STARS
+    if year and stars <= 0:
+        send_stars(uid, 30)
+        return
+    period = "365 дней" if year else "30 дней"
     ok, res = tg.create_invoice_link(
-        title=cfg.SUB_TITLE, description=cfg.SUB_DESCRIPTION,
-        payload=f"sub:{uid}", stars=cfg.SUB_PRICE_STARS, token=TOKEN)
+        title=f"{cfg.SUB_TITLE} — {period}", description=cfg.SUB_DESCRIPTION,
+        payload=f"sub:{uid}:{days}", stars=stars,
+        subscription=not year, token=TOKEN)
     if not ok:
         print("createInvoiceLink:", res)
         reply(uid, "Не получилось создать счёт. Попробуй позже.")
         return
-    rows = [[{"text": f"Оплатить {cfg.SUB_PRICE_STARS} ⭐", "url": res}]]
+    rows = [[{"text": f"Оплатить {stars} ⭐", "url": res}]]
     cb = channel_buttons()
     if cb:
         rows.append(cb)
     markup = {"inline_keyboard": rows}
+    renew = ("продлевается автоматически, отменить можно в любой момент "
+             "в «Мои звёзды»" if not year else "разовый платёж, без автопродления")
     caption = (
         f"<b>{cfg.SUB_TITLE}</b>\n\n{cfg.SUB_DESCRIPTION}\n\n"
-        f"Подписка {cfg.SUB_PRICE_STARS} ⭐ в месяц: продлевается автоматически, "
-        "отменить можно в любой момент в «Мои звёзды»."
+        f"Доступ на <b>{period}</b> — {stars} ⭐, {renew}."
     )
     offer = asset("offer")
     if offer and os.path.exists(offer):
@@ -463,10 +638,16 @@ def send_stars(uid: str) -> None:
     tg.send_message(caption, token=TOKEN, chat_id=uid, markup=markup)
 
 
-def send_crypto(uid: str) -> None:
+def send_crypto(uid: str, days: int = 30) -> None:
     """Счёт в крипте через Crypto Pay: ссылка на оплату."""
+    year = days > 30
+    amount = cfg.CRYPTO_PRICE_USDT_YEAR if year else cfg.CRYPTO_PRICE_USDT
+    if year and amount <= 0:
+        send_crypto(uid, 30)
+        return
+    period = "365 дней" if year else "30 дней"
     ok, inv = crypto_pay.create_invoice(
-        cfg.CRYPTO_PRICE_USDT, f"{cfg.SUB_TITLE} — 30 дней", f"sub:{uid}")
+        amount, f"{cfg.SUB_TITLE} — {period}", f"sub:{uid}:{days}")
     if not ok or not isinstance(inv, dict):
         print("createInvoice:", inv)
         reply(uid, "Не получилось создать счёт в крипте. Попробуй позже или оплати Stars.")
@@ -477,16 +658,14 @@ def send_crypto(uid: str) -> None:
         print("createInvoice: нет ссылки на оплату", inv)
         reply(uid, "Не получилось создать счёт в крипте. Попробуй позже.")
         return
-    rows = [[{"text": f"💠 Оплатить {cfg.CRYPTO_PRICE_USDT:g} {cfg.CRYPTO_ASSET}",
-              "url": url}],
+    rows = [[{"text": f"💠 Оплатить {amount:g} {cfg.CRYPTO_ASSET}", "url": url}],
             [{"text": "← Другой способ", "callback_data": "buy"}]]
     cb = channel_buttons()
     if cb:
         rows.append(cb)
     tg.send_message(
         f"<b>Оплата криптой</b>\n\n"
-        f"Счёт на <b>{cfg.CRYPTO_PRICE_USDT:g} {cfg.CRYPTO_ASSET}</b> "
-        f"(сеть {cfg.CRYPTO_ASSET}).\n"
+        f"Счёт на <b>{amount:g} {cfg.CRYPTO_ASSET}</b> за <b>{period}</b>.\n"
         "Открой счёт кнопкой ниже и оплати — подписка включится сама, "
         "как только платёж подтвердится (обычно 1–3 мин).\n\n"
         "Оплата разовая: продление нужно повторить, бот напомнит заранее.",
@@ -644,25 +823,67 @@ def send_gate(uid: str) -> None:
 def settings_text(users: dict, uid: str) -> str:
     p = user_plan(users, uid)
     risk_money = float(p["deposit"]) * float(p["risk"]) / 100.0
+    u = users.get(uid) or {}
+    syms = u.get("symbols") or []
+    if isinstance(syms, str):
+        syms = [x.strip().upper() for x in syms.split(",") if x.strip()]
+    maxday = int(u.get("maxday", 0) or 0)
+    filt = f"{', '.join(syms) if syms else 'все'} · лимит {maxday or 'нет'}"
     return (
         "<b>Настрой свой план</b>\n\n"
         f"Депозит <b>{usd(float(p['deposit']))}</b>\n"
         f"Риск на сделку <b>{float(p['risk']):.2f}%</b> = <b>{usd(risk_money)}</b>\n"
         f"Дневной стоп <b>{float(p['daily']):.1f}%</b> · "
-        f"общий стоп <b>{float(p['total']):.1f}%</b>\n\n"
+        f"общий стоп <b>{float(p['total']):.1f}%</b>\n"
+        f"Фильтры: <b>{filt}</b>\n\n"
         "Нажми на строку, чтобы изменить."
     )
+
+
+def filters_text(users: dict, uid: str) -> str:
+    u = users.get(uid) or {}
+    syms = u.get("symbols") or []
+    if isinstance(syms, str):
+        syms = [x.strip().upper() for x in syms.split(",") if x.strip()]
+    maxday = int(u.get("maxday", 0) or 0)
+    return (
+        "<b>Фильтры сигналов</b>\n\n"
+        f"Инструменты: <b>{', '.join(syms) if syms else 'все'}</b>\n"
+        f"Максимум входов за 24 ч: <b>{maxday or 'без лимита'}</b>\n\n"
+        "Фильтр применяется к новым сигналам. Открытые сделки ведутся до конца, "
+        "результаты по ним придут как обычно."
+    )
+
+
+def filters_markup(users: dict, uid: str) -> dict:
+    return {"inline_keyboard": [
+        [{"text": "Все инструменты", "callback_data": "flt:sym:all"}],
+        [{"text": "Только золото (XAUUSD)", "callback_data": "flt:sym:xau"}],
+        [{"text": "Золото + форекс", "callback_data": "flt:sym:fx"}],
+        [{"text": "Лимит: нет", "callback_data": "flt:max:0"},
+         {"text": "1 в сутки", "callback_data": "flt:max:1"}],
+        [{"text": "3 в сутки", "callback_data": "flt:max:3"},
+         {"text": "5 в сутки", "callback_data": "flt:max:5"}],
+        [{"text": "← Назад", "callback_data": "set:menu"}],
+    ]}
 
 
 def settings_markup(users: dict, uid: str) -> dict:
     p = user_plan(users, uid)
     risk_money = float(p["deposit"]) * float(p["risk"]) / 100.0
+    u = users.get(uid) or {}
+    syms = u.get("symbols") or []
+    if isinstance(syms, str):
+        syms = [x.strip().upper() for x in syms.split(",") if x.strip()]
+    maxday = int(u.get("maxday", 0) or 0)
+    filt = f"{len(syms) if syms else 'все'} · {maxday or '∞'}"
     return {"inline_keyboard": [
         [{"text": f"💰 Депозит: {usd(float(p['deposit']))}", "callback_data": "set:deposit"}],
         [{"text": f"🎯 Риск: {float(p['risk']):.2f}% (={usd(risk_money)})",
           "callback_data": "set:risk"}],
         [{"text": f"🛑 День: {float(p['daily']):.1f}%", "callback_data": "set:daily"}],
         [{"text": f"🧱 Всего: {float(p['total']):.1f}%", "callback_data": "set:total"}],
+        [{"text": f"🔔 Фильтры: {filt}", "callback_data": "set:filters"}],
         [{"text": "📊 Карточка счёта", "callback_data": "card"}],
     ]}
 
@@ -710,8 +931,16 @@ def handle_callback(users: dict, uid: str, chat_id: str, mid: int, data: str) ->
         send_stars(uid)
         return None
 
+    if data == "pay:stars:year":
+        send_stars(uid, 365)
+        return None
+
     if data == "pay:crypto":
         send_crypto(uid)
+        return None
+
+    if data == "pay:crypto:year":
+        send_crypto(uid, 365)
         return None
 
     if data == "card":
@@ -723,7 +952,7 @@ def handle_callback(users: dict, uid: str, chat_id: str, mid: int, data: str) ->
         return None
 
     if data == "stats":
-        send_stats(uid)
+        send_stats(uid, users)
         return None
 
     if data == "faq":
@@ -747,6 +976,36 @@ def handle_callback(users: dict, uid: str, chat_id: str, mid: int, data: str) ->
     if data == "set:menu":
         _edit_or_send(chat_id, mid, settings_text(users, uid),
                       settings_markup(users, uid), uid)
+        return None
+
+    if data == "set:filters":
+        _edit_or_send(chat_id, mid, filters_text(users, uid),
+                      filters_markup(users, uid), uid)
+        return None
+
+    if data.startswith("flt:sym:"):
+        val = data.split(":", 2)[2]
+        mapping = {
+            "all": [],
+            "xau": ["XAUUSD"],
+            "fx": ["XAUUSD", "AUDUSD", "USDCAD", "GBPUSD"],
+        }
+        if val in mapping:
+            users.setdefault(uid, {})["symbols"] = mapping[val]
+            save_json(USERS_PATH, users)
+            _edit_or_send(chat_id, mid, filters_text(users, uid),
+                          filters_markup(users, uid), uid)
+            return users.get(uid) or {}
+        return None
+
+    if data.startswith("flt:max:"):
+        raw = data.split(":", 2)[2]
+        if raw.isdigit():
+            users.setdefault(uid, {})["maxday"] = int(raw)
+            save_json(USERS_PATH, users)
+            _edit_or_send(chat_id, mid, filters_text(users, uid),
+                          filters_markup(users, uid), uid)
+            return users.get(uid) or {}
         return None
 
     if data.startswith("set:"):
@@ -831,7 +1090,7 @@ def handle(users: dict, uid: str, raw: str, name: str = "") -> dict | None:
         return None
 
     if cmd in ("stats", "stat", "statistics"):
-        send_stats(uid)
+        send_stats(uid, users)
         return None
 
     if cmd == "faq":
@@ -845,6 +1104,34 @@ def handle(users: dict, uid: str, raw: str, name: str = "") -> dict | None:
             reply(uid, "Пробный доступ уже использован. Оформить подписку — /buy.")
         return None
 
+    if cmd in ("promo", "promocode"):
+        if not args or not cfg.PROMO_CODES:
+            reply(uid, "Промокоды сейчас не активны.")
+            return None
+        code = args[0].strip().upper()
+        days = cfg.PROMO_CODES.get(code)
+        if not days:
+            reply(uid, "Такого промокода нет. Проверь написание.")
+            return None
+        u = users.setdefault(uid, {})
+        used = [str(x) for x in (u.get("promo_used") or [])]
+        if code in used:
+            reply(uid, "Этот промокод уже применён.")
+            return None
+        new = store.record_payment(provider="promo", external_id=f"{code}:{uid}",
+                                   uid=uid, amount=0.0, days=days,
+                                   raw={"code": code})
+        if not new:
+            reply(uid, "Этот промокод уже применён.")
+            return None
+        until = max(paid_until(users, uid), time.time()) + days * 86400
+        u["paid_until"] = until
+        u["promo_used"] = sorted(set(used) | {code})
+        save_json(USERS_PATH, users)
+        reply(uid, f"🎁 Промокод применён: <b>+{days} дн.</b>\n"
+                   f"Доступ активен до <b>{_date(until)}</b>.")
+        return None
+
     if cmd in ("buy", "subscribe"):
         send_buy(uid)
         return None
@@ -856,6 +1143,19 @@ def handle(users: dict, uid: str, raw: str, name: str = "") -> dict | None:
     if cmd == "status":
         send_status(uid, users)
         return None
+
+    # owner-only: деньги и резервная копия
+    if str(uid) == str(cfg.OWNER_CHAT_ID):
+        if cmd in ("revenue", "money"):
+            reply(uid, revenue.text_report(30))
+            return None
+        if cmd == "backup":
+            try:
+                path = backup.snapshot()
+                reply(uid, f"💾 Бэкап готов: <code>{path}</code>")
+            except Exception as e:
+                reply(uid, f"Бэкап не удался: {e}")
+            return None
 
     # остальное — только по активной подписке
     if not is_paid(users, uid):
@@ -921,46 +1221,114 @@ def handle(users: dict, uid: str, raw: str, name: str = "") -> dict | None:
         reply(uid, f"План сохранён: риск {r:.2f}% · день {d:.1f}% · всего {t:.1f}%")
         return plan
 
+    if cmd in ("symbols", "symbol"):
+        u = users.setdefault(uid, {})
+        raw = " ".join(args).strip().upper().replace(",", " ")
+        if not raw or raw in ("ALL", "ВСЕ", "ЛЮБЫЕ"):
+            u["symbols"] = []
+            save_json(USERS_PATH, users)
+            reply(uid, "Фильтр снят: приходят сигналы по всем инструментам.")
+            return None
+        syms = [s for s in raw.split() if s]
+        u["symbols"] = syms[:20]
+        save_json(USERS_PATH, users)
+        reply(uid, "Оставляю только: <b>" + ", ".join(u["symbols"]) + "</b>\n"
+                   "Снять фильтр — /symbols all")
+        return None
+
+    if cmd in ("maxday", "maxsignals"):
+        u = users.setdefault(uid, {})
+        if not args:
+            cur = int(u.get("maxday", 0) or 0)
+            reply(uid, f"Лимит входов за 24 ч: <b>{cur or 'без лимита'}</b>\n"
+                       "Изменить: /maxday 3, выключить: /maxday 0")
+            return None
+        try:
+            n = max(0, min(50, int(float(args[0].replace(",", ".")))))
+        except ValueError:
+            reply(uid, "Нужно целое число от 0 до 50. Пример: /maxday 3")
+            return None
+        u["maxday"] = n
+        save_json(USERS_PATH, users)
+        reply(uid, f"Лимит входов за 24 ч: <b>{n or 'без лимита'}</b>")
+        return None
+
     reply(uid, "Не понял. Пользуйся кнопками внизу или глянь /help.")
     return None
 
 
 # ------------------------------------------------------------------ доставка сигналов
 
-def poll_signals(users: dict, state: dict) -> None:
-    """Разослать подписчикам сигналы, появившиеся в очереди bot.py."""
-    if not os.path.exists(QUEUE_PATH):
-        return
-    last = float(state.get("last_signal_ts", 0) or 0)
-    fresh: list[tuple[float, str, str]] = []
+def _read_queue(path: str, last_ts: float) -> list[dict]:
+    """Строки jsonl новее last_ts. Битые строки пропускаем."""
+    rows: list[dict] = []
+    if not os.path.exists(path):
+        return rows
     try:
-        with open(QUEUE_PATH, encoding="utf-8") as f:
+        with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     rec = json.loads(line)
-                except ValueError:
+                    ts = float(rec.get("ts", 0) or 0)
+                except (ValueError, TypeError):
                     continue
-                ts = float(rec.get("ts", 0) or 0)
-                path = str(rec.get("path", ""))
-                if ts <= last or not path or not os.path.exists(path):
-                    continue
-                fresh.append((ts, path, str(rec.get("caption", ""))))
+                if ts > last_ts:
+                    rows.append(rec)
     except OSError as e:
         print("очередь недоступна:", e)
-        return
+    return sorted(rows, key=lambda r: float(r.get("ts", 0) or 0))
+
+
+def poll_signals(users: dict, state: dict) -> None:
+    """Разложить новые сигналы bot.py по outbox каждого подписчика."""
+    fresh = _read_queue(QUEUE_PATH, float(state.get("last_signal_ts", 0) or 0))
     if not fresh:
         return
-    paid = [uid for uid in users if is_paid(users, uid)]
-    for ts, path, cap in sorted(fresh):
+    paid = [uid for uid in users
+            if is_paid(users, uid) and not (users.get(uid) or {}).get("blocked")]
+    added = 0
+    for rec in fresh:
+        tid = str(rec.get("trade_id") or
+                  f"{rec.get('symbol', '')}_{int(float(rec.get('ts', 0) or 0))}")
+        caption = str(rec.get("caption", ""))
+        path = str(rec.get("path", "") or "")
         for uid in paid:
-            tg.send_photo(path, cap, token=TOKEN, chat_id=uid,
-                          markup=signal_markup(users, uid))
-    state["last_signal_ts"] = max(ts for ts, _, _ in fresh)
+            if store.enqueue_delivery(
+                uid=uid, trade_id=tid, kind="entry", chat_id=uid,
+                caption=caption, symbol=str(rec.get("symbol", "")),
+                side=str(rec.get("side", "")), image_path=path or None,
+            ):
+                added += 1
+    state["last_signal_ts"] = max(float(r.get("ts", 0) or 0) for r in fresh)
     save_json(STATE_PATH, state)
-    print(f"сигналов: {len(fresh)} · подписчиков: {len(paid)}")
+    print(f"outbox: +{added} входов · подписчиков {len(paid)}")
+
+
+def poll_results(users: dict, state: dict) -> None:
+    """Результаты сделок → обновление подписи карточки у тех, кто её получил."""
+    fresh = _read_queue(RESULTS_PATH, float(state.get("last_result_ts", 0) or 0))
+    if not fresh:
+        return
+    added = 0
+    for rec in fresh:
+        tid = str(rec.get("trade_id") or "")
+        if not tid:
+            continue
+        targets = store.entry_targets(tid)
+        status = result_status(rec)
+        event = str(rec.get("event", "result")).lower()
+        for uid in targets:
+            if store.enqueue_delivery(
+                uid=uid, trade_id=tid, kind=event, chat_id=uid, caption=status,
+                symbol=str(rec.get("symbol", "")), side=str(rec.get("side", "")),
+            ):
+                added += 1
+    state["last_result_ts"] = max(float(r.get("ts", 0) or 0) for r in fresh)
+    save_json(STATE_PATH, state)
+    print(f"outbox: +{added} результатов")
 
 
 def remind_expiring(users: dict) -> None:
@@ -984,38 +1352,67 @@ def remind_expiring(users: dict) -> None:
         save_json(USERS_PATH, users)
 
 
-def poll_crypto(users: dict) -> None:
-    """Оплаченные счета Crypto Pay → выдать подписку автору счёта.
+def migrate_crypto_seen() -> None:
+    """Перенести старый crypto_paid.json в ledger, чтобы не выдать счета повторно."""
+    seen = load_json(CRYPTO_STATE_PATH)
+    if not isinstance(seen, dict) or not seen:
+        return
+    n = 0
+    for iid, rec in seen.items():
+        rec = rec if isinstance(rec, dict) else {}
+        uid = str(rec.get("uid", "") or "")
+        if not uid:
+            continue
+        if store.record_payment(provider="crypto", external_id=str(iid), uid=uid,
+                                amount=0.0, days=30, raw={"migrated": True, **rec}):
+            n += 1
+    print(f"crypto: старых счетов перенесено в ledger: {n}")
 
-    Счёт помечается в crypto_paid.json по invoice_id, чтобы один платёж
-    не продлил подписку дважды.
+
+def poll_crypto(users: dict) -> bool:
+    """Оплаченные счета Crypto Pay → подписка автору счёта.
+
+    Идемпотентность по invoice_id в payments: один счёт не продлит доступ
+    дважды, даже если getInvoices вернёт его несколько раз.
     """
     if not crypto_pay.enabled():
-        return
+        return True
     ok, items = crypto_pay.paid_invoices()
     if not ok:
         print("crypto getInvoices:", items)
-        return
-    seen = load_json(CRYPTO_STATE_PATH)
-    got = False
+        return False
+    got = 0
     for inv in items:
         iid = str(inv.get("invoice_id") or "")
         payload = str(inv.get("payload") or "")
-        if not iid or iid in seen or not payload.startswith("sub:"):
+        if not iid or not payload.startswith("sub:"):
             continue
-        uid = payload[4:].strip()
+        parts = payload.split(":")
+        uid = parts[1].strip() if len(parts) > 1 else ""
         if not uid:
             continue
-        until = time.time() + SUB_FALLBACK_SEC
+        try:
+            days = int(parts[2]) if len(parts) > 2 and parts[2].strip() else 30
+        except ValueError:
+            days = 30
+        days = max(1, min(days, 3650))
+        new = store.record_payment(
+            provider="crypto", external_id=iid, uid=uid,
+            amount=float(inv.get("amount", 0) or 0),
+            currency=str(inv.get("asset", "") or ""), days=days, raw=inv,
+        )
+        if not new:
+            continue
+        until = time.time() + days * 86400
         grant(users, uid, until)
-        seen[iid] = {"uid": uid, "ts": time.time(), "amount": inv.get("amount", "")}
-        got = True
-        print(f"крипта: счёт {iid} · {uid} · до {_date(until)}")
+        got += 1
+        print(f"крипта: счёт {iid} · {uid} · +{days} дн. до {_date(until)}")
         tg.send_message(onboard_text(until), token=TOKEN, chat_id=uid,
                         markup=menu_markup(users, uid))
         reward_referrer(users, uid)
     if got:
-        save_json(CRYPTO_STATE_PATH, seen)
+        print(f"крипта: выдано подписок {got}")
+    return True
 
 
 # ------------------------------------------------------------------ запуск
@@ -1055,15 +1452,52 @@ def handle_update(users: dict, state: dict, up: dict) -> None:
         return
     uid = str(chat.get("id"))
 
+    # Пользователь написал боту — значит, он его разблокировал. Снимаем метку,
+    # иначе он навсегда останется вне рассылки.
+    if (users.get(uid) or {}).get("blocked"):
+        users[uid]["blocked"] = 0
+        save_json(USERS_PATH, users)
+
+    refund = msg.get("refunded_payment")
+    if refund:
+        charge = str(refund.get("telegram_payment_charge_id")
+                     or refund.get("provider_payment_charge_id") or "")
+        if charge and store.mark_payment_refunded(provider="stars", external_id=charge):
+            days = store.payment_days("stars", charge) or 30
+            u = users.setdefault(uid, {})
+            u["paid_until"] = max(time.time(), paid_until(users, uid) - days * 86400)
+            save_json(USERS_PATH, users)
+            alert_owner(f"💸 Возврат Stars: <code>{uid}</code> · charge <code>{charge}</code>")
+            reply(uid, "Возврат получен. Срок подписки скорректирован.")
+        return
+
     payment = msg.get("successful_payment")
     if payment:
-        until = float(payment.get("subscription_expiration_date") or 0) \
-            or time.time() + SUB_FALLBACK_SEC
-        grant(users, uid, until)
-        print(f"оплата: {uid} · до {_date(until)} · recurring={payment.get('is_recurring')}")
-        tg.send_message(onboard_text(until), token=TOKEN, chat_id=uid,
-                        markup=menu_markup(users, uid))
-        reward_referrer(users, uid)
+        payload = str(payment.get("invoice_payload") or "")
+        days = 30
+        if payload.startswith("sub:"):
+            parts = payload.split(":")
+            if len(parts) > 2 and parts[2].strip().isdigit():
+                days = max(1, min(int(parts[2]), 3650))
+        exp = float(payment.get("subscription_expiration_date") or 0)
+        until = exp if exp > time.time() else time.time() + days * 86400
+        charge = str(payment.get("telegram_payment_charge_id")
+                     or payment.get("provider_payment_charge_id") or "")
+        if not charge:
+            # Без charge_id идемпотентность невозможна; такой апдейт — аномалия.
+            charge = f"{uid}:{payment.get('total_amount')}:{payload}:{int(time.time())}"
+        new = apply_payment(
+            users, provider="stars", external_id=charge, uid=uid,
+            amount=float(payment.get("total_amount", 0) or 0), currency="XTR",
+            days=days, until_ts=until, raw=payment,
+        )
+        print(f"оплата: {uid} · +{days} дн. до {_date(until)} · "
+              f"recurring={payment.get('is_recurring')} · "
+              f"{'новая' if new else 'повтор, пропущено'}")
+        if new:
+            tg.send_message(onboard_text(until), token=TOKEN, chat_id=uid,
+                            markup=menu_markup(users, uid))
+            reward_referrer(users, uid)
         return
 
     text = (msg.get("text") or "").strip()
@@ -1089,6 +1523,8 @@ def main() -> None:
     # Инициализация UI компонент
     subbot_ui.init(USERS_PATH, TOKEN)
 
+    store.init_db()
+    migrate_crypto_seen()
     users = load_json(USERS_PATH)
     state = load_json(STATE_PATH)
     ASSETS.update(brand.ensure_brand_assets(BRAND_DIR))
@@ -1112,6 +1548,7 @@ def main() -> None:
     offset = None
     next_remind = 0.0
     next_crypto = 0.0
+    crypto_fail = 0
     try:
         while True:
             updates = tg.get_updates(offset=offset, timeout=POLL_TIMEOUT, token=TOKEN)
@@ -1122,12 +1559,23 @@ def main() -> None:
                 except Exception as e:
                     print("ошибка обработки апдейта:", repr(e))
             poll_signals(users, state)
+            poll_results(users, state)
+            process_deliveries(users)
             if time.time() >= next_remind:
                 remind_expiring(users)
                 next_remind = time.time() + REMIND_EVERY_SEC
             if time.time() >= next_crypto:
-                poll_crypto(users)
-                next_crypto = time.time() + CRYPTO_POLL_SEC
+                if poll_crypto(users):
+                    crypto_fail = 0
+                    next_crypto = time.time() + CRYPTO_POLL_SEC
+                else:
+                    crypto_fail += 1
+                    delay = min(600, CRYPTO_POLL_SEC * (2 ** min(crypto_fail, 5)))
+                    next_crypto = time.time() + delay
+                    if crypto_fail in (3, 10) or crypto_fail % 20 == 0:
+                        alert_owner(
+                            f"⚠️ Crypto Pay недоступен {crypto_fail} раз подряд. "
+                            f"Оплаты могут не зачисляться. Следующая попытка через {delay} с.")
             if not updates:
                 time.sleep(1)
     except KeyboardInterrupt:

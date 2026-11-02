@@ -41,11 +41,14 @@ from apscheduler.triggers.cron import CronTrigger
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import backup
 import config as cfg
 import render as card
+import revenue
 import ru_post
 import tg
 import threads_post
+import track_record
 import x_post
 
 logging.basicConfig(level=logging.INFO,
@@ -244,8 +247,12 @@ def post_week_summary(now: dt.datetime | None = None) -> bool:
 
     bal_start = cfg.PLAN_DEPOSIT + PER_R * sum(t["r"] for t in before)
     bal_end = bal_start + PER_R * sum_r
+    m = track_record.metrics(week)
+    pf = "∞" if m["pf"] == float("inf") else f"{m['pf']:.2f}"
     note = (f"С начала ведения счёта (с {_usd(cfg.PLAN_DEPOSIT)} $): "
-            f"{(bal_end / cfg.PLAN_DEPOSIT - 1) * 100:+.1f}%")
+            f"{(bal_end / cfg.PLAN_DEPOSIT - 1) * 100:+.1f}%\n"
+            f"PF {pf} · макс. просадка {m['max_dd_r']:.1f}R · "
+            f"серия убытков до {m['losing_streak']}")
     os.makedirs(OUT_DIR, exist_ok=True)
     path = os.path.join(OUT_DIR, f"week_{now:%Y%m%d}.png")
     try:
@@ -428,6 +435,8 @@ def build_scheduler() -> BackgroundScheduler:
         ("plan", cfg.PLAN_TIME, "mon-fri", post_plan),
         ("day", cfg.DAY_SUMMARY_TIME, "mon-fri", post_day_summary),
         ("week", cfg.WEEK_SUMMARY_TIME, "fri", post_week_summary),
+        ("revenue", "09:05", "mon", revenue.send_report),
+        ("backup", "03:00", "*", backup.snapshot),
     ]
     if cfg.PROMO_ENABLED:
         plan.append(("promo", cfg.PROMO_TIME, "*", post_promo))
@@ -478,6 +487,7 @@ def main() -> None:
         what = sys.argv[2] if len(sys.argv) > 2 else "plan"
         jobs = {"plan": post_plan, "day": post_day_summary, "week": post_week_summary,
                 "promo": post_promo, "threads": remind_threads, "x": remind_x,
+                "revenue": revenue.send_report, "backup": backup.snapshot,
                 "vk": lambda: remind_ru("vk"), "dzen": lambda: remind_ru("dzen")}
         job = jobs.get(what)
         if not job:
