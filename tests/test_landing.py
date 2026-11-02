@@ -18,6 +18,8 @@ def test_build_landing(tmp_path):
     assert "Публичный журнал" in html
     assert "Пробный доступ" in html
     assert "src_landing" in html
+    assert "Методички" in html
+    assert "src_method" in html
     assert "Не является инвестиционной рекомендацией" in html
     assert "<svg" in html
     assert not re.search(r"\b\d{8,10}:[A-Za-z0-9_-]{30,}\b", html)

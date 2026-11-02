@@ -127,6 +127,7 @@ def build(out_dir: Path | str | None = None) -> str:
               f'<p class="notice">Выборка пока маленькая: {m["n"]} закрытых сделок. '
               f'Публикуем без обещаний доходности — статистика будет расти.</p>')
     premium = _with_start(cfg.PREMIUM_URL or f"https://t.me/{cfg.SUB_BOT_USERNAME}", "landing")
+    method = _with_start(cfg.PREMIUM_URL or f"https://t.me/{cfg.SUB_BOT_USERNAME}", "method")
     support = (f'<a href="{html.escape(cfg.SUPPORT_URL)}">Поддержка</a>' if cfg.SUPPORT_URL else "")
     updated = dt.datetime.now().strftime(UPDATED_FMT)
     handle = (cfg.CHANNEL_HANDLE or "@KidzordFX").lstrip("@")
@@ -184,6 +185,10 @@ tr:last-child td {{ border-bottom:none; }}
 .steps {{ display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }}
 .step {{ background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:18px; }}
 .step b {{ display:block; margin-bottom:6px; }}
+.materials {{ display:grid; grid-template-columns:repeat(2,1fr); gap:12px; }}
+.material {{ background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:18px; }}
+.material b {{ display:block; margin-bottom:6px; color:var(--gold); }}
+.material p {{ margin:0; font-size:14px; color:var(--muted); }}
 .pricing {{ display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }}
 .price-card {{ background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:20px; }}
 .price-card.featured {{ border-color:var(--gold); }}
@@ -196,11 +201,11 @@ summary {{ cursor:pointer; font-weight:600; }}
 footer {{ border-top:1px solid var(--line); padding-top:22px; color:var(--muted); font-size:13px; }}
 footer a {{ color:var(--muted); }}
 @media (max-width:760px) {{
-  .grid,.steps,.pricing {{ grid-template-columns:1fr 1fr; }}
+  .grid,.steps,.pricing,.materials {{ grid-template-columns:1fr 1fr; }}
   nav {{ display:none; }}
 }}
 @media (max-width:520px) {{
-  .grid,.steps,.pricing {{ grid-template-columns:1fr; }}
+  .grid,.steps,.pricing,.materials {{ grid-template-columns:1fr; }}
   .hero {{ padding-top:40px; }}
 }}
 </style>
@@ -212,6 +217,7 @@ footer a {{ color:var(--muted); }}
     <nav>
       <a href="#journal">Журнал</a>
       <a href="#how">Как это работает</a>
+      <a href="#method">Методички</a>
       <a href="#pricing">Цена</a>
       <a href="#faq">FAQ</a>
     </nav>
@@ -258,6 +264,30 @@ footer a {{ color:var(--muted); }}
       <div class="step"><b>3. Проверь на триале</b>
         {cfg.TRIAL_DAYS} дня бесплатно, без карты. Дальше — {cfg.SUB_PRICE_STARS} ⭐ в месяц.</div>
     </div>
+  </section>
+
+  <section id="method">
+    <h2>Методички</h2>
+    <p>Короткие разборы без «секретных стратегий»: одна мысль — один слайд.
+      Бесплатно, без подписки и регистрации.</p>
+    <div class="materials">
+      <div class="material"><b>Смарт-мани и ликвидность</b>
+        <p>Кто двигает цену, зачем снимают стопы за экстремумами и почему вход
+        в середине диапазона — худший.</p></div>
+      <div class="material"><b>MSNR: уровни по телам</b>
+        <p>Уровни по телам свечей на D1/H4, а не по теням. Свип, возврат
+        и подтверждение вместо входа по касанию.</p></div>
+      <div class="material"><b>Структура, BOS и CHoCH</b>
+        <p>Как отличить продолжение тренда от слома характера и когда
+        вообще не стоит искать вход.</p></div>
+      <div class="material"><b>Вход, стоп и риск</b>
+        <p>Стоп за экстремум, цель 2–3R, лимит стопов в день и расчёт объёма
+        под депозит — математика вместо угадывания.</p></div>
+    </div>
+    <div class="actions" style="margin-top:18px">
+      <a class="btn ghost" href="{html.escape(method)}">Открыть методички в боте</a>
+    </div>
+    <p class="muted">В боте: /lesson — следующая методичка, /lessons — все.</p>
   </section>
 
   <section id="pricing">
