@@ -517,11 +517,15 @@ def post_result(kind: str, side: str, r: float, *, entry: float | None = None,
         rendered = False
         # 1) настоящий скриншот терминала через ScreenshotEA (если он запущен)
         if MT5_SCREENSHOT and MT5_DATA_PATH and entry is not None and stop is not None:
+            exit_ts = None
+            if chart is not None and exit_idx is not None and 0 <= int(exit_idx) < len(chart.t):
+                exit_ts = float(chart.t[int(exit_idx)])
             shot = mt5_screenshot.request(
                 SYMBOL, TF, data_path=MT5_DATA_PATH, side=side,
                 entry=float(entry), stop=float(stop),
                 tp1=tp1, tp2=tp2, tp3=tp3, exit_px=exit_px,
-                label=kind, r=r, timeout=12)
+                label=kind, r=r, entry_ts=entry_ts, exit_ts=exit_ts,
+                timeout=12)
             if shot:
                 path = shot
                 rendered = True

@@ -13,14 +13,15 @@
 //|   kz_screenshot_heartbeat.txt (EA -> Python, раз в секунду)       |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.00"
+#property version   "1.10"
 #property description "KidzordFX: PNG графика по запросу Python"
 
 input int InpTimerSec = 1;      // период опроса, секунд
 input int InpWidth    = 1280;   // ширина PNG по умолчанию
 input int InpHeight   = 720;    // высота PNG по умолчанию
-input int InpScale    = 2;      // масштаб графика 0..5
+input int InpScale    = 2;      // запасной масштаб, если нет времени входа/выхода
 input int InpWaitMs   = 1500;   // сколько ждать отрисовки графика
+input int InpRightMargin = 8;   // сколько баров оставить справа от выхода
 
 string REQ  = "kz_screenshot_request.txt";
 string DONE = "kz_screenshot_done.txt";
@@ -55,6 +56,7 @@ void WriteHeartbeat()
    if(h == INVALID_HANDLE)
       return;
    FileWrite(h, "ts=" + IntegerToString((long)TimeCurrent()));
+   FileWrite(h, "ver=110");
    FileWrite(h, "symbol=" + _Symbol);
    FileWrite(h, "chart=" + IntegerToString(ChartID()));
    FileClose(h);
@@ -88,7 +90,7 @@ ENUM_TIMEFRAMES StrToTF(string s)
    return(PERIOD_CURRENT);
 }
 
-void ConfigureChart(long chart)
+void ConfigureChart(long chart, int scale)
 {
    ChartSetInteger(chart, CHART_MODE, CHART_CANDLES);
    ChartSetInteger(chart, CHART_COLOR_BACKGROUND, C'14,17,22');
@@ -109,9 +111,103 @@ void ConfigureChart(long chart)
    ChartSetInteger(chart, CHART_SHOW_ASK_LINE, false);
    ChartSetInteger(chart, CHART_SHOW_LAST_LINE, false);
    ChartSetInteger(chart, CHART_SHOW_PERIOD_SEP, true);
-   ChartSetInteger(chart, CHART_SCALE, (int)MathMax(0, MathMin(5, InpScale)));
-   ChartSetInteger(chart, CHART_AUTOSCROLL, true);
-   ChartNavigate(chart, CHART_END, 0);
+   ChartSetInteger(chart, CHART_SCALE, (int)MathMax(0, MathMin(5, scale)));
+   ChartSetInteger(chart, CHART_AUTOSCROLL, false);
+}
+
+// Сколько баров назад находится время ts (0 = текущий бар).
+int ShiftOf(string symbol, ENUM_TIMEFRAMES tf, long ts)
+{
+   if(ts <= 0)
+      return(-1);
+   return(iBarShift(symbol, tf, (datetime)ts, false));
+}
+
+int BarsBetween(string symbol, ENUM_TIMEFRAMES tf, long entry_ts, long exit_ts)
+{
+   int a = ShiftOf(symbol, tf, entry_ts);
+   int b = ShiftOf(symbol, tf, exit_ts);
+   if(a < 0 || b < 0)
+      return(-1);
+   return(MathAbs(a - b) + 1);
+}
+
+// Масштаб под длительность сделки: видимых баров должно быть с запасом.
+int PickScale(int span)
+{
+   if(span <= 0)
+      return(-1);
+   int need = span * 3 + 20;
+   if(need <= 45)  return(5);
+   if(need <= 90)  return(4);
+   if(need <= 180) return(3);
+   if(need <= 360) return(2);
+   if(need <= 720) return(1);
+   return(0);
+}
+
+// Прокрутка к бару выхода: он остаётся справа с небольшим отступом.
+void FocusChart(long chart, string symbol, ENUM_TIMEFRAMES tf,
+                long entry_ts, long exit_ts)
+{
+   int i_exit = ShiftOf(symbol, tf, exit_ts);
+   if(i_exit < 0)
+   {
+      ChartSetInteger(chart, CHART_AUTOSCROLL, true);
+      ChartNavigate(chart, CHART_END, 0);
+      return;
+   }
+   int margin = (int)MathMax(0, MathMin(50, InpRightMargin));
+   int shift = (int)MathMin(0, margin - i_exit);
+   ChartNavigate(chart, CHART_END, shift);
+}
+
+// Фиксируем ценовую шкалу по уровням сделки и свечам её окна, чтобы
+// вход/стоп/цели не сжимались в тонкую полоску.
+void FixPriceRange(long chart, string symbol, ENUM_TIMEFRAMES tf,
+                   long entry_ts, long exit_ts,
+                   double entry, double stop, double tp1, double tp2,
+                   double tp3, double exit_px)
+{
+   double vals[6];
+   vals[0] = entry; vals[1] = stop; vals[2] = tp1;
+   vals[3] = tp2;   vals[4] = tp3;  vals[5] = exit_px;
+   double hi = 0, lo = 0;
+   for(int i = 0; i < 6; i++)
+   {
+      if(vals[i] <= 0)
+         continue;
+      if(hi == 0 || vals[i] > hi) hi = vals[i];
+      if(lo == 0 || vals[i] < lo) lo = vals[i];
+   }
+   if(hi <= 0 || lo <= 0)
+      return;
+
+   int i_exit = ShiftOf(symbol, tf, exit_ts);
+   if(i_exit < 0)
+      i_exit = 0;
+   int span = BarsBetween(symbol, tf, entry_ts, exit_ts);
+   if(span < 0)
+      span = 40;
+   int margin = (int)MathMax(0, MathMin(50, InpRightMargin));
+   int right = (int)MathMax(0, i_exit - margin);
+   int left  = i_exit + (int)MathMin(500, MathMax(30, span * 3));
+   int count = (int)MathMax(10, left - right + 1);
+
+   double highs[], lows[];
+   int got_h = CopyHigh(symbol, tf, right, count, highs);
+   int got_l = CopyLow(symbol, tf, right, count, lows);
+   int n = (int)MathMin(got_h, got_l);
+   for(int i = 0; i < n; i++)
+   {
+      if(highs[i] > hi) hi = highs[i];
+      if(lows[i] > 0 && lows[i] < lo) lo = lows[i];
+   }
+
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   double pad = MathMax((hi - lo) * 0.08, point * 20);
+   ChartSetDouble(chart, CHART_FIXED_MAX, hi + pad);
+   ChartSetDouble(chart, CHART_FIXED_MIN, lo - pad);
 }
 
 void HLine(long chart, string name, double price, color clr,
@@ -183,6 +279,7 @@ void CheckRequest()
 
    string symbol = "", tf_str = "", out = "", side = "LONG", label = "";
    double entry = 0, stop = 0, tp1 = 0, tp2 = 0, tp3 = 0, exit_px = 0, r = 0;
+   long entry_ts = 0, exit_ts = 0;
    int width = InpWidth, height = InpHeight;
 
    while(!FileIsEnding(h))
@@ -209,6 +306,8 @@ void CheckRequest()
       else if(key == "tp3")    tp3 = StringToDouble(val);
       else if(key == "exit")   exit_px = StringToDouble(val);
       else if(key == "r")      r = StringToDouble(val);
+      else if(key == "entry_ts") entry_ts = (long)StringToInteger(val);
+      else if(key == "exit_ts")  exit_ts = (long)StringToInteger(val);
       else if(key == "width")  width = (int)StringToInteger(val);
       else if(key == "height") height = (int)StringToInteger(val);
    }
@@ -242,7 +341,15 @@ void CheckRequest()
       wait++;
    }
 
-   ConfigureChart(chart);
+   int span = BarsBetween(symbol, tf, entry_ts, exit_ts);
+   int scale = PickScale(span);
+   if(scale < 0)
+      scale = (int)MathMax(0, MathMin(5, InpScale));
+
+   ConfigureChart(chart, scale);
+   FocusChart(chart, symbol, tf, entry_ts, exit_ts);
+   FixPriceRange(chart, symbol, tf, entry_ts, exit_ts,
+                 entry, stop, tp1, tp2, tp3, exit_px);
    DrawLevels(chart, symbol, side, label, entry, stop, tp1, tp2, tp3, exit_px, r);
    ChartRedraw(chart);
    Sleep(InpWaitMs);

@@ -117,6 +117,7 @@ def request(symbol: str, tf: str, *, data_path: str,
             stop: float | None = None, tp1: float | None = None,
             tp2: float | None = None, tp3: float | None = None,
             exit_px: float | None = None, label: str = "", r: float = 0.0,
+            entry_ts: float | None = None, exit_ts: float | None = None,
             width: int = 1280, height: int = 720,
             timeout: float = 15.0) -> str | None:
     """Попросить советник сделать PNG. None — советник не запущен/ошибка."""
@@ -134,6 +135,7 @@ def request(symbol: str, tf: str, *, data_path: str,
         return _request_locked(
             symbol, tf, folder=folder, side=side, entry=entry, stop=stop,
             tp1=tp1, tp2=tp2, tp3=tp3, exit_px=exit_px, label=label, r=r,
+            entry_ts=entry_ts, exit_ts=exit_ts,
             width=width, height=height, timeout=timeout)
     finally:
         _release_lock(lock)
@@ -143,6 +145,7 @@ def _request_locked(symbol: str, tf: str, *, folder: str,
                     side: str, entry: float | None, stop: float | None,
                     tp1: float | None, tp2: float | None, tp3: float | None,
                     exit_px: float | None, label: str, r: float,
+                    entry_ts: float | None, exit_ts: float | None,
                     width: int, height: int, timeout: float) -> str | None:
     out_name = f"kz_shot_{symbol}_{int(time.time() * 1000)}.png"
     req_path = os.path.join(folder, REQ)
@@ -159,6 +162,8 @@ def _request_locked(symbol: str, tf: str, *, folder: str,
         f"entry={_num(entry)}", f"stop={_num(stop)}",
         f"tp1={_num(tp1)}", f"tp2={_num(tp2)}", f"tp3={_num(tp3)}",
         f"exit={_num(exit_px)}", f"r={float(r):.4f}", f"label={label}",
+        f"entry_ts={int(entry_ts) if entry_ts else 0}",
+        f"exit_ts={int(exit_ts) if exit_ts else 0}",
     ]
     tmp = req_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
