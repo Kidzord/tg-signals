@@ -587,6 +587,12 @@ def manage_trade(state: dict, chart: st.Frame, i: int) -> None:
     done = float(tr.get("done", 0.0))
     rp = float(tr.get("r_partial", 0.0))
 
+    def chart_tps() -> tuple[float | None, float | None, float | None]:
+        """Для одной цели не дублируем TP1/TP2/TP3 на графике результата."""
+        if single:
+            return tr.get("tp1"), None, None
+        return tr.get("tp1"), tr.get("tp2"), tr.get("tp3")
+
     def postmortem() -> str:
         """Короткий разбор к результату: был ли вход по чек-листу."""
         if not POSTMORTEM_ENABLED or tr.get("marks") is None:
@@ -606,11 +612,12 @@ def manage_trade(state: dict, chart: st.Frame, i: int) -> None:
         if r > 0:
             stats["wins"] += 1
         full_note = (note + " " + postmortem()).strip()
+        t1, t2, t3 = chart_tps()
         post_result(kind, side, r, entry=tr["entry"], stop=tr["stop"],
                     exit_px=exit_px, note=full_note,
                     trade_id=str(tr.get("trade_id", "")), total_r=r,
                     chart=chart, entry_ts=tr.get("bar_ts"), exit_idx=i,
-                    tp1=tr.get("tp1"), tp2=tr.get("tp2"), tp3=tr.get("tp3"))
+                    tp1=t1, tp2=t2, tp3=t3)
         state["trade"] = None
 
     # трейлинг UT Bot: подтяжка по закрытию предыдущего бара, со следующего после TP1
@@ -655,11 +662,12 @@ def manage_trade(state: dict, chart: st.Frame, i: int) -> None:
         done += p1
         tr["r_partial"], tr["done"] = rp, done
         note = "стоп в безубыток" if PARAMS.be_after == 1 else ""
+        t1, t2, t3 = chart_tps()
         post_result("tp1", side, add, entry=tr["entry"], stop=tr["stop"],
                     exit_px=tp1, note=note,
                     trade_id=str(tr.get("trade_id", "")), total_r=rp,
                     chart=chart, entry_ts=tr.get("bar_ts"), exit_idx=i,
-                    tp1=tr.get("tp1"), tp2=tr.get("tp2"), tp3=tr.get("tp3"))
+                    tp1=t1, tp2=t2, tp3=t3)
         if PARAMS.be_after == 1:
             tr["stop"], tr["be"] = tr["entry"], True
 
@@ -669,10 +677,11 @@ def manage_trade(state: dict, chart: st.Frame, i: int) -> None:
         rp += add
         done += p2
         tr["r_partial"], tr["done"] = rp, done
+        t1, t2, t3 = chart_tps()
         post_result("tp2", side, add, entry=tr["entry"], stop=tr["stop"], exit_px=tp2,
                     trade_id=str(tr.get("trade_id", "")), total_r=rp,
                     chart=chart, entry_ts=tr.get("bar_ts"), exit_idx=i,
-                    tp1=tr.get("tp1"), tp2=tr.get("tp2"), tp3=tr.get("tp3"))
+                    tp1=t1, tp2=t2, tp3=t3)
         if PARAMS.be_after == 2:
             tr["stop"], tr["be"] = tr["entry"], True
 

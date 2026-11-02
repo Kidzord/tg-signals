@@ -62,3 +62,21 @@ def test_trade_chart_renders(tmp_path):
         entry_idx=40, exit_idx=55, out_path=str(out),
         tp1=4005.0, tp2=4010.0, tp3=4015.0, note="Цель взята")
     assert out.exists() and out.stat().st_size > 10_000
+
+
+def test_trade_levels_dedupe_single_target():
+    # range/sonar/ict: одна цель лежит в tp1/tp2/tp3 — рисуем только TP1
+    levels = render._trade_levels(0.70107, 0.70107, 0.70107,
+                                  0.70263, 0.70224, 0.70263, "#f00")
+    names = [n for n, _, _, _ in levels]
+    assert names.count("TP1") == 1
+    assert "TP2" not in names and "TP3" not in names
+    assert "Выход" not in names  # выход совпал со стопом
+    assert "SL" in names and "Вход" in names
+
+
+def test_trade_levels_keeps_distinct_targets():
+    levels = render._trade_levels(100.0, 105.0, 110.0,
+                                  90.0, 95.0, 112.0, "#f00")
+    names = [n for n, _, _, _ in levels]
+    assert {"TP1", "TP2", "TP3", "SL", "Вход", "Выход"} <= set(names)

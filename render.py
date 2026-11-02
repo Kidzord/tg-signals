@@ -398,6 +398,40 @@ def render_result_card(*, symbol: str, side: str, kind: str, r: float, out_path:
     return c.save(out_path)
 
 
+def _trade_levels(tp1: float | None, tp2: float | None, tp3: float | None,
+                  stop: float | None, entry: float | None,
+                  exit_px: float | None,
+                  exit_color: str) -> list[tuple[str, float, str, float]]:
+    """Уровни карточки результата без дублей.
+
+    У range/sonar/ict цель одна, и в состоянии сделки она лежит сразу в
+    tp1/tp2/tp3. Рисуем только TP1: три одинаковые линии — это визуальный баг.
+    Если выход совпал с TP/SL/входом, отдельную линию «Выход» не рисуем —
+    выход и так отмечен крестиком.
+    """
+    levels: list[tuple[str, float, str, float]] = []
+    seen: list[float] = []
+    for name, px, col, alpha in (
+        ("TP1", tp1, theme.GREEN, 1.0),
+        ("TP2", tp2, theme.GREEN, 0.75),
+        ("TP3", tp3, theme.GREEN, 0.55),
+    ):
+        if px is None:
+            continue
+        if any(abs(float(px) - p) < 1e-9 for p in seen):
+            continue
+        seen.append(float(px))
+        levels.append((name, float(px), col, alpha))
+    base = [float(x) for x in (entry, stop) if x is not None] + seen
+    if stop is not None:
+        levels.append(("SL", float(stop), theme.RED, 1.0))
+    if entry is not None:
+        levels.append(("Вход", float(entry), theme.LABEL2, 1.0))
+    if exit_px is not None and not any(abs(float(exit_px) - p) < 1e-9 for p in base):
+        levels.append(("Выход", float(exit_px), exit_color, 1.0))
+    return levels
+
+
 def render_trade_chart(*, symbol: str, side: str, kind: str, r: float,
                        entry: float, stop: float, exit_px: float | None,
                        bars: list[Bar], tf: str, entry_idx: int, exit_idx: int,
@@ -464,14 +498,9 @@ def render_trade_chart(*, symbol: str, side: str, kind: str, r: float,
                                max(body_hi - body_lo, tick),
                                facecolor=candle, edgecolor=candle, lw=0, zorder=4))
 
-    levels = [(name, px, col, a) for name, px, col, a in (
-        ("TP3", tp3, theme.GREEN, 0.55),
-        ("TP2", tp2, theme.GREEN, 0.75),
-        ("TP1", tp1, theme.GREEN, 1.0),
-        ("SL", stop, theme.RED, 1.0),
-        ("Вход", entry, theme.LABEL2, 1.0),
-        ("Выход", exit_px, color, 1.0),
-    ) if px is not None]
+    # Уровни без дублей: у range/sonar/ict цель одна, и TP1/TP2/TP3
+    # не должны рисоваться тремя линиями на одной цене.
+    levels = _trade_levels(tp1, tp2, tp3, stop, entry, exit_px, color)
     for name, price, col, alpha in levels:
         lw = 1.5 if name in ("Вход", "Выход") else 1.1
         ax.axhline(price, color=col, lw=lw, ls=(0, (5, 4)), alpha=alpha, zorder=2)
