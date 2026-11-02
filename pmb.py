@@ -29,6 +29,11 @@ class Params:
     tp_r: float = 2.0
     max_bars: int = 100         # макс. удержание после входа
     min_risk_atr: float = 0.0   # диагностический фильтр: мин. риск в ATR
+    # --- v0.2: фильтры, вытащенные in-sample из разметки автора ---
+    # выключены по умолчанию: это fitted-пресет, он не воспроизводит выборку
+    min_bars_exp: int = 0          # развитие структуры: баров от FVG до триггера
+    min_exp_atr: float = 0.0       # сила расширения
+    min_rb_wick: float = 0.0       # тень rejection block
 
 
 @dataclass
@@ -62,6 +67,7 @@ class Trade:
     rb: tuple[float, float] = (0.0, 0.0)
     ta: float = 0.0            # противоположная граница DR: отмена до входа
     tp_r: float = 2.0
+    feat: dict = field(default_factory=dict)
 
 
 def atr(h: np.ndarray, l: np.ndarray, c: np.ndarray, n: int = 14) -> np.ndarray:
@@ -128,33 +134,33 @@ class Engine:
         p = self.p
         c = float(self.h4.c[i])
         d = int(self.d1_idx[i])
-        cands: list[float] = []
+        cands: list[tuple[float, str]] = []
         for f, bot, top, sd in self.d1_fvg:
             if sd != side or f > d - 1 or f < d - p.liq_d1:
                 continue
             lvl = bot if side == 1 else top
             if side == 1 and lo <= lvl < min(c, mid):
-                cands.append(lvl)
+                cands.append((lvl, 'd1_fvg'))
             if side == -1 and max(c, mid) < lvl <= hi:
-                cands.append(lvl)
+                cands.append((lvl, 'd1_fvg'))
         for f, bot, top, sd in self.h4_fvg:
             if sd != side or f > i - 1 or f < i - p.liq_h4:
                 continue
             lvl = bot if side == 1 else top
             if side == 1 and lo <= lvl < min(c, mid):
-                cands.append(lvl)
+                cands.append((lvl, 'h4_fvg'))
             if side == -1 and max(c, mid) < lvl <= hi:
-                cands.append(lvl)
+                cands.append((lvl, 'h4_fvg'))
         sw = float(np.min(self.h4.l[max(0, i - p.swing_look):i])) if side == 1 else float(np.max(self.h4.h[max(0, i - p.swing_look):i]))
         if side == 1:
-            cands.append(lo)
+            cands.append((lo, 'dr'))
             if sw < min(c, mid):
-                cands.append(sw)
-            return max(cands) if cands else None
-        cands.append(hi)
+                cands.append((sw, 'swing'))
+            return max(cands, key=lambda x: x[0]) if cands else None
+        cands.append((hi, 'dr'))
         if sw > max(c, mid):
-            cands.append(sw)
-        return min(cands) if cands else None
+            cands.append((sw, 'swing'))
+        return min(cands, key=lambda x: x[0]) if cands else None
 
     def _sweep(self, i: int, side: int, level: float, a: float):
         p = self.p
@@ -195,9 +201,10 @@ class Engine:
         self.stage['dr'] += 1
         lo, hi, mid, _ = dr
         c = float(self.h4.c[i])
-        level = self._liquidity(i, side, lo, hi, mid)
-        if level is None:
+        lv = self._liquidity(i, side, lo, hi, mid)
+        if lv is None:
             return None
+        level, liq_kind = lv
         self.stage['liq'] += 1
         # ликвидность должна быть в рабочей области DR
         if (side == 1 and level > mid) or (side == -1 and level < mid):
@@ -292,9 +299,43 @@ class Engine:
         if side == -1 and not (sl > entry > c and entry < rb_high):
             self.stage['bad_entry'] += 1
             return None
+        ta = hi if side == 1 else lo
+        rng_j = float(h[j] - l[j])
+        wick_j = (float(min(o[j], cc[j]) - l[j]) if side == 1
+                  else float(h[j] - max(o[j], cc[j])))
+        lo_win = float(np.min(l[k + 1:i + 1])) if i > k else ztop
+        hi_win = float(np.max(h[k + 1:i + 1])) if i > k else zbot
+        feat = {
+            "side": side,
+            "liq": liq_kind,
+            "sweep_atr": ((level - float(l[j])) if side == 1 else (float(h[j]) - level)) / a,
+            "rb_wick": (wick_j / rng_j) if rng_j > 0 else 0.0,
+            "rb_atr": (rb_high - rb_low) / a,
+            "bars_sweep": i - j,
+            "bars_exp": i - k,
+            "exp_atr": ((float(h[k]) - rb_low) if side == 1 else (rb_high - float(l[k]))) / a,
+            "fvg_atr": (ztop - zbot) / a,
+            "retest_atr": max(0.0, ((ztop - lo_win) if side == 1 else (hi_win - zbot)) / a),
+            "risk_atr": 0.0,
+            "dr_pos": ((c - mid) / (hi - lo)) if hi > lo else 0.0,
+            "level_dist_atr": abs(c - level) / a,
+            "mb_body_atr": abs(float(o[b]) - float(cc[b])) / a,
+            "ta_dist_atr": abs(ta - entry) / a,
+            "entry_level_atr": (entry - level) * side / a,
+        }
+        if feat['bars_exp'] < p.min_bars_exp:
+            self.stage['f_bars'] += 1
+            return None
+        if feat['exp_atr'] < p.min_exp_atr:
+            self.stage['f_exp'] += 1
+            return None
+        if feat['rb_wick'] < p.min_rb_wick:
+            self.stage['f_wick'] += 1
+            return None
         risk = abs(entry - sl)
         if risk <= 0:
             return None
+        feat['risk_atr'] = risk / a
         if risk < p.min_risk_atr * a:
             self.stage['tiny_risk'] += 1
             return None
@@ -305,7 +346,7 @@ class Engine:
             ts_setup=int(self.h4.t[j]), ts_trigger=int(self.h4.t[i]),
             ts_entry=None, ts_exit=None, level=float(level), mb_i=b,
             fvg=zone, rb=(rb_low, rb_high), tp_r=p.tp_r,
-            ta=hi if side == 1 else lo,
+            ta=hi if side == 1 else lo, feat=feat,
         )
 
     # -------------------------------------------------------------- trading
@@ -343,6 +384,8 @@ class Engine:
         # отмена: цена дошла до противоположной границы DR (TA) раньше входа
         ta = od.ta
         if (od.side == 1 and h[i] >= ta) or (od.side == -1 and l[i] <= ta):
+            od.result = 'cancelled'
+            self.trades.append(od)
             self.cancelled += 1
             self._order = None
             return
@@ -366,6 +409,8 @@ class Engine:
                     self._close(i, od.tp, "win")
             return
         if i - od.trigger_i >= p.entry_ttl:
+            od.result = 'cancelled'
+            self.trades.append(od)
             self._order = None
 
     def run(self, start: int | None = None) -> list[Trade]:

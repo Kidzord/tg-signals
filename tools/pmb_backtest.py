@@ -46,9 +46,12 @@ def main() -> None:
     ap.add_argument("--ref", default="", help="JSON с сделками автора для сверки")
     ap.add_argument("--csv", default="")
     ap.add_argument("--min-risk-atr", type=float, default=0.0)
+    ap.add_argument("--fit", action="store_true", help="применить fitted-пресет v0.2")
     args = ap.parse_args()
 
     p = pmb.Params(min_risk_atr=args.min_risk_atr)
+    if args.fit:
+        p.min_bars_exp, p.min_exp_atr, p.min_rb_wick = 12, 2.90, 0.45
     import MetaTrader5 as mt5
 
     if not mt5.initialize():
@@ -106,8 +109,8 @@ def main() -> None:
 
 def audit_reference(path: str, symbol: str, trades: list, p: pmb.Params) -> None:
     ref = json.load(open(path, encoding="utf-8"))
-    mine = [t for t in trades if t.result in ("win", "loss")]
-    theirs = [r for r in ref if r.get("pair") == symbol and r.get("tf") == "4h"
+    mine = list(trades)  # включая неисполненные сетапы: автор тоже их считает
+    theirs = [r for r in ref if (r.get("pair") == symbol or (symbol == "JPN225" and r.get("pair") == "JP225")) and r.get("tf") == "4h"
               and r.get("s1") in ("Win", "Stop") and r.get("date")]
     used = set()
     matched = 0
