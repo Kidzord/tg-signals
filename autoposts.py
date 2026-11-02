@@ -47,7 +47,7 @@ import render as card
 import revenue
 import ru_post
 import tg
-import threads_post
+import threads_editor
 import track_record
 import x_post
 
@@ -281,46 +281,16 @@ def post_promo() -> bool:
 # ------------------------------------------------------- напоминания о Threads
 
 def remind_threads() -> bool:
-    """Прислать владельцу в личку следующий неопубликованный пост для Threads."""
+    """Прислать владельцу в личку готовый пост: картинка + текст для копирования."""
     chat = owner_chat()
     if not chat:
         log.warning("нет чата владельца: напиши /threads premium-боту (или задай OWNER_CHAT_ID)")
         return False
-
-    n = threads_post.next_unused()
-    if n is None:
-        st = load_json(STATE_PATH)
-        if not st.get("threads_exhausted"):
-            st["threads_exhausted"] = True
-            save_json(STATE_PATH, st)
-            tg.send_message(
-                "📝 Банк постов для Threads закончился — все 28 опубликованы.\n"
-                "Пора пополнить: скажи мне, и я добавлю новые.",
-                token=cfg.SUB_BOT_TOKEN, chat_id=chat)
-        else:
-            log.info("банк Threads исчерпан, напоминание уже отправлялось")
-        return False
-
-    post = threads_post.POSTS[n - 1]
-    text = post["text"]
-    url = threads_post.INTENT + urllib.parse.quote(text, safe="")
-    cap = (f"📝 <b>Пост для Threads #{n}</b> · {post['title']}\n\n"
-           f"{html.escape(text)}\n\n"
-           f"— скопируй текст или открой Threads с готовым постом 👇")
-    markup = {"inline_keyboard": [[{"text": "Открыть Threads",
-                                    "url": url}]]}
-    img = threads_post.IMG_DIR / f"{n:02d}.png"
-    if img.exists():
-        ok, info = tg.send_photo(str(img), cap, token=cfg.SUB_BOT_TOKEN,
-                                 chat_id=chat, markup=markup)
-    else:
-        ok, info = tg.send_message(cap, token=cfg.SUB_BOT_TOKEN, chat_id=chat,
-                                   markup=markup)
+    ok = threads_editor.send_next(chat, cfg.SUB_BOT_TOKEN or cfg.BOT_TOKEN)
     if ok:
-        threads_post.mark_used(n)
-        log.info("напоминание Threads #%d отправлено", n)
+        log.info("пост Threads отправлен владельцу")
     else:
-        log.error("напоминание Threads: %s", info)
+        log.warning("пост Threads не отправлен (банк исчерпан?)")
     return ok
 
 

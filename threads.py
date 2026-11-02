@@ -32,14 +32,23 @@ def enabled() -> bool:
     return bool(_env("THREADS_USER_ID") and _env("THREADS_TOKEN"))
 
 
-def plain(text: str) -> str:
+def plain(text: str, limit: int = LIMIT) -> str:
     """Убираем HTML-теги и лишние пустые строки — Threads разметку не понимает."""
     t = re.sub(r"<[^>]+>", "", text)
     t = t.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
     t = re.sub(r"\n{3,}", "\n\n", t).strip()
-    if len(t.encode("utf-8")) > LIMIT:
-        # режем по символам, но с запасом на многобайтовые эмодзи
-        t = t[: LIMIT - 1].rstrip() + "…"
+    if len(t.encode("utf-8")) > limit:
+        # Режем по байтам, а не по символам: кириллица и эмодзи занимают
+        # больше одного байта, и срез по len(str) вылезает за лимит.
+        lo, hi = 0, len(t)
+        budget = limit - len("…".encode("utf-8"))
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if len(t[:mid].encode("utf-8")) <= budget:
+                lo = mid
+            else:
+                hi = mid - 1
+        t = t[:lo].rstrip() + "…"
     return t
 
 

@@ -460,7 +460,9 @@ def post_signal(sig: card.Signal, chart: st.Frame, regime: str | None = None,
 
 
 def note_trade(kind: str, side: str, r: float, *, trade_id: str = "",
-               total_r: float | None = None) -> None:
+               total_r: float | None = None, entry: float | None = None,
+               stop: float | None = None, exit_px: float | None = None,
+               note: str = "") -> None:
     """Записать итог закрытой сделки в журнал (autoposts.py считает по нему итоги).
 
     Частичные выходы (tp1/tp2) не пишем: сделка попадает в журнал один раз —
@@ -470,8 +472,9 @@ def note_trade(kind: str, side: str, r: float, *, trade_id: str = "",
         return
     rec = {"ts": time.time(), "symbol": SYMBOL, "side": side, "kind": kind,
            "r": round(float(r), 4), "strategy": STRATEGY,
-           "trade_id": trade_id,
-           "total_r": round(float(total_r if total_r is not None else r), 4)}
+           "trade_id": trade_id, "tf": TF,
+           "total_r": round(float(total_r if total_r is not None else r), 4),
+           "entry": entry, "stop": stop, "exit": exit_px, "note": note}
     append_jsonl(TRADES_PATH, rec)
 
 
@@ -489,7 +492,8 @@ def post_result(kind: str, side: str, r: float, *, entry: float | None = None,
     # Сначала premium: событие durable в jsonl, subbot разложит его по outbox.
     queue_result(trade_id=tid, kind=kind, side=side, r=r, total_r=total,
                  entry=float(entry or 0), stop=stop, exit_px=exit_px, note=note)
-    note_trade(kind, side, r, trade_id=tid, total_r=total)
+    note_trade(kind, side, r, trade_id=tid, total_r=total,
+               entry=entry, stop=stop, exit_px=exit_px, note=note)
 
     path = ""
     try:

@@ -161,6 +161,26 @@ def send_photo(path: str, caption: str, token: str | None = None,
     return res.ok, ("ok" if res.ok else res.error)
 
 
+def send_plain_result(text: str, token: str | None = None,
+                      chat_id: str | int | None = None,
+                      markup: dict | None = None) -> ApiResult:
+    """Сообщение без HTML-разметки — удобно копировать в другой сервис."""
+    chat = cfg.CHAT_ID if chat_id is None else str(chat_id)
+    if not chat:
+        return ApiResult(False, error="no chat_id")
+    data = {"chat_id": chat, "text": text, "disable_web_page_preview": "true"}
+    if markup:
+        data["reply_markup"] = json.dumps(markup, ensure_ascii=False)
+    return api_call("sendMessage", data, token=token)
+
+
+def send_plain(text: str, token: str | None = None,
+               chat_id: str | int | None = None,
+               markup: dict | None = None) -> tuple[bool, str]:
+    res = send_plain_result(text, token=token, chat_id=chat_id, markup=markup)
+    return res.ok, ("ok" if res.ok else res.error)
+
+
 def send_message_result(text: str, token: str | None = None,
                         chat_id: str | int | None = None,
                         markup: dict | None = None) -> ApiResult:

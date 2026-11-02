@@ -148,8 +148,9 @@ def text_report(days: int = 30, title: str | None = None) -> str:
     return "\n".join(lines)
 
 
-def render_equity(days: int | None = 90, out_path: str | None = None) -> str:
-    """Нарисовать equity curve и просадку. Возвращает путь к PNG."""
+def render_equity(days: int | None = 90, out_path: str | None = None,
+                  portrait: bool = False) -> str:
+    """Нарисовать equity curve и просадку. portrait=True — 4:5 для Threads."""
     import datetime as dt
 
     import matplotlib
@@ -174,7 +175,7 @@ def render_equity(days: int | None = 90, out_path: str | None = None) -> str:
     pf_str = "∞" if math.isinf(m["pf"]) else f"{m['pf']:.2f}"
 
     fig, (ax1, ax2) = plt.subplots(
-        2, 1, figsize=(12, 6.6), dpi=110, sharex=True,
+        2, 1, figsize=(8.6, 11.0) if portrait else (12, 6.6), dpi=110, sharex=True,
         gridspec_kw={"height_ratios": [2.4, 1.0], "hspace": 0.08},
     )
     fig.patch.set_facecolor("#12161f")

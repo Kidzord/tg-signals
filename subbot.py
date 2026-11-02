@@ -43,6 +43,7 @@ import render as card
 import revenue
 import store
 import tg
+import threads_editor
 import track_record
 import ui_components
 import subbot_ui
@@ -1012,6 +1013,19 @@ def handle_callback(users: dict, uid: str, chat_id: str, mid: int, data: str) ->
     if new_result is not None:
         return new_result
 
+    # Редактор Threads — только владельцу.
+    if data.startswith("post:") and str(uid) == str(cfg.OWNER_CHAT_ID):
+        kind = data.split(":", 1)[1]
+        if kind == "next":
+            threads_editor.send_next(uid, TOKEN)
+        elif kind == "signal":
+            threads_editor.send_signal(uid, TOKEN)
+        elif kind == "week":
+            threads_editor.send_week(uid, TOKEN)
+        elif kind == "result":
+            threads_editor.send_result(uid, TOKEN)
+        return None
+
     if data == "buy":
         send_buy(uid)
         return None
@@ -1158,15 +1172,18 @@ def handle(users: dict, uid: str, raw: str, name: str = "") -> dict | None:
         reply(uid, f"Твой Telegram ID: <code>{uid}</code>")
         return None
 
-    if cmd == "threads":
-        cur = str(load_json(OWNER_PATH).get("chat_id", "") or "")
-        if cur and cur != uid:
-            reply(uid, "Напоминания о постах для Threads уже привязаны к другому чату.")
+        if cmd == "threads":
+            cur = str(load_json(OWNER_PATH).get("chat_id", "") or "")
+            if cur and cur != uid:
+                reply(uid, "Напоминания о постах для Threads уже привязаны к другому чату.")
+                return None
+            save_json(OWNER_PATH, {"chat_id": uid})
+            reply(uid, "Готово. Сюда будут приходить посты для Threads — "
+                       "по расписанию, чтобы ты не забывал публиковать.\n\n"
+                       "В любой момент: /post — следующий пост, /post signal — "
+                       "последний сигнал, /post week — итог недели, /post result — "
+                       "последняя закрытая сделка.")
             return None
-        save_json(OWNER_PATH, {"chat_id": uid})
-        reply(uid, "Готово. Сюда будут приходить посты для Threads — "
-                   "по расписанию, чтобы ты не забывал публиковать.")
-        return None
 
     if cmd in ("start", "menu"):
         if args:
@@ -1240,7 +1257,7 @@ def handle(users: dict, uid: str, raw: str, name: str = "") -> dict | None:
         send_status(uid, users)
         return None
 
-    # owner-only: деньги и резервная копия
+    # owner-only: деньги, бэкап и редактор Threads
     if str(uid) == str(cfg.OWNER_CHAT_ID):
         if cmd in ("revenue", "money"):
             reply(uid, revenue.text_report(30))
@@ -1251,6 +1268,19 @@ def handle(users: dict, uid: str, raw: str, name: str = "") -> dict | None:
                 reply(uid, f"💾 Бэкап готов: <code>{path}</code>")
             except Exception as e:
                 reply(uid, f"Бэкап не удался: {e}")
+            return None
+        if cmd == "post":
+            arg = args[0].lower() if args else "next"
+            if arg == "signal":
+                threads_editor.send_signal(uid, TOKEN)
+            elif arg in ("week", "stats"):
+                threads_editor.send_week(uid, TOKEN)
+            elif arg in ("result", "trade"):
+                threads_editor.send_result(uid, TOKEN)
+            elif arg.isdigit():
+                threads_editor.send_next(uid, TOKEN, int(arg))
+            else:
+                threads_editor.send_next(uid, TOKEN)
             return None
 
     # остальное — только по активной подписке
