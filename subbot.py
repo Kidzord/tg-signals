@@ -21,6 +21,8 @@ signals_queue.jsonl, а premium-бот рассылает их подписчи�
     /total 10          общий стоп, % от депозита
     /limits 0.5 5 10   риск, дневной и общий стоп сразу
     /mycard            карточка-сводка под твои параметры
+    /lesson            следующая методичка (бесплатно)
+    /lessons           список методичек
     /id                твой Telegram ID
     /threads           привязать этот чат владельцу (напоминания о постах для Threads)
     /help              список команд
@@ -39,6 +41,7 @@ import brand
 import backup
 import config as cfg
 import crypto_pay
+import edu_posts
 import render as card
 import revenue
 import store
@@ -108,6 +111,8 @@ HELP = (
     "/status — до какого числа активна\n"
     "/promo КОД — активировать промокод\n"
     "/stats — статистика сигналов (7 и 30 дней)\n"
+    "/lesson — следующая методичка (бесплатно)\n"
+    "/lessons — все методички списком\n"
     "/faq — частые вопросы\n"
     "/mycard — карточка счёта\n"
     "/limits 0.5 5 10 — риск, дневной и общий стоп\n"
@@ -148,7 +153,8 @@ def not_paid_text() -> str:
     return (
         "🔒 <b>Нужна подписка</b>\n\n"
         "Premium открывает быстрые сигналы в боте и карточку твоего счёта.\n"
-        f"Цена — {price_line()}." + trial + tail
+        f"Цена — {price_line()}.\n\n"
+        "Бесплатно и без подписки: методички — /lesson." + trial + tail
     )
 
 
@@ -411,7 +417,8 @@ def process_nurture(users: dict) -> None:
                 "Цели 1/2/3 — где фиксируем части позиции.\n\n"
                 "R — единица риска. Риск 0,5% депозита и результат +2R = +1% депозита. "
                 "Считать в R удобнее, чем в деньгах: результат не зависит от размера счёта.\n\n"
-                "Проверь свой план: депозит, риск и лимиты."
+                "Проверь свой план: депозит, риск и лимиты.\n"
+                "Разборы основ — /lesson: смарт-мани, MSNR, структура и риск."
             )
             markup = {"inline_keyboard": [[
                 {"text": "📊 Мой счёт", "callback_data": "card"},
@@ -797,6 +804,7 @@ BTN_PREMIUM = "⚡ Premium"
 BTN_ACCOUNT = "📊 Мой счёт"
 BTN_SETTINGS = "⚙️ Настройки"
 BTN_HELP = "ℹ️ Помощь"
+BTN_LESSONS = "📚 Методички"
 
 # Готовые варианты для кнопок — чтобы не вводить числа руками
 PRESETS = {
@@ -817,7 +825,8 @@ def main_keyboard() -> dict:
     """Нижнее меню — всегда под рукой, без ввода команд."""
     return {
         "keyboard": [[{"text": BTN_PREMIUM}, {"text": BTN_ACCOUNT}],
-                     [{"text": BTN_SETTINGS}, {"text": BTN_HELP}]],
+                     [{"text": BTN_SETTINGS}, {"text": BTN_LESSONS}],
+                     [{"text": BTN_HELP}]],
         "resize_keyboard": True,
         "is_persistent": True,
     }
@@ -838,6 +847,7 @@ def menu_markup(users: dict, uid: str) -> dict:
                           "callback_data": "trial"}])
     rows.append([{"text": "📈 Статистика", "callback_data": "stats"},
                  {"text": "❓ FAQ", "callback_data": "faq"}])
+    rows.append([{"text": "📚 Методички", "callback_data": "edu:list"}])
     cb = channel_buttons()
     if cb:
         rows.append(cb)
@@ -861,7 +871,8 @@ def welcome_text(users: dict, uid: str, name: str = "") -> str:
         "индексам и расчёт риска под твой счёт.\n\n"
         "• сигнал приходит сразу: вход, стоп и три цели\n"
         "• бот считает объём под твой депозит\n"
-        "• следит за твоим дневным и общим лимитом\n\n"
+        "• следит за твоим дневным и общим лимитом\n"
+        "• бесплатные методички: /lesson или «📚 Методички» внизу\n\n"
     )
     if is_paid(users, uid):
         body += (f"✅ Подписка активна до <b>{_date(paid_until(users, uid))}</b>.\n"
@@ -1018,6 +1029,29 @@ def handle_callback(users: dict, uid: str, chat_id: str, mid: int, data: str) ->
     new_result = subbot_ui.handle_callback(data, uid, users)
     if new_result is not None:
         return new_result
+
+    # Методички — бесплатно, поэтому до проверки подписки.
+    if data == "edu:list":
+        edu_posts.send_index(uid, TOKEN)
+        return None
+    if data.startswith("edu:lesson:"):
+        parts = data.split(":")
+        if len(parts) == 3 and parts[2].isdigit():
+            u = users.setdefault(uid, {})
+            n = int(parts[2])
+            if edu_posts.send_to_user(uid, TOKEN, n):
+                u["lesson_next"] = edu_posts.next_after(n)
+                return u
+        return None
+    if data.startswith("edu:next:"):
+        u = users.setdefault(uid, {})
+        n = int(u.get("lesson_next", 1) or 1)
+        if not 1 <= n <= edu_posts.total():
+            n = 1
+        if edu_posts.send_to_user(uid, TOKEN, n):
+            u["lesson_next"] = edu_posts.next_after(n)
+            return u
+        return None
 
     # Редактор Threads — только владельцу.
     if data.startswith("post:") and str(uid) == str(cfg.OWNER_CHAT_ID):
@@ -1177,6 +1211,9 @@ def handle(users: dict, uid: str, raw: str, name: str = "") -> dict | None:
     if text == BTN_HELP:
         reply(uid, HELP)
         return None
+    if text == BTN_LESSONS:
+        edu_posts.send_index(uid, TOKEN)
+        return None
 
     parts = text.split()
     cmd = parts[0].lstrip("/").split("@")[0].lower()
@@ -1187,21 +1224,21 @@ def handle(users: dict, uid: str, raw: str, name: str = "") -> dict | None:
         reply(uid, f"Твой Telegram ID: <code>{uid}</code>")
         return None
 
-        if cmd == "threads":
-            cur = str(load_json(OWNER_PATH).get("chat_id", "") or "")
-            if cur and cur != uid:
-                reply(uid, "Напоминания о постах для Threads уже привязаны к другому чату.")
-                return None
-            save_json(OWNER_PATH, {"chat_id": uid})
-            reply(uid, "Готово. Сюда будут приходить посты для Threads — "
-                       "по расписанию, чтобы ты не забывал публиковать.\n\n"
-                       "В любой момент: /post — следующий пост, /post signal — "
-                       "последний сигнал, /post week — итог недели, /post result — "
-                       "последняя закрытая сделка.\n"
-                       "Telegram: /tgpost — сразу опубликовать следующий пост, "
-                       "/tgpost preview — только превью.\n"
-                       "TikTok: /tt — карусель из карточек и текст для публикации.")
+    if cmd == "threads":
+        cur = str(load_json(OWNER_PATH).get("chat_id", "") or "")
+        if cur and cur != uid:
+            reply(uid, "Напоминания о постах для Threads уже привязаны к другому чату.")
             return None
+        save_json(OWNER_PATH, {"chat_id": uid})
+        reply(uid, "Готово. Сюда будут приходить посты для Threads — "
+                   "по расписанию, чтобы ты не забывал публиковать.\n\n"
+                   "В любой момент: /post — следующий пост, /post signal — "
+                   "последний сигнал, /post week — итог недели, /post result — "
+                   "последняя закрытая сделка.\n"
+                   "Telegram: /tgpost — сразу опубликовать следующий пост, "
+                   "/tgpost preview — только превью.\n"
+                   "TikTok: /tt — карусель из карточек и текст для публикации.")
+        return None
 
     if cmd in ("start", "menu"):
         if args:
@@ -1273,6 +1310,25 @@ def handle(users: dict, uid: str, raw: str, name: str = "") -> dict | None:
 
     if cmd == "status":
         send_status(uid, users)
+        return None
+
+    # методички бесплатны для всех — это вход в продукт, а не premium-фича
+    if cmd in ("lesson", "methodics", "method"):
+        u = users.setdefault(uid, {})
+        if args and args[0].isdigit():
+            n = int(args[0])
+        else:
+            n = int(u.get("lesson_next", 1) or 1)
+        if not 1 <= n <= edu_posts.total():
+            reply(uid, f"Нет методички #{n}. Всего {edu_posts.total()} — /lessons.")
+            return None
+        if edu_posts.send_to_user(uid, TOKEN, n):
+            u["lesson_next"] = edu_posts.next_after(n)
+            return u
+        return None
+
+    if cmd in ("lessons", "methods"):
+        edu_posts.send_index(uid, TOKEN)
         return None
 
     # owner-only: деньги, бэкап и редактор Threads
@@ -1708,6 +1764,8 @@ def main() -> None:
         ("status", "Статус подписки"),
         ("promo", "Активировать промокод"),
         ("stats", "Статистика сигналов"),
+        ("lesson", "Следующая методичка"),
+        ("lessons", "Все методички"),
         ("mycard", "Карточка счёта"),
         ("symbols", "Фильтр инструментов"),
         ("maxday", "Лимит сигналов в сутки"),
