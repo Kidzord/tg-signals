@@ -24,6 +24,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import feeds
+import mt5_screenshot
 import render as card
 import sonar
 import store
@@ -78,6 +79,10 @@ QUEUE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "signals_q
 RESULTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results_queue.jsonl")
 # Журнал закрытых сделок: по нему autoposts.py собирает итог дня и итог недели.
 TRADES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trades.jsonl")
+# data_path терминала: через него ScreenshotEA и Python обмениваются файлами.
+MT5_DATA_PATH = ""
+# 1 — при выходе просить PNG у ScreenshotEA; 0 — всегда рисовать карточку сами.
+MT5_SCREENSHOT = os.getenv("MT5_SCREENSHOT", "1").strip().lower() in ("1", "true", "yes")
 # Группы коррелированных символов: 4 индекса — почти один рынок, мажоры доллара
 # тоже ходят вместе. Кросс-лок не даёт группе набрать стек одновременных ставок.
 RISK_GROUP = {
@@ -132,6 +137,13 @@ class MT5Data:
         if not mt5.initialize(timeout=20000):
             raise RuntimeError(f"MT5 не отвечает: {mt5.last_error()}")
         self._off: dict[str, int] = {}
+        global MT5_DATA_PATH
+        try:
+            info = mt5.terminal_info()
+            self.data_path = info.data_path if info else ""
+        except Exception:
+            self.data_path = ""
+        MT5_DATA_PATH = self.data_path
 
     def offset(self, symbol: str) -> int:
         """MT5 отдаёт время сервера как есть — не сдвигаем.
@@ -503,7 +515,18 @@ def post_result(kind: str, side: str, r: float, *, entry: float | None = None,
         os.makedirs(OUT_DIR, exist_ok=True)
         path = os.path.join(OUT_DIR, f"result_{SYMBOL}_{int(time.time() * 1000)}.png")
         rendered = False
-        if chart is not None and entry is not None and stop is not None and exit_idx is not None:
+        # 1) настоящий скриншот терминала через ScreenshotEA (если он запущен)
+        if MT5_SCREENSHOT and MT5_DATA_PATH and entry is not None and stop is not None:
+            shot = mt5_screenshot.request(
+                SYMBOL, TF, data_path=MT5_DATA_PATH, side=side,
+                entry=float(entry), stop=float(stop),
+                tp1=tp1, tp2=tp2, tp3=tp3, exit_px=exit_px,
+                label=kind, r=r, timeout=12)
+            if shot:
+                path = shot
+                rendered = True
+        # 2) иначе — свой график по данным MT5
+        if not rendered and chart is not None and entry is not None and stop is not None and exit_idx is not None:
             bars_all = [
                 feeds.Bar(dt.datetime.fromtimestamp(float(chart.t[j]), dt.timezone.utc),
                           float(chart.o[j]), float(chart.h[j]),

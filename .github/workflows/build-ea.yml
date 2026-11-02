@@ -67,7 +67,7 @@ jobs:
           $mql5dir = $env:MQL5DIR
           Write-Host "Include-путь: $mql5dir"
           $fail = 0
-          foreach ($ea in @("RangeBotEA", "Ict2022EA")) {
+          foreach ($ea in @("RangeBotEA", "Ict2022EA", "ScreenshotEA")) {
             $src = "$env:GITHUB_WORKSPACE\mt5_ea\$ea.mq5"
             $log = "$env:GITHUB_WORKSPACE\mt5_ea\ci_$ea.log"
             $p = Start-Process -FilePath $ed -ArgumentList "/compile:`"$src`"", "/inc:`"$mql5dir`"", "/log:`"$log`"" -Wait -PassThru
@@ -86,4 +86,5 @@ jobs:
           path: |
             mt5_ea/RangeBotEA.ex5
             mt5_ea/Ict2022EA.ex5
+            mt5_ea/ScreenshotEA.ex5
           if-no-files-found: error
