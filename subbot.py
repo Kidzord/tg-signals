@@ -256,7 +256,9 @@ def apply_payment(users: dict, *, provider: str, external_id: str, uid: str,
     """
     new = store.record_payment(
         provider=provider, external_id=external_id, uid=uid,
-        amount=amount, currency=currency, days=days, raw=raw,
+        amount=amount, currency=currency, days=days,
+        source=str((users.get(uid) or {}).get("source", "") or ""),
+        raw=raw,
     )
     if not new:
         return False
@@ -578,7 +580,9 @@ def grant_trial(users: dict, uid: str) -> None:
     users[uid]["paid_until"] = max(paid_until(users, uid), until)
     save_json(USERS_PATH, users)
     store.record_payment(provider="trial", external_id=f"trial:{uid}", uid=uid,
-                         amount=0.0, days=cfg.TRIAL_DAYS, raw={"source": "trial"})
+                         amount=0.0, days=cfg.TRIAL_DAYS,
+                         source=str(u.get("source", "") or ""),
+                         raw={"source": "trial"})
     # День 0 — сразу; день 1 — как читать карточку; день 3 — окончание.
     store.enqueue_nurture(uid, "trial_day1", now + 86400)
     store.enqueue_nurture(uid, "trial_day3", now + 2 * 86400 + 12 * 3600)
@@ -1560,7 +1564,9 @@ def poll_crypto(users: dict) -> bool:
         new = store.record_payment(
             provider="crypto", external_id=iid, uid=uid,
             amount=float(inv.get("amount", 0) or 0),
-            currency=str(inv.get("asset", "") or ""), days=days, raw=inv,
+            currency=str(inv.get("asset", "") or ""), days=days,
+            source=str((users.get(uid) or {}).get("source", "") or ""),
+            raw=inv,
         )
         if not new:
             continue

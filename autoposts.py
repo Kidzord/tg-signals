@@ -315,6 +315,46 @@ def remind_tiktok() -> bool:
     return ok
 
 
+def remind_threads_result() -> bool:
+    """Готовый пост по последней закрытой сделке; если сделок нет — из банка."""
+    chat = owner_chat()
+    if not chat:
+        log.warning("нет чата владельца для Threads")
+        return False
+    ok = threads_editor.send_result(chat, cfg.SUB_BOT_TOKEN or cfg.BOT_TOKEN)
+    if not ok:
+        ok = threads_editor.send_next(chat, cfg.SUB_BOT_TOKEN or cfg.BOT_TOKEN)
+    log.info("Threads result -> %s", ok)
+    return ok
+
+
+def remind_threads_week() -> bool:
+    """Недельный трек-рекорд с equity-картинкой для Threads."""
+    chat = owner_chat()
+    if not chat:
+        log.warning("нет чата владельца для Threads")
+        return False
+    ok = threads_editor.send_week(chat, cfg.SUB_BOT_TOKEN or cfg.BOT_TOKEN)
+    log.info("Threads week -> %s", ok)
+    return ok
+
+
+def build_landing_job() -> bool:
+    """Пересобрать landing/index.html из trades.jsonl."""
+    import subprocess
+    import sys
+
+    path = os.path.join(HERE, "tools", "build_landing.py")
+    try:
+        r = subprocess.run([sys.executable, path], capture_output=True,
+                           text=True, timeout=120)
+        log.info("landing: %s", (r.stdout or r.stderr).strip()[:300])
+        return r.returncode == 0
+    except Exception as e:
+        log.error("landing: %s", e)
+        return False
+
+
 def remind_x() -> bool:
     """Прислать владельцу в личку следующий неопубликованный пост для X (EN)."""
     chat = owner_chat()
@@ -433,6 +473,8 @@ def build_scheduler() -> BackgroundScheduler:
         plan.append(("promo", cfg.PROMO_TIME, "*", post_promo))
     if cfg.TG_CONTENT_ENABLED:
         plan.append(("tgcontent", cfg.TG_CONTENT_TIME, "*", post_tg_content))
+    if cfg.LANDING_ENABLED:
+        plan.append(("landing", cfg.LANDING_TIME, "*", build_landing_job))
     for name, when, dow, job in plan:
         hm = _hhmm(when)
         if not hm:
@@ -451,6 +493,25 @@ def build_scheduler() -> BackgroundScheduler:
             sch.add_job(remind_threads,
                         CronTrigger(hour=hm[0], minute=hm[1], timezone=TZ),
                         id=f"threads_{i}", replace_existing=True)
+
+    if cfg.THREADS_RESULT_ENABLED:
+        hm = _hhmm(cfg.THREADS_RESULT_TIME)
+        if hm:
+            sch.add_job(remind_threads_result,
+                        CronTrigger(hour=hm[0], minute=hm[1], timezone=TZ),
+                        id="threads_result", replace_existing=True)
+        else:
+            log.error("Threads result: неверное время %r", cfg.THREADS_RESULT_TIME)
+
+    if cfg.THREADS_WEEK_ENABLED:
+        hm = _hhmm(cfg.THREADS_WEEK_TIME)
+        if hm:
+            sch.add_job(remind_threads_week,
+                        CronTrigger(day_of_week="fri", hour=hm[0], minute=hm[1],
+                                    timezone=TZ),
+                        id="threads_week", replace_existing=True)
+        else:
+            log.error("Threads week: неверное время %r", cfg.THREADS_WEEK_TIME)
 
     if cfg.X_REMIND_ENABLED:
         for i, when in enumerate(_times(cfg.X_REMIND_TIMES), 1):
@@ -492,6 +553,9 @@ def main() -> None:
                 "promo": post_promo, "threads": remind_threads, "x": remind_x,
                 "revenue": revenue.send_report, "backup": backup.snapshot,
                 "tgcontent": post_tg_content, "tiktok": remind_tiktok,
+                "threads_result": remind_threads_result,
+                "threads_week": remind_threads_week,
+                "landing": build_landing_job,
                 "vk": lambda: remind_ru("vk"), "dzen": lambda: remind_ru("dzen")}
         job = jobs.get(what)
         if not job:

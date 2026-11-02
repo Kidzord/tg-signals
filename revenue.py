@@ -38,20 +38,27 @@ def metrics(days: int = 30) -> dict[str, Any]:
     trials = 0
     trial_converted = 0
     expired = 0
+    by_source: dict[str, dict] = {}
     for uid, u in users.items():
         u = u if isinstance(u, dict) else {}
         try:
             until = float(u.get("paid_until", 0) or 0)
         except (TypeError, ValueError):
             until = 0.0
+        src = str(u.get("source", "") or "—")
+        b = by_source.setdefault(src, {"users": 0, "active": 0, "trials": 0,
+                                      "paid": 0, "revenue": 0.0})
+        b["users"] += 1
         if u.get("blocked"):
             blocked += 1
         if until > now:
             active += 1
+            b["active"] += 1
         elif cut <= until <= now:
             expired += 1
         if u.get("trial_used"):
             trials += 1
+            b["trials"] += 1
             if str(uid) in paid_uids:
                 trial_converted += 1
 
@@ -59,11 +66,24 @@ def metrics(days: int = 30) -> dict[str, Any]:
     new_paid_uids = {str(r["uid"]) for r in pays
                      if r["provider"] in ("stars", "crypto") and r["status"] == "paid"}
     revenue: dict[str, float] = {}
+    promo_codes: dict[str, int] = {}
     for r in pays:
-        if r["status"] != "paid" or r["provider"] not in ("stars", "crypto"):
+        if r["status"] != "paid":
+            continue
+        if r["provider"] == "promo":
+            code = str(r["external_id"]).split(":", 1)[0].upper()
+            promo_codes[code] = promo_codes.get(code, 0) + 1
+            continue
+        if r["provider"] not in ("stars", "crypto"):
             continue
         key = f"{r['provider']}:{r['currency'] or '?'}"
         revenue[key] = revenue.get(key, 0.0) + float(r["amount"] or 0)
+        src = str(r["source"] or "—")
+        b = by_source.setdefault(src, {"users": 0, "active": 0, "trials": 0,
+                                      "paid": 0, "revenue": 0.0})
+        b["revenue"] += float(r["amount"] or 0)
+        if str(r["uid"]) in new_paid_uids:
+            b["paid"] += 1
 
     churn_base = active + expired
     return {
@@ -78,19 +98,29 @@ def metrics(days: int = 30) -> dict[str, Any]:
         "new_paid": len(new_paid_uids),
         "payments": len(pays),
         "revenue": revenue,
+        "by_source": by_source,
+        "promo_codes": promo_codes,
     }
 
 
 def text_report(days: int = 30) -> str:
     m = metrics(days)
     rev = " · ".join(f"{k}: {v:g}" for k, v in sorted(m["revenue"].items())) or "нет"
+    srcs = sorted(m["by_source"].items(), key=lambda kv: (-kv[1]["paid"], -kv[1]["users"]))[:5]
+    src_line = " · ".join(
+        f"{name}: {v['users']} чел / {v['paid']} оплат / {v['revenue']:g}"
+        for name, v in srcs
+    ) or "нет данных"
+    promo_line = " · ".join(f"{c}: {n}" for c, n in sorted(m["promo_codes"].items())) or "нет"
     return (
         f"💼 <b>Подписки · {days} дней</b>\n\n"
         f"Активных: <b>{m['active']}</b> · всего в базе: {m['users']} · "
         f"заблокировали: {m['blocked']}\n"
         f"Новых платящих: <b>{m['new_paid']}</b> · поступления: {rev}\n"
         f"Триалы: {m['trials']} · конверсия в оплату: <b>{m['trial_rate']:.0f}%</b>\n"
-        f"Истекли без продления: {m['expired']} · churn <b>{m['churn_rate']:.0f}%</b>"
+        f"Истекли без продления: {m['expired']} · churn <b>{m['churn_rate']:.0f}%</b>\n\n"
+        f"<b>Источники</b>: {src_line}\n"
+        f"<b>Промокоды</b>: {promo_line}"
     )
 
 

@@ -117,6 +117,14 @@ TG_CONTENT_TIME = os.getenv("TG_CONTENT_TIME", "12:00").strip()
 # Напоминания о постах Threads в личку: список времён через запятую
 THREADS_REMIND_ENABLED = _flag("THREADS_REMIND_ENABLED", "1")
 THREADS_REMIND_TIMES = os.getenv("THREADS_REMIND_TIMES", "09:00,14:00,19:00").strip()
+# Отдельный слот под реальную сделку и недельный трек-рекорд для Threads.
+THREADS_RESULT_ENABLED = _flag("THREADS_RESULT_ENABLED", "1")
+THREADS_RESULT_TIME = os.getenv("THREADS_RESULT_TIME", "19:00").strip()
+THREADS_WEEK_ENABLED = _flag("THREADS_WEEK_ENABLED", "1")
+THREADS_WEEK_TIME = os.getenv("THREADS_WEEK_TIME", "20:00").strip()
+# Лендинг собирается локально из trades.jsonl (деплой — вручную/CI).
+LANDING_ENABLED = _flag("LANDING_ENABLED", "1")
+LANDING_TIME = os.getenv("LANDING_TIME", "23:55").strip()
 # Напоминания о постах для X (отдельный англ. аккаунт) в личку
 X_REMIND_ENABLED = _flag("X_REMIND_ENABLED", "1")
 X_REMIND_TIMES = os.getenv("X_REMIND_TIMES", "10:30,16:30").strip()

@@ -145,6 +145,37 @@ def ping_healthcheck() -> bool:
         return False
 
 
+def set_healthcheck(url: str) -> bool:
+    """Записать HEALTHCHECK_URL в .env и проверить пингом."""
+    url = (url or "").strip()
+    if not url.startswith("http"):
+        print("URL должен начинаться с http:// или https://")
+        return False
+    env_path = os.path.join(HERE, ".env")
+    if not os.path.exists(env_path):
+        print("нет .env рядом с monitor.py")
+        return False
+    lines = open(env_path, encoding="utf-8").read().splitlines()
+    out, found = [], False
+    for line in lines:
+        if line.startswith("HEALTHCHECK_URL="):
+            out.append(f"HEALTHCHECK_URL={url}")
+            found = True
+        else:
+            out.append(line)
+    if not found:
+        out.append(f"HEALTHCHECK_URL={url}")
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(out).rstrip() + "\n")
+    try:
+        r = requests.get(url, timeout=10)
+        print("проверка URL:", r.status_code, r.text[:80])
+    except requests.RequestException as e:
+        print("URL записан, но проверка не прошла:", e)
+    print("HEALTHCHECK_URL записан в .env — перезапусти monitor.bat")
+    return True
+
+
 def run_once(send_alerts: bool = True) -> dict:
     store.init_db()
     state = _load_state()
@@ -164,6 +195,9 @@ def run_once(send_alerts: bool = True) -> dict:
 
 
 def main() -> None:
+    if len(sys.argv) > 2 and sys.argv[1] == "set-healthcheck":
+        set_healthcheck(sys.argv[2])
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "once":
         res = run_once(send_alerts=False)
         print("боты:", "ok" if res["bots"] else "ПРОБЛЕМА", "-", res["bots_text"])
@@ -172,6 +206,9 @@ def main() -> None:
     print(f"monitor: каждые {cfg.MONITOR_EVERY_MIN} мин, "
           f"порог пульса {cfg.MONITOR_STALE_MIN} мин, "
           f"healthcheck {'вкл' if cfg.HEALTHCHECK_URL else 'выкл'}")
+    if not cfg.HEALTHCHECK_URL:
+        print("внешний dead-man выключен: создай check на healthchecks.io и выполни "
+              "python monitor.py set-healthcheck https://hc-ping.com/<uuid>")
     while True:
         try:
             run_once()

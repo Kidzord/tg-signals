@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS payments (
     provider    TEXT NOT NULL,              -- stars|crypto|promo|trial|ref|manual
     external_id TEXT NOT NULL,
     uid         TEXT NOT NULL,
+    source      TEXT NOT NULL DEFAULT '',   -- src_threads, src_tiktok, ...
     amount      REAL NOT NULL DEFAULT 0,
     currency    TEXT NOT NULL DEFAULT '',
     days        INTEGER NOT NULL DEFAULT 0,
@@ -131,6 +132,9 @@ def init_db() -> None:
         cols = {r["name"] for r in con.execute("PRAGMA table_info(group_outbox)")}
         if "symbol" not in cols:
             con.execute("ALTER TABLE group_outbox ADD COLUMN symbol TEXT NOT NULL DEFAULT ''")
+        pay_cols = {r["name"] for r in con.execute("PRAGMA table_info(payments)")}
+        if "source" not in pay_cols:
+            con.execute("ALTER TABLE payments ADD COLUMN source TEXT NOT NULL DEFAULT ''")
         _recover_stale(con, "deliveries")
         _recover_stale(con, "group_outbox")
         _recover_stale(con, "nurture")
@@ -339,17 +343,18 @@ def delivery_stats() -> dict[str, Any]:
 
 def record_payment(*, provider: str, external_id: str, uid: str,
                    amount: float = 0.0, currency: str = "", days: int = 0,
-                   raw: dict | None = None) -> bool:
+                   source: str = "", raw: dict | None = None) -> bool:
     """Записать платёж. True — он новый, False — уже был (повтор вебхука)."""
     now = time.time()
     con = connect()
     try:
         cur = con.execute(
             "INSERT OR IGNORE INTO payments "
-            "(provider, external_id, uid, amount, currency, days, status, raw, "
-            " created_at, updated_at) VALUES (?,?,?,?,?,?,'paid',?,?,?)",
-            (provider, str(external_id), str(uid), float(amount), currency,
-             int(days), json.dumps(raw or {}, ensure_ascii=False), now, now),
+            "(provider, external_id, uid, source, amount, currency, days, status, raw, "
+            " created_at, updated_at) VALUES (?,?,?,?,?,?,?,'paid',?,?,?)",
+            (provider, str(external_id), str(uid), str(source),
+             float(amount), currency, int(days),
+             json.dumps(raw or {}, ensure_ascii=False), now, now),
         )
         return cur.rowcount > 0
     finally:

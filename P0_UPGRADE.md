@@ -57,6 +57,9 @@ python -m pytest -q
 HEALTHCHECK_URL=https://hc-ping.com/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 ```
 
+Можно не открывать файл: `python monitor.py set-healthcheck https://hc-ping.com/...`
+запишет URL и сразу проверит его пингом.
+
 Пока ПК жив, `monitor.py` пингует URL; если пингов нет — сервис шлёт алерт.
 
 ## 4. Новые необязательные настройки в `.env`
