@@ -54,20 +54,24 @@ def _save_state(state: dict) -> None:
     os.replace(tmp, STATE_PATH)
 
 
-def _alert(text: str) -> None:
+def _alert(text: str) -> bool:
     if not cfg.OWNER_CHAT_ID:
-        return
-    tg.send_message(text, token=cfg.SUB_BOT_TOKEN or cfg.BOT_TOKEN,
-                    chat_id=cfg.OWNER_CHAT_ID)
+        return True   # некого уведомлять — считаем доставленным
+    try:
+        ok, _ = tg.send_message(text, token=cfg.SUB_BOT_TOKEN or cfg.BOT_TOKEN,
+                                chat_id=cfg.OWNER_CHAT_ID)
+        return bool(ok)
+    except Exception as e:
+        print("алерт не отправлен:", repr(e))
+        return False
 
 
 def _transition(key: str, bad: bool, bad_text: str, ok_text: str, state: dict) -> None:
-    """Отправить алерт только при смене состояния."""
+    """Отправить алерт только при смене состояния и не терять его при сбое Telegram."""
     prev = bool(state.get(key))
-    if bad and not prev:
-        _alert(bad_text)
-    elif not bad and prev:
-        _alert(ok_text)
+    if bad != prev:
+        if not _alert(bad_text if bad else ok_text):
+            return   # state не меняем — повторим в следующем цикле
     state[key] = bad
 
 
@@ -114,22 +118,57 @@ def check_heartbeats() -> tuple[bool, str]:
         problems.append(f"bot.py процессов {procs} из {cfg.EXPECTED_BOTS}")
     if not files and procs == 0:
         problems.append("ни одного bot.py и ни одного heartbeat")
+    elif not files and procs < 0:
+        problems.append("нет heartbeat-файлов, процессы проверить не удалось")
     return (not problems), ("; ".join(problems) or "все боты живы")
 
 
 def check_delivery() -> tuple[bool, str]:
     stats = store.delivery_stats()
     pending = stats.get("pending", {})
-    failed = stats.get("failed", {})
     problems: list[str] = []
     oldest = pending.get("oldest")
-    if oldest:
-        age = time.time() - float(oldest)
+    min_due = pending.get("min_due")
+    now = time.time()
+    # ближайшая попытка запланирована в будущем — очередь ждёт (429/backoff), не стоит
+    waiting = min_due is not None and float(min_due) > now
+    if oldest and not waiting:
+        age = now - float(oldest)
         if age > BACKLOG_STALE_SEC:
             problems.append(f"очередь доставки стоит {age / 60:.0f} мин")
-    if failed.get("n"):
-        problems.append(f"недоставленных сообщений: {int(failed['n'])}")
+    failed = store.delivery_failed_recent(now - 86400)
+    if failed:
+        problems.append(f"недоставленных сообщений за сутки: {failed}")
+    group_pending = store.group_pending_count()
+    if group_pending > 20:
+        problems.append(f"в групповой очереди {group_pending} постов")
     return (not problems), ("; ".join(problems) or "доставка в порядке")
+
+
+def check_backup(max_age_h: float = 26.0) -> tuple[bool, str]:
+    import backup
+    last = backup.latest_snapshot()
+    if not last:
+        return False, "нет ни одного бэкапа"
+    try:
+        age_h = (time.time() - os.path.getmtime(last)) / 3600.0
+    except OSError:
+        return False, "бэкап не читается"
+    if age_h > max_age_h:
+        return False, f"последний бэкап {age_h:.0f} ч назад"
+    return True, "бэкап свежий"
+
+
+def check_logs(max_mb: float = 50.0) -> tuple[bool, str]:
+    big: list[str] = []
+    for path in glob.glob(os.path.join(HERE, "logs", "*.log")):
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        if size > max_mb * 1024 * 1024:
+            big.append(f"{os.path.basename(path)} {size / 1048576:.0f} МБ")
+    return (not big), ("логи: " + ", ".join(big) if big else "логи в норме")
 
 
 def ping_healthcheck() -> bool:
@@ -181,6 +220,8 @@ def run_once(send_alerts: bool = True) -> dict:
     state = _load_state()
     ok_b, text_b = check_heartbeats()
     ok_d, text_d = check_delivery()
+    ok_bk, text_bk = check_backup()
+    ok_lg, text_lg = check_logs()
     if send_alerts:
         _transition("bots", not ok_b,
                     f"🔴 <b>Боты сигналов</b>\n{text_b}",
@@ -188,10 +229,18 @@ def run_once(send_alerts: bool = True) -> dict:
         _transition("delivery", not ok_d,
                     f"🔴 <b>Доставка</b>\n{text_d}",
                     "🟢 <b>Доставка</b> восстановлена.", state)
+        _transition("backup", not ok_bk,
+                    f"🔴 <b>Бэкапы</b>\n{text_bk}",
+                    "🟢 <b>Бэкапы</b> снова в порядке.", state)
+        _transition("logs", not ok_lg,
+                    f"🔴 <b>Логи</b>\n{text_lg}",
+                    "🟢 <b>Логи</b> снова в норме.", state)
         _save_state(state)
     ping_healthcheck()
     return {"bots": ok_b, "bots_text": text_b,
-            "delivery": ok_d, "delivery_text": text_d}
+            "delivery": ok_d, "delivery_text": text_d,
+            "backup": ok_bk, "backup_text": text_bk,
+            "logs": ok_lg, "logs_text": text_lg}
 
 
 def main() -> None:
@@ -202,6 +251,8 @@ def main() -> None:
         res = run_once(send_alerts=False)
         print("боты:", "ok" if res["bots"] else "ПРОБЛЕМА", "-", res["bots_text"])
         print("доставка:", "ok" if res["delivery"] else "ПРОБЛЕМА", "-", res["delivery_text"])
+        print("бэкапы:", "ok" if res["backup"] else "ПРОБЛЕМА", "-", res["backup_text"])
+        print("логи:", "ok" if res["logs"] else "ПРОБЛЕМА", "-", res["logs_text"])
         return
     print(f"monitor: каждые {cfg.MONITOR_EVERY_MIN} мин, "
           f"порог пульса {cfg.MONITOR_STALE_MIN} мин, "

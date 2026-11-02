@@ -33,7 +33,52 @@ HEARTBEAT_TIME = os.getenv("HEARTBEAT_TIME", "09:00").strip()
 DIGEST_TIME = os.getenv("DIGEST_TIME", "21:00").strip()
 QUEUE_PATH = Path(__file__).parent / "signals_queue.jsonl"
 TRADES_PATH = Path(__file__).parent / "trades.jsonl"
+STATE_PATH = Path(__file__).parent / "heartbeat_state.json"
 EXPECTED_BOTS = int(os.getenv("HEARTBEAT_EXPECT_BOTS", "3"))  # range AUDUSD+USDCAD + classic XAUUSD
+
+
+def _num(v, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _hhmm(raw: str) -> tuple[int, int] | None:
+    try:
+        h, m = str(raw).strip().split(":")
+        h, m = int(h), int(m)
+        return (h, m) if 0 <= h < 24 and 0 <= m < 60 else None
+    except (ValueError, AttributeError):
+        return None
+
+
+def load_sent() -> dict:
+    """Даты последней успешной отправки по каждому отчёту (переживает рестарт)."""
+    try:
+        data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_sent(data: dict) -> None:
+    tmp = STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, STATE_PATH)
+
+
+def _dedup(rows: list[dict]) -> list[dict]:
+    """Одна сделка — одна строка, даже если журнал продублировал запись."""
+    seen: set[tuple[str, str]] = set()
+    out: list[dict] = []
+    for rec in rows:
+        key = (str(rec.get("trade_id", "")), str(rec.get("kind", "")))
+        if rec.get("trade_id") and key in seen:
+            continue
+        seen.add(key)
+        out.append(rec)
+    return out
 
 
 def read_jsonl(path: Path, since: float) -> list[dict]:
@@ -51,7 +96,7 @@ def read_jsonl(path: Path, since: float) -> list[dict]:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if float(rec.get("ts", 0)) >= since:
+                if _num(rec.get("ts")) >= since:
                     out.append(rec)
     except OSError:
         pass
@@ -77,8 +122,8 @@ def build_report() -> str:
     since = now - 86400
     sigs = read_jsonl(QUEUE_PATH, since)
     trades = read_jsonl(TRADES_PATH, since)
-    closed = [t for t in trades if t.get("kind") not in ("tp1", "tp2")]
-    r_sum = sum(float(t.get("r", 0)) for t in closed)
+    closed = _dedup([t for t in trades if t.get("kind") not in ("tp1", "tp2")])
+    r_sum = sum(_num(t.get("r")) for t in closed)
     bots, _ = count_bots()
 
     lines = ["🫀 Heartbeat · боты сигналов"]
@@ -92,7 +137,7 @@ def build_report() -> str:
         lines.append(f"Сделок закрыто за 24ч: {len(closed)} · сумма {r_sum:+.2f}R")
         by_sym: dict[str, float] = {}
         for t in closed:
-            by_sym[t.get("symbol", "?")] = by_sym.get(t.get("symbol", "?"), 0) + float(t.get("r", 0))
+            by_sym[t.get("symbol", "?")] = by_sym.get(t.get("symbol", "?"), 0) + _num(t.get("r"))
         top = sorted(by_sym.items(), key=lambda kv: -abs(kv[1]))[:5]
         lines.append("  " + " · ".join(f"{s} {r:+.1f}R" for s, r in top))
     if not sigs and not closed:
@@ -118,9 +163,10 @@ def build_digest() -> str:
     now = time.time()
     since = now - 86400
     sigs = read_jsonl(QUEUE_PATH, since)
-    closed = [t for t in read_jsonl(TRADES_PATH, since) if t.get("kind") not in ("tp1", "tp2")]
-    r_sum = sum(float(t.get("r", 0)) for t in closed)
-    wins = sum(1 for t in closed if float(t.get("r", 0)) > 0)
+    closed = _dedup([t for t in read_jsonl(TRADES_PATH, since)
+                     if t.get("kind") not in ("tp1", "tp2")])
+    r_sum = sum(_num(t.get("r")) for t in closed)
+    wins = sum(1 for t in closed if _num(t.get("r")) > 0)
 
     open_list: list[str] = []
     try:
@@ -135,13 +181,17 @@ def build_digest() -> str:
             tr = st.get("trade") if isinstance(st, dict) else None
             if not tr:
                 continue
+            # state умершего бота не должен месяцами висеть как «открытая сделка»
+            age_h = (now - _num(tr.get("ts_saved") or tr.get("bar_ts"))) / 3600.0
+            if age_h > 36:
+                continue
             sym = name[len("bot_state_"):-len(".json")].split("_")[0]
-            side = "LONG" if int(tr.get("dir", 1)) == 1 else "SHORT"
+            side = "LONG" if int(_num(tr.get("dir"), 1)) == 1 else "SHORT"
             open_list.append(f"{sym} {side} @ {tr.get('entry', '?')}")
     except OSError:
         pass
 
-    lines = [f"📓 Итог суток · {dt.datetime.now(TZ):%d.%m}"]
+    lines = [f"📓 Итог суток · {dt.datetime.now(TZ):%d.%m} (окно 24 ч)"]
     lines.append(f"Сигналов: {len(sigs)}")
     if closed:
         lines.append(f"Закрыто сделок: {len(closed)} · {r_sum:+.2f}R · прибыльных {wins}/{len(closed)}")
@@ -188,19 +238,35 @@ def main() -> None:
         (HEARTBEAT_TIME, send_report, "hb"),
         (DIGEST_TIME, send_digest, "digest"),
     ]
-    last_sent: dict[str, str] = {}
+    for hhmm, _fn, tag in tasks:
+        if not _hhmm(hhmm):
+            print(f"{tag}: неверное время {hhmm!r} — ожидается ЧЧ:ММ, отчёт выключен")
+    last_sent = load_sent()
+    retry_at: dict[str, float] = {}
     while True:
         now = dt.datetime.now(TZ)
+        today = now.strftime("%Y-%m-%d")
         for hhmm, fn, tag in tasks:
-            hh, mm = int(hhmm[:2]), int(hhmm[3:5])
-            target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-            today = now.strftime("%Y-%m-%d")
-            if now >= target and last_sent.get(tag) != today:
-                try:
-                    fn()
-                except Exception as e:
-                    print("ошибка отчёта:", repr(e))
+            hm = _hhmm(hhmm)
+            if not hm:
+                continue
+            target = now.replace(hour=hm[0], minute=hm[1], second=0, microsecond=0)
+            if now < target or last_sent.get(tag) == today:
+                continue
+            if time.time() < retry_at.get(tag, 0.0):
+                continue
+            try:
+                ok = fn()
+            except Exception as e:
+                print("ошибка отчёта:", repr(e))
+                ok = False
+            if ok:
                 last_sent[tag] = today
+                save_sent(last_sent)
+                retry_at.pop(tag, None)
+            else:
+                # не отмечаем как отправленный: повторим через 5 минут
+                retry_at[tag] = time.time() + 300
         time.sleep(30)
 
 

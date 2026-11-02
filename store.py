@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS payments (
     currency    TEXT NOT NULL DEFAULT '',
     days        INTEGER NOT NULL DEFAULT 0,
     status      TEXT NOT NULL DEFAULT 'paid',  -- paid|refunded
+    granted_until REAL NOT NULL DEFAULT 0,     -- до какого срока выдан доступ (0 — ещё не выдан)
     raw         TEXT,
     created_at  REAL NOT NULL,
     updated_at  REAL NOT NULL,
@@ -135,6 +136,10 @@ def init_db() -> None:
         pay_cols = {r["name"] for r in con.execute("PRAGMA table_info(payments)")}
         if "source" not in pay_cols:
             con.execute("ALTER TABLE payments ADD COLUMN source TEXT NOT NULL DEFAULT ''")
+        if "granted_until" not in pay_cols:
+            con.execute("ALTER TABLE payments ADD COLUMN granted_until REAL NOT NULL DEFAULT 0")
+            # старые платежи считаем выданными: иначе сверка при старте продлит их повторно
+            con.execute("UPDATE payments SET granted_until=created_at WHERE granted_until=0")
         _recover_stale(con, "deliveries")
         _recover_stale(con, "group_outbox")
         _recover_stale(con, "nurture")
@@ -328,13 +333,27 @@ def delivery_stats() -> dict[str, Any]:
     con = connect()
     try:
         rows = con.execute(
-            "SELECT status, COUNT(*) AS n, MIN(created_at) AS oldest "
-            "FROM deliveries GROUP BY status"
+            "SELECT status, COUNT(*) AS n, MIN(created_at) AS oldest, "
+            "MIN(next_try) AS min_due FROM deliveries GROUP BY status"
         ).fetchall()
         out: dict[str, Any] = {}
         for r in rows:
-            out[str(r["status"])] = {"n": int(r["n"]), "oldest": r["oldest"]}
+            out[str(r["status"])] = {"n": int(r["n"]), "oldest": r["oldest"],
+                                     "min_due": r["min_due"]}
         return out
+    finally:
+        con.close()
+
+
+def delivery_failed_recent(since_ts: float) -> int:
+    """Свежие постоянные ошибки доставки (старые failed не должны шуметь вечно)."""
+    con = connect()
+    try:
+        row = con.execute(
+            "SELECT COUNT(*) AS n FROM deliveries WHERE status='failed' AND created_at>=?",
+            (float(since_ts),),
+        ).fetchone()
+        return int(row["n"]) if row else 0
     finally:
         con.close()
 
@@ -382,6 +401,55 @@ def payment_days(provider: str, external_id: str) -> int:
             (provider, str(external_id)),
         ).fetchone()
         return int(row["days"]) if row else 0
+    finally:
+        con.close()
+
+
+def payment_row(provider: str, external_id: str) -> dict | None:
+    """Строка платежа целиком (нужна для возвратов и сверки)."""
+    con = connect()
+    try:
+        row = con.execute(
+            "SELECT * FROM payments WHERE provider=? AND external_id=?",
+            (provider, str(external_id)),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        con.close()
+
+
+def mark_payment_granted(provider: str, external_id: str, until_ts: float) -> None:
+    """Отметить, что доступ по платежу выдан до until_ts (защита от повторной выдачи)."""
+    con = connect()
+    try:
+        con.execute(
+            "UPDATE payments SET granted_until=?, updated_at=? "
+            "WHERE provider=? AND external_id=?",
+            (float(until_ts), time.time(), provider, str(external_id)),
+        )
+    finally:
+        con.close()
+
+
+def delete_payment(provider: str, external_id: str) -> None:
+    """Откатить запись платежа, если выдать доступ не удалось (апдейт повторится)."""
+    con = connect()
+    try:
+        con.execute("DELETE FROM payments WHERE provider=? AND external_id=?",
+                    (provider, str(external_id)))
+    finally:
+        con.close()
+
+
+def ungranted_payments(since_ts: float) -> list[dict]:
+    """Оплаченные, но не выданные платежи — сверка после падения между ledger и выдачей."""
+    con = connect()
+    try:
+        rows = con.execute(
+            "SELECT * FROM payments WHERE status='paid' AND granted_until=0 "
+            "AND created_at>=? ORDER BY created_at", (float(since_ts),),
+        ).fetchall()
+        return [dict(r) for r in rows]
     finally:
         con.close()
 
@@ -514,6 +582,55 @@ def group_pending_count() -> int:
             "SELECT COUNT(*) AS n FROM group_outbox WHERE status IN ('pending','sending')"
         ).fetchone()
         return int(row["n"]) if row else 0
+    finally:
+        con.close()
+
+
+def group_pending_entry(trade_id: str) -> sqlite3.Row | None:
+    """Отложенный вход группы, который ещё не ушёл подписчикам."""
+    con = connect()
+    try:
+        return con.execute(
+            "SELECT * FROM group_outbox WHERE trade_id=? AND kind='entry' "
+            "AND status IN ('pending','sending') LIMIT 1", (trade_id,),
+        ).fetchone()
+    finally:
+        con.close()
+
+
+def append_group_outcome(trade_id: str, note: str) -> bool:
+    """Приклеить итог закрытой сделки к ещё не отправленному входу в группе.
+
+    Склейка: сделка закрылась внутри FREE_DELAY_SEC — подписчик получает одну
+    карточку «вход + итог» вместо сигнала и результата подряд. False — входа
+    в очереди нет (уже ушёл или не заводился), итог пойдёт отдельным сообщением.
+    """
+    con = connect()
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute(
+            "SELECT id, caption FROM group_outbox WHERE trade_id=? AND kind='entry' "
+            "AND status IN ('pending','sending') LIMIT 1", (trade_id,),
+        ).fetchone()
+        if not row:
+            con.execute("ROLLBACK")
+            return False
+        cap = str(row["caption"] or "")
+        marker = "\n\nM15 ·"
+        if marker in cap:
+            cap = cap.replace(marker, "\n\n" + note + marker, 1)
+        else:
+            cap = cap.rstrip() + "\n\n" + note
+        cur = con.execute(
+            "UPDATE group_outbox SET caption=?, updated_at=? "
+            "WHERE id=? AND status IN ('pending','sending')",
+            (cap, time.time(), row["id"]),
+        )
+        con.execute("COMMIT")
+        return cur.rowcount > 0
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
     finally:
         con.close()
 

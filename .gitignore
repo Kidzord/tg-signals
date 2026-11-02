@@ -22,6 +22,9 @@ state.db-wal
 state.db-shm
 monitor_state.json
 autoposts_state.json
+heartbeat_state.json
+*.corrupt-*
+*.tmp
 backups/
 crypto_paid.json
 tg_posts_used.json
@@ -43,3 +46,4 @@ mt5_ea/*.log
 # сборки EA и временные файлы
 *.ex5
 Ict2022EA_tmp.*
+devlog_state.json

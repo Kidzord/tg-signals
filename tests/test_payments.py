@@ -62,3 +62,75 @@ def test_revenue_by_source(env, monkeypatch, tmp_path):
     assert m["by_source"]["threads"]["paid"] == 1
     assert m["by_source"]["threads"]["revenue"] == 500
     assert "threads" in revenue.text_report(30)
+
+
+def test_extension_adds_to_remaining_days(env):
+    """Оплата при активной подписке не сжигает уже оплаченный остаток."""
+    before = time.time() + 20 * 86400
+    users = {"1": {"paid_until": before}}
+    assert subbot.apply_payment(users, provider="crypto", external_id="c-1",
+                                uid="1", days=30)
+    assert users["1"]["paid_until"] == pytest.approx(before + 30 * 86400, abs=5)
+
+
+def test_expired_subscription_starts_from_now(env):
+    users = {"1": {"paid_until": time.time() - 10 * 86400}}
+    assert subbot.apply_payment(users, provider="crypto", external_id="c-2",
+                                uid="1", days=30)
+    assert users["1"]["paid_until"] == pytest.approx(time.time() + 30 * 86400, abs=5)
+
+
+def test_absolute_stars_date_does_not_stack(env):
+    """Срок подписки Telegram — абсолютный: max(текущий, дата Telegram)."""
+    exp = time.time() + 30 * 86400
+    users = {"1": {"paid_until": time.time() + 20 * 86400}}
+    assert subbot.apply_payment(users, provider="stars", external_id="s-1",
+                                uid="1", days=30, until_ts=exp)
+    assert users["1"]["paid_until"] == pytest.approx(exp, abs=1)
+
+
+def test_payment_marks_granted(env):
+    users: dict = {}
+    subbot.apply_payment(users, provider="crypto", external_id="mark-1",
+                         uid="1", days=30)
+    row = store.payment_row("crypto", "mark-1")
+    assert row and row["granted_until"] > time.time() + 29 * 86400
+
+
+def test_reconcile_restores_ungranted_payment(env, monkeypatch):
+    monkeypatch.setattr(subbot, "alert_owner", lambda *a, **kw: None)
+    users = {"1": {"paid_until": 0}}
+    store.record_payment(provider="crypto", external_id="lost", uid="1", days=30)
+    subbot.reconcile_payments(users)
+    assert users["1"]["paid_until"] > time.time() + 29 * 86400
+    assert store.payment_row("crypto", "lost")["granted_until"] > 0
+
+
+def test_reconcile_skips_granted_payment(env, monkeypatch):
+    monkeypatch.setattr(subbot, "alert_owner", lambda *a, **kw: None)
+    users = {"1": {"paid_until": 0}}
+    store.record_payment(provider="crypto", external_id="ok", uid="1", days=30)
+    store.mark_payment_granted("crypto", "ok", 123.0)
+    subbot.reconcile_payments(users)
+    assert users["1"]["paid_until"] == 0
+
+
+def test_refund_of_expired_payment_keeps_current_subscription(env, monkeypatch):
+    monkeypatch.setattr(subbot, "reply", lambda *a, **kw: None)
+    monkeypatch.setattr(subbot, "alert_owner", lambda *a, **kw: None)
+    now = time.time()
+    users = {"1": {"paid_until": now + 30 * 86400}}
+    store.record_payment(provider="stars", external_id="old", uid="1", days=365)
+    con = store.connect()
+    con.execute("UPDATE payments SET created_at=? WHERE external_id='old'",
+                (now - 400 * 86400,))
+    con.close()
+    up = {"message": {"chat": {"id": 1},
+                      "refunded_payment": {"telegram_payment_charge_id": "old"}}}
+    subbot.handle_update(users, {}, up)
+    assert users["1"]["paid_until"] > now + 29 * 86400
+
+
+def test_trial_not_for_ex_payer(env):
+    store.record_payment(provider="stars", external_id="paid-1", uid="1", days=30)
+    assert subbot.trial_available({"1": {}}, "1") is False

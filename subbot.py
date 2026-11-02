@@ -34,6 +34,7 @@ import json
 import os
 import sys
 import time
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -50,8 +51,6 @@ import tg
 import threads_editor
 import tiktok_editor
 import track_record
-import ui_components
-import subbot_ui
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 USERS_PATH = os.path.join(HERE, "users.json")
@@ -197,7 +196,7 @@ def usd(v: float) -> str:
 
 
 def _date(ts: float) -> str:
-    return dt.datetime.fromtimestamp(ts, dt.timezone.utc).strftime("%d.%m.%Y")
+    return dt.datetime.fromtimestamp(ts, ZoneInfo(cfg.DISPLAY_TZ)).strftime("%d.%m.%Y")
 
 
 # ------------------------------------------------------------------ хранилище
@@ -237,10 +236,18 @@ def is_paid(users: dict, uid: str) -> bool:
 
 
 def grant(users: dict, uid: str, until_ts: float) -> None:
-    """Продлить подписку: оплата могла прийти заново до истечения срока."""
+    """Продлить подписку до абсолютного срока (оплата могла прийти заново)."""
     u = users.setdefault(uid, {})
     u["paid_until"] = max(paid_until(users, uid), until_ts)
     save_json(USERS_PATH, users)
+
+
+def extend_subscription(users: dict, uid: str, days: int) -> float:
+    """Добавить N дней к остатку: оплата при активной подписке не сжигает старый срок."""
+    base = max(time.time(), paid_until(users, uid))
+    until = base + max(0, int(days)) * 86400
+    grant(users, uid, until)
+    return until
 
 
 def alert_owner(text: str) -> None:
@@ -268,11 +275,41 @@ def apply_payment(users: dict, *, provider: str, external_id: str, uid: str,
     )
     if not new:
         return False
-    until = until_ts if until_ts and until_ts > 0 else time.time() + days * 86400
-    grant(users, uid, until)
+    try:
+        if until_ts and until_ts > 0:
+            # подписка Telegram: срок диктует Telegram, берём абсолютную дату
+            grant(users, uid, until_ts)
+            granted = paid_until(users, uid)
+        else:
+            # разовый платёж на N дней: прибавляем к остатку, а не от «сейчас»
+            granted = extend_subscription(users, uid, days)
+        # фиксируем факт выдачи: сверка при старте не продлит платёж повторно
+        store.mark_payment_granted(provider, external_id, granted)
+    except Exception:
+        # доступ не выдан — откатываем ledger, чтобы апдейт можно было повторить
+        store.delete_payment(provider, external_id)
+        raise
     if provider in ("stars", "crypto"):
         store.cancel_nurture(uid)
     return True
+
+
+def reconcile_payments(users: dict) -> None:
+    """Сверка ledger → users после падения между записью платежа и выдачей доступа."""
+    fixed = 0
+    for row in store.ungranted_payments(time.time() - 7 * 86400):
+        uid = str(row.get("uid") or "")
+        days = int(row.get("days") or 0)
+        if not uid or days <= 0:
+            continue
+        until = extend_subscription(users, uid, days)
+        store.mark_payment_granted(row["provider"], row["external_id"], until)
+        fixed += 1
+        alert_owner(
+            f"⚠️ Платёж <code>{row['provider']}/{row['external_id']}</code> был записан "
+            f"без выдачи доступа — восстановил: <code>{uid}</code> до {_date(until)}.")
+    if fixed:
+        print(f"сверка платежей: восстановлено {fixed}")
 
 
 def stops_today() -> int:
@@ -352,6 +389,11 @@ def process_deliveries(users: dict) -> None:
             if path and os.path.exists(path):
                 res = tg.send_photo_result(path, row["caption"], token=TOKEN,
                                            chat_id=row["chat_id"])
+                if (not res.ok and not res.blocked and not res.retry_after
+                        and int(row["attempts"]) >= 2):
+                    # фото стабильно отвергается (битое/слишком большое) — отдаём текстом
+                    res = tg.send_message_result(row["caption"], token=TOKEN,
+                                                 chat_id=row["chat_id"])
             else:
                 res = tg.send_message_result(row["caption"], token=TOKEN,
                                              chat_id=row["chat_id"])
@@ -360,7 +402,11 @@ def process_deliveries(users: dict) -> None:
             if mid is None:
                 if store.entry_pending_exists(str(row["trade_id"]), uid):
                     # вход ещё не ушёл — результат подождёт, иначе он обгонит карточку
-                    store.mark_delivery_retry(row["id"], "ждём карточку входа", 60)
+                    if time.time() - float(row["created_at"] or 0) > 86400:
+                        store.mark_delivery_terminal(row["id"], "failed",
+                                                     "карточка входа так и не доставлена")
+                    else:
+                        store.mark_delivery_retry(row["id"], "ждём карточку входа", 60)
                     continue
                 res = tg.send_message_result(row["caption"], token=TOKEN,
                                              chat_id=row["chat_id"])
@@ -368,6 +414,10 @@ def process_deliveries(users: dict) -> None:
                 caption = _with_status(
                     store.entry_caption(str(row["trade_id"]), uid), row["caption"])
                 res = tg.edit_caption_result(row["chat_id"], mid, caption, token=TOKEN)
+                if not res.ok and "not modified" in str(res.error or "").lower():
+                    # сообщение уже в нужном виде — это успех, а не повод дублировать
+                    store.mark_delivery_sent(row["id"])
+                    continue
                 if not res.ok and not res.blocked and not res.retry_after:
                     res = tg.send_message_result(row["caption"], token=TOKEN,
                                                  chat_id=row["chat_id"])
@@ -384,7 +434,12 @@ def process_deliveries(users: dict) -> None:
             alert_owner(f"⛔ Подписчик <code>{uid}</code> заблокировал бота — "
                         "исключён из рассылки.")
         elif res.retry_after:
-            store.mark_delivery_retry(row["id"], res.error, res.retry_after)
+            if int(row["attempts"]) + 1 >= cfg.DELIVERY_MAX_ATTEMPTS:
+                store.mark_delivery_terminal(row["id"], "failed", res.error)
+                alert_owner(f"❗ Не доставлено {row['kind']} {row['trade_id']} "
+                            f"→ <code>{uid}</code>\n429 держится: {res.error[:200]}")
+            else:
+                store.mark_delivery_retry(row["id"], res.error, res.retry_after)
         elif int(row["attempts"]) + 1 >= cfg.DELIVERY_MAX_ATTEMPTS:
             store.mark_delivery_terminal(row["id"], "failed", res.error)
             alert_owner(f"❗ Не доставлено {row['kind']} {row['trade_id']} "
@@ -568,6 +623,8 @@ def reward_referrer(users: dict, uid: str) -> None:
 
     if changed:
         save_json(USERS_PATH, users)
+        # оплатил или получил бонус — «триал заканчивается» больше не актуально
+        store.cancel_nurture(uid)
 
 
 def trial_available(users: dict, uid: str) -> bool:
@@ -575,7 +632,8 @@ def trial_available(users: dict, uid: str) -> bool:
     if not cfg.TRIAL_ENABLED or cfg.TRIAL_DAYS <= 0:
         return False
     u = users.get(uid) or {}
-    return not u.get("trial_used") and paid_until(users, uid) <= time.time()
+    return (not u.get("trial_used") and paid_until(users, uid) <= time.time()
+            and not store.has_paid_subscription(uid))
 
 
 def grant_trial(users: dict, uid: str) -> None:
@@ -590,9 +648,10 @@ def grant_trial(users: dict, uid: str) -> None:
                          amount=0.0, days=cfg.TRIAL_DAYS,
                          source=str(u.get("source", "") or ""),
                          raw={"source": "trial"})
-    # День 0 — сразу; день 1 — как читать карточку; день 3 — окончание.
+    # День 0 — сразу; день 1 — как читать карточку; «заканчивается» — за 12 ч до конца.
     store.enqueue_nurture(uid, "trial_day1", now + 86400)
-    store.enqueue_nurture(uid, "trial_day3", now + 2 * 86400 + 12 * 3600)
+    day3_at = until - 12 * 3600
+    store.enqueue_nurture(uid, "trial_day3", max(now + 3600, day3_at))
     tg.send_message(
         f"🎁 <b>Пробный доступ открыт на {cfg.TRIAL_DAYS} дн.</b>\n\n"
         + onboard_text(until), token=TOKEN, chat_id=uid,
@@ -777,7 +836,7 @@ def send_crypto(uid: str, days: int = 30) -> None:
 def send_status(uid: str, users: dict) -> None:
     ts = paid_until(users, uid)
     if ts <= time.time():
-        send_gate(uid)
+        send_gate(uid, users)
         return
     left = int((ts - time.time()) // 86400) + 1
     text = f"Подписка активна до <b>{_date(ts)}</b> (осталось {left} дн.)."
@@ -915,10 +974,10 @@ def send_premium(uid: str, users: dict) -> None:
         token=TOKEN, chat_id=uid, markup={"inline_keyboard": rows})
 
 
-def send_gate(uid: str) -> None:
+def send_gate(uid: str, users: dict | None = None) -> None:
     """Отказ без подписки — бренд-карточка и кнопка оплаты."""
     text = not_paid_text()
-    markup = menu_markup({}, uid)
+    markup = menu_markup(users or {}, uid)
     gate = asset("gate")
     if gate and os.path.exists(gate):
         sent, _ = tg.send_photo(gate, text, token=TOKEN, chat_id=uid, markup=markup)
@@ -1024,11 +1083,6 @@ def _edit_or_send(chat_id: str, mid: int, text: str, markup: dict, uid: str) -> 
 
 def handle_callback(users: dict, uid: str, chat_id: str, mid: int, data: str) -> dict | None:
     """Нажатия на inline-кнопки. Возвращает план, если он менялся."""
-
-    # Новые кнопки из ui_components
-    new_result = subbot_ui.handle_callback(data, uid, users)
-    if new_result is not None:
-        return new_result
 
     # Методички — бесплатно, поэтому до проверки подписки.
     if data == "edu:list":
@@ -1200,13 +1254,13 @@ def handle(users: dict, uid: str, raw: str, name: str = "") -> dict | None:
         if is_paid(users, uid):
             send_card(uid, users, name)
         else:
-            send_gate(uid)
+            send_gate(uid, users)
         return None
     if text == BTN_SETTINGS:
         if is_paid(users, uid):
             send_settings(uid, users)
         else:
-            send_gate(uid)
+            send_gate(uid, users)
         return None
     if text == BTN_HELP:
         reply(uid, HELP)
@@ -1296,6 +1350,7 @@ def handle(users: dict, uid: str, raw: str, name: str = "") -> dict | None:
         u["paid_until"] = until
         u["promo_used"] = sorted(set(used) | {code})
         save_json(USERS_PATH, users)
+        store.cancel_nurture(uid)
         reply(uid, f"🎁 Промокод применён: <b>+{days} дн.</b>\n"
                    f"Доступ активен до <b>{_date(until)}</b>.")
         return None
@@ -1376,7 +1431,7 @@ def handle(users: dict, uid: str, raw: str, name: str = "") -> dict | None:
 
     # остальное — только по активной подписке
     if not is_paid(users, uid):
-        send_gate(uid)
+        send_gate(uid, users)
         return None
 
     if cmd in ("mycard", "card", "account"):
@@ -1562,13 +1617,18 @@ def remind_expiring(users: dict) -> None:
             continue
         if users[uid].get("reminded_for") == until:
             continue
-        tg.send_message(
+        res = tg.send_message_result(
             remind_text(until), token=TOKEN, chat_id=uid,
             markup={"inline_keyboard": [[
                 {"text": f"🔄 Продлить — {cfg.SUB_PRICE_STARS} ⭐",
                  "callback_data": "buy"}]]})
-        users[uid]["reminded_for"] = until
-        changed = True
+        if res.ok:
+            users[uid]["reminded_for"] = until
+            changed = True
+        elif res.blocked:
+            users[uid]["blocked"] = 1
+            changed = True
+        # 429/сеть: напомним в следующий проход, reminded_for не ставим
     if changed:
         save_json(USERS_PATH, users)
 
@@ -1586,6 +1646,8 @@ def migrate_crypto_seen() -> None:
             continue
         if store.record_payment(provider="crypto", external_id=str(iid), uid=uid,
                                 amount=0.0, days=30, raw={"migrated": True, **rec}):
+            # старые счета уже были выданы через crypto_paid.json — не выдаём повторно
+            store.mark_payment_granted("crypto", str(iid), time.time())
             n += 1
     print(f"crypto: старых счетов перенесено в ledger: {n}")
 
@@ -1617,17 +1679,15 @@ def poll_crypto(users: dict) -> bool:
         except ValueError:
             days = 30
         days = max(1, min(days, 3650))
-        new = store.record_payment(
-            provider="crypto", external_id=iid, uid=uid,
+        new = apply_payment(
+            users, provider="crypto", external_id=iid, uid=uid,
             amount=float(inv.get("amount", 0) or 0),
             currency=str(inv.get("asset", "") or ""), days=days,
-            source=str((users.get(uid) or {}).get("source", "") or ""),
             raw=inv,
         )
         if not new:
             continue
-        until = time.time() + days * 86400
-        grant(users, uid, until)
+        until = paid_until(users, uid)
         got += 1
         print(f"крипта: счёт {iid} · {uid} · +{days} дн. до {_date(until)}")
         tg.send_message(onboard_text(until), token=TOKEN, chat_id=uid,
@@ -1685,13 +1745,29 @@ def handle_update(users: dict, state: dict, up: dict) -> None:
     if refund:
         charge = str(refund.get("telegram_payment_charge_id")
                      or refund.get("provider_payment_charge_id") or "")
-        if charge and store.mark_payment_refunded(provider="stars", external_id=charge):
-            days = store.payment_days("stars", charge) or 30
+        if not charge:
+            alert_owner(f"💸 Возврат Stars без charge_id · <code>{uid}</code>")
+            return
+        row = store.payment_row("stars", charge)
+        if not row or not store.mark_payment_refunded(provider="stars", external_id=charge):
+            alert_owner(f"💸 Возврат Stars по неизвестному платежу "
+                        f"<code>{charge}</code> · <code>{uid}</code>")
+            return
+        days = int(row.get("days") or 30)
+        now = time.time()
+        until = paid_until(users, uid)
+        cut = days * 86400.0
+        # вернули уже истёкший период — текущую подписку не трогаем
+        if float(row.get("created_at") or 0) + cut <= now:
+            cut = 0.0
+        # и никогда не уводим доступ в прошлое
+        cut = min(cut, max(0.0, until - now))
+        if cut > 0:
             u = users.setdefault(uid, {})
-            u["paid_until"] = max(time.time(), paid_until(users, uid) - days * 86400)
+            u["paid_until"] = max(now, until - cut)
             save_json(USERS_PATH, users)
-            alert_owner(f"💸 Возврат Stars: <code>{uid}</code> · charge <code>{charge}</code>")
-            reply(uid, "Возврат получен. Срок подписки скорректирован.")
+        alert_owner(f"💸 Возврат Stars: <code>{uid}</code> · charge <code>{charge}</code>")
+        reply(uid, "Возврат получен. Срок подписки скорректирован.")
         return
 
     payment = msg.get("successful_payment")
@@ -1703,22 +1779,26 @@ def handle_update(users: dict, state: dict, up: dict) -> None:
             if len(parts) > 2 and parts[2].strip().isdigit():
                 days = max(1, min(int(parts[2]), 3650))
         exp = float(payment.get("subscription_expiration_date") or 0)
-        until = exp if exp > time.time() else time.time() + days * 86400
+        # абсолютный срок диктует только подписка Telegram; годовой пакет — разовый
+        until_ts = exp if exp > time.time() else None
         charge = str(payment.get("telegram_payment_charge_id")
                      or payment.get("provider_payment_charge_id") or "")
         if not charge:
-            # Без charge_id идемпотентность невозможна; такой апдейт — аномалия.
-            charge = f"{uid}:{payment.get('total_amount')}:{payload}:{int(time.time())}"
+            # Стабильный ключ из самого апдейта: повтор не продлит подписку дважды.
+            stamp = int(msg.get("date") or 0)
+            charge = f"{uid}:{payment.get('total_amount')}:{payload}:{stamp}"
+            alert_owner(f"⚠️ Stars без charge_id — использую ключ <code>{charge}</code>")
         new = apply_payment(
             users, provider="stars", external_id=charge, uid=uid,
             amount=float(payment.get("total_amount", 0) or 0), currency="XTR",
-            days=days, until_ts=until, raw=payment,
+            days=days, until_ts=until_ts, raw=payment,
         )
-        print(f"оплата: {uid} · +{days} дн. до {_date(until)} · "
+        granted = paid_until(users, uid)
+        print(f"оплата: {uid} · +{days} дн. до {_date(granted)} · "
               f"recurring={payment.get('is_recurring')} · "
               f"{'новая' if new else 'повтор, пропущено'}")
         if new:
-            tg.send_message(onboard_text(until), token=TOKEN, chat_id=uid,
+            tg.send_message(onboard_text(granted), token=TOKEN, chat_id=uid,
                             markup=menu_markup(users, uid))
             reward_referrer(users, uid)
         return
@@ -1743,12 +1823,10 @@ def main() -> None:
         print("не задан SUB_BOT_TOKEN в .env — premium-бот не запущен")
         return
 
-    # Инициализация UI компонент
-    subbot_ui.init(USERS_PATH, TOKEN)
-
     store.init_db()
     migrate_crypto_seen()
     users = load_json(USERS_PATH)
+    reconcile_payments(users)
     state = load_json(STATE_PATH)
     ASSETS.update(brand.ensure_brand_assets(BRAND_DIR))
     paid = sum(1 for uid in users if is_paid(users, uid))
@@ -1777,24 +1855,62 @@ def main() -> None:
     next_remind = 0.0
     next_crypto = 0.0
     crypto_fail = 0
+    update_fails: dict[int, int] = {}
+    step_fails: dict[str, int] = {}
+
+    def run_step(name: str, fn) -> bool:
+        """Периодический шаг не должен ронять весь premium-бот."""
+        try:
+            fn()
+            step_fails.pop(name, None)
+            return True
+        except Exception as e:
+            n = step_fails.get(name, 0) + 1
+            step_fails[name] = n
+            print(f"ошибка шага {name}: {e!r}")
+            if n in (1, 10) or n % 50 == 0:
+                alert_owner(f"⚠️ Premium-бот: шаг <b>{name}</b> падает {n} раз подряд.\n"
+                            f"<code>{e!r}</code>")
+            return False
+
     try:
         while True:
             updates = tg.get_updates(offset=offset, timeout=POLL_TIMEOUT, token=TOKEN)
             for up in updates:
-                offset = up["update_id"] + 1
+                upd_id = int(up.get("update_id", 0))
                 try:
                     handle_update(users, state, up)
+                    offset = upd_id + 1
+                    update_fails.pop(upd_id, None)
                 except Exception as e:
+                    # апдейт не подтверждаем: повторная попытка не потеряет оплату
+                    n = update_fails.get(upd_id, 0) + 1
+                    update_fails[upd_id] = n
                     print("ошибка обработки апдейта:", repr(e))
-            poll_signals(users, state)
-            poll_results(users, state)
-            process_deliveries(users)
-            process_nurture(users)
+                    if n in (1, 3):
+                        alert_owner(f"⚠️ Ошибка обработки апдейта {upd_id} "
+                                    f"(попытка {n}): <code>{e!r}</code>")
+                    if n >= 5:
+                        offset = upd_id + 1
+                        update_fails.pop(upd_id, None)
+                        alert_owner(f"❗ Апдейт {upd_id} пропущен после 5 попыток.")
+                    else:
+                        break
+            run_step("signals", lambda: poll_signals(users, state))
+            run_step("results", lambda: poll_results(users, state))
+            run_step("deliveries", lambda: process_deliveries(users))
+            run_step("nurture", lambda: process_nurture(users))
             if time.time() >= next_remind:
-                remind_expiring(users)
-                next_remind = time.time() + REMIND_EVERY_SEC
+                next_remind = time.time() + (
+                    REMIND_EVERY_SEC if run_step("remind", lambda: remind_expiring(users))
+                    else 300)
             if time.time() >= next_crypto:
-                if poll_crypto(users):
+                try:
+                    crypto_ok = poll_crypto(users)
+                except Exception as e:
+                    print("ошибка crypto:", repr(e))
+                    crypto_ok = False
+                if crypto_ok:
                     crypto_fail = 0
                     next_crypto = time.time() + CRYPTO_POLL_SEC
                 else:

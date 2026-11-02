@@ -63,3 +63,16 @@ def test_owner_tt_command(monkeypatch):
                         lambda uid, token: called.append(uid) or True)
     subbot.handle({}, "42", "/tt")
     assert called == ["42"]
+
+def test_story_slides_carry_journal_hook():
+    slides = tiktok_editor._story_slides(7, "KidzordFX")
+    titles = [s[1] for s in slides]
+    assert titles[0] == "ДЕНЬ 7"
+    bodies = " ".join(s[2] for s in slides)
+    assert "написал не я" in bodies
+    assert "ИЩУ ТЕСТЕРОВ" in titles
+    assert "Telegram: @KidzordFX" in bodies
+    # каждый слайд влезает в шаблон карточки: 2 строки заголовка, 7 строк текста
+    for _, title, body, _ in slides:
+        assert len(title) <= 32
+        assert len(body.splitlines()) <= 5

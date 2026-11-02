@@ -44,11 +44,22 @@ def load_trades(days: int | None = None) -> list[dict[str, Any]]:
                     "ts": ts, "r": r, "symbol": str(d.get("symbol", "")),
                     "side": str(d.get("side", "")), "kind": str(d.get("kind", "")),
                     "strategy": str(d.get("strategy", "")),
+                    "trade_id": str(d.get("trade_id", "")),
                 })
     except OSError:
         pass
     rows.sort(key=lambda x: x["ts"])
-    return rows
+    # дубль строки после рестарта не должен удваивать R в публичном трек-рекорде
+    uniq: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for rec in reversed(rows):
+        key = (rec["trade_id"], rec["kind"])
+        if rec["trade_id"] and key in seen:
+            continue
+        seen.add(key)
+        uniq.append(rec)
+    uniq.reverse()
+    return uniq
 
 
 def metrics(trades: list[dict[str, Any]]) -> dict[str, Any]:

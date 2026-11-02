@@ -18,6 +18,7 @@ import re
 from PIL import Image
 
 import config as cfg
+import devlog
 import render as card
 import tg
 import threads_editor
@@ -67,7 +68,8 @@ def _fit(src: str, name: str) -> str | None:
 
 
 def _generic(n: int, title: str, body: str, name: str) -> str | None:
-    src = threads_editor._generic_image(n, {"title": title, "text": body})
+    src = threads_editor._generic_image(n, {"title": title, "text": body,
+                                            "label": ""})
     return _fit(src, name)
 
 
@@ -83,20 +85,25 @@ def _latest_trade() -> dict | None:
 
 
 def caption() -> str:
-    """Короткий текст для TikTok (до 2200 символов)."""
+    """Короткий текст для TikTok (до 2200 символов), в тоне дневника разработки."""
     handle = (cfg.CHANNEL_HANDLE or "@KidzordFX").lstrip("@")
-    lines = ["Один вход, один стоп, один выход — и результат в R."]
+    day_no = devlog.day_number()
+    lines = [f"День {day_no} дневника. Я — обычный парень, месяц пилю торгового "
+             "бота: канал и соцсети ведёт он сам, я пишу код и вычитываю."]
     trade = _latest_trade()
     if trade:
         r = float(trade.get("total_r", trade.get("r", 0)) or 0)
         lines.append(f"Последняя сделка: {trade.get('symbol', '')} {r:+.1f}R. "
-                     "Вход, стоп и выход — в карусели.")
+                     "Вход, стоп и выход — в карусели, цифры из журнала сделок.")
     else:
         sig = _latest_signal()
         if sig:
             lines.append(f"Свежий сигнал: {sig.get('side', '')} {sig.get('symbol', '')}. "
                          "Вход, стоп и цели — в карусели.")
-    lines.append(f"Полный журнал сделок — в Telegram: t.me/{handle}")
+    note = devlog.next_devnote()
+    if note:
+        lines.append(f"В разработке: {note}.")
+    lines.append(f"Полный дневник и журнал сделок — в Telegram: t.me/{handle}")
     days = cfg.PROMO_CODES.get("TIKTOK")
     if days:
         lines.append(f"Промокод TIKTOK: +{days} дн. к доступу в боте.")
@@ -104,32 +111,61 @@ def caption() -> str:
     return "\n".join(lines)
 
 
-def build() -> tuple[list[str], str]:
-    """Собрать 5–6 картинок: обложка, вход, выход, счёт, статистика, CTA."""
-    images: list[str] = []
+def _story_slides(day_no: int, handle: str) -> list[tuple[int, str, str, str]]:
+    """Сюжетные слайды дневника: (сид картинки, заголовок, текст, имя файла).
 
-    cover = _generic(200, "ЖУРНАЛ СДЕЛОК",
-                     "Вход. Стоп. Выход. Результат в R.\n"
-                     "Без «100% винрейта» — публикуем и стопы.", "01_cover")
-    if cover:
-        images.append(cover)
+    Первые три — обложка и рассказ, кто пишет; последние два — набор тестеров
+    и CTA. Между ними бот вставляет реальные карточки: вход, выход, счёт, equity.
+    """
+    return [
+        (210, f"ДЕНЬ {day_no}",
+         "Этот пост написал не я.\n"
+         "Его написал бот, которого пишу я.\n\n"
+         "Месяц пилю торгового бота.", "01_cover"),
+        (211, "КТО ЗДЕСЬ ПИШЕТ",
+         "Обычный парень. Код — по вечерам, вместе с ИИ.\n"
+         "Канал и соцсети ведёт сам бот.", "02_who"),
+        (212, "ЧТО БУДЕТ В ДНЕВНИКЕ",
+         "Код. Сделки. Стопы. Цифры из журнала.\n"
+         "Ничего не рисую, ничего не удаляю.", "03_what"),
+        (213, "ИЩУ ТЕСТЕРОВ",
+         "Заходи в группу в Telegram: покрути бота, поломай, поругай.\n"
+         "Бесплатно — за фидбек.", "08_testers"),
+        (214, "ДНЕВНИК РАЗРАБОТКИ",
+         "Каждый день: что добавил в код.\n"
+         "Каждая сделка: вход, стоп, итог.\n"
+         f"Telegram: @{handle}", "09_cta"),
+    ]
+
+
+def build() -> tuple[list[str], str]:
+    """Собрать карусель: сюжет дневника + настоящие карточки сделок и цифр."""
+    images: list[str] = []
+    day_no = devlog.day_number()
+    handle = (cfg.CHANNEL_HANDLE or "@KidzordFX").lstrip("@")
+    story = _story_slides(day_no, handle)
+
+    for seed, title, body, name in story[:3]:
+        img = _generic(seed, title, body, name)
+        if img:
+            images.append(img)
 
     sig = _latest_signal()
     if sig:
-        entry = _fit(str(sig.get("path", "") or ""), "02_entry")
+        entry = _fit(str(sig.get("path", "") or ""), "04_entry")
         if entry:
             images.append(entry)
 
     trade = _latest_trade()
     if trade:
-        exit_img = _fit(str(trade.get("image", "") or ""), "03_exit")
+        exit_img = _fit(str(trade.get("image", "") or ""), "05_exit")
         if exit_img:
             images.append(exit_img)
 
     # План счёта: не реальный баланс, а правила риска. Без номеров счёта.
     try:
         os.makedirs(OUT_DIR, exist_ok=True)
-        plan_path = os.path.join(OUT_DIR, "04_account.png")
+        plan_path = os.path.join(OUT_DIR, "06_account.png")
         card.render_account_card(card.AccountPlan(
             deposit=cfg.PLAN_DEPOSIT,
             risk_pct=cfg.PLAN_RISK_PCT,
@@ -140,7 +176,7 @@ def build() -> tuple[list[str], str]:
             handle=cfg.CHANNEL_HANDLE,
             when=dt.datetime.now(dt.timezone.utc),
         ), plan_path)
-        fitted = _fit(plan_path, "04_account")
+        fitted = _fit(plan_path, "06_account")
         if fitted:
             images.append(fitted)
     except Exception as e:
@@ -148,19 +184,17 @@ def build() -> tuple[list[str], str]:
 
     try:
         eq = track_record.render_equity(
-            30, out_path=os.path.join(OUT_DIR, "05_equity.png"), portrait=True)
-        fitted = _fit(eq, "05_equity")
+            30, out_path=os.path.join(OUT_DIR, "07_equity.png"), portrait=True)
+        fitted = _fit(eq, "07_equity")
         if fitted:
             images.append(fitted)
     except Exception as e:
         print("tiktok: equity не отрисовалась", e)
 
-    handle = (cfg.CHANNEL_HANDLE or "@KidzordFX").lstrip("@")
-    cta = _generic(201, "ПОЛНЫЙ ЖУРНАЛ",
-                   f"Каждая сделка: вход, стоп, цели, результат.\n"
-                   f"Telegram: @{handle}", "06_cta")
-    if cta:
-        images.append(cta)
+    for seed, title, body, name in story[3:]:
+        img = _generic(seed, title, body, name)
+        if img:
+            images.append(img)
 
     # Дубликаты бывают, если сигнал и результат ссылаются на один файл.
     seen: set[str] = set()
@@ -175,8 +209,9 @@ def send(chat_id: str, token: str | None = None) -> bool:
                       token=token, chat_id=chat_id)
         return False
     res = tg.send_media_group(
-        images, caption="🎠 <b>Карусель для TikTok</b>\n"
-                        "Сохрани фото по порядку — они уже готовы для загрузки.",
+        images, caption="🎠 <b>Карусель для TikTok · дневник</b>\n"
+                        "Порядок: крючок → кто пишет → что в дневнике → сделки "
+                        "и цифры → тестеры → CTA. Сохрани фото как есть.",
         token=token, chat_id=chat_id)
     if not res.ok:
         tg.send_plain(f"Альбом не ушёл: {res.error[:200]}", token=token, chat_id=chat_id)

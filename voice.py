@@ -125,3 +125,14 @@ def event_text(kind: str, symbol: str, side: str, r: float, note: str = "") -> s
         txt += " " + note[0].upper() + note[1:] + "."
     emoji = KIND_EMOJI.get(kind, "•")
     return f"{emoji} <b>{symbol}</b> · {'лонг' if side == 'LONG' else 'шорт'}\n{txt}"
+
+
+def outcome_line(kind: str, r: float, note: str = "") -> str:
+    """Компактный итог сделки для склейки с отложенным входом в бесплатной группе."""
+    opts = EVENT.get(kind) or EVENT["sl"]
+    line = _pick(opts, f"merge{kind}{r:.2f}")
+    rtxt = f"{r:+.2f}R" if abs(r) > 0.001 else "0R"
+    txt = f"{KIND_EMOJI.get(kind, '•')} Итог: " + line.format(r=rtxt)
+    if note:
+        txt += " " + note[0].upper() + note[1:] + "."
+    return txt

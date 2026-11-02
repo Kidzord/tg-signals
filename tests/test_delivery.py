@@ -93,3 +93,87 @@ def test_blocked_user_is_excluded(db, monkeypatch):
     subbot.process_deliveries(users)
     assert users["1"].get("blocked") == 1
     assert store.delivery_stats()["blocked"]["n"] == 1
+
+
+# ------------------------------------------------- склейка итога с входом в группе
+
+import bot  # noqa: E402
+
+
+def _group_entry(trade_id: str, due: float) -> bool:
+    return store.enqueue_group(
+        trade_id=trade_id, kind="entry", path="",
+        caption="На AUDUSD сняли хай — шорт.\n\nРаботаю до цели.\n\n"
+                "M15 · 02.11 16:15 сервер · MT5\n<i>Не рекомендация.</i>\n\n"
+                "⚡ Premium",
+        due_ts=due, entry=0.70042, side="SHORT", symbol="AUDUSD")
+
+
+def _capture_group_sends(monkeypatch) -> list[str]:
+    sent: list[str] = []
+    monkeypatch.setattr(bot.tg, "send_message_result",
+                        lambda caption, **kw: (sent.append(caption), tg.ApiResult(True))[1])
+    return sent
+
+
+def test_group_result_glues_into_pending_entry(db, monkeypatch):
+    """Сделка закрылась внутри FREE_DELAY_SEC — одна карточка «вход + итог»."""
+    monkeypatch.setattr(bot, "SYMBOL", "AUDUSD")
+    assert _group_entry("g1", time.time() - 10)
+    sent = _capture_group_sends(monkeypatch)
+    bot.deliver_group_result(trade_id="g1", kind="sl", r=-1.0, note="",
+                             text="🛑 отдельный итог", path="",
+                             entry=0.70042, side="SHORT")
+    bot.flush_pending()
+    assert len(sent) == 1, "склеенный итог не должен уходить отдельным сообщением"
+    cap = sent[0]
+    assert "Итог:" in cap and "отдельный итог" not in cap
+    assert cap.index("Итог:") < cap.index("M15 ·"), "итог перед подвалом карточки"
+    assert "⚡ Premium" in cap, "CTA остаётся в конце"
+
+
+def test_group_result_separate_after_entry_sent(db, monkeypatch):
+    monkeypatch.setattr(bot, "SYMBOL", "AUDUSD")
+    assert _group_entry("g2", time.time() - 10)
+    sent = _capture_group_sends(monkeypatch)
+    bot.flush_pending()                       # вход уже ушёл
+    assert store.group_pending_entry("g2") is None
+    bot.deliver_group_result(trade_id="g2", kind="tp", r=3.0, note="",
+                             text="✅ отдельный итог", path="",
+                             entry=0.70042, side="SHORT")
+    bot.flush_pending()
+    assert len(sent) == 2
+    assert sent[1] == "✅ отдельный итог"
+
+
+def test_group_result_delayed_until_entry_due(db, monkeypatch):
+    """Вход ещё ждёт задержку, итог не должен выйти раньше карточки."""
+    monkeypatch.setattr(bot, "SYMBOL", "AUDUSD")
+    assert _group_entry("g3", time.time() + 1800)
+    sent = _capture_group_sends(monkeypatch)
+    bot.flush_pending()                       # ничего не должно уйти
+    assert sent == []
+    bot.deliver_group_result(trade_id="g3", kind="sl", r=-1.0, note="",
+                             text="🛑 отдельный итог", path="",
+                             entry=0.70042, side="SHORT")
+    bot.flush_pending()
+    assert sent == [], "итог приклеился — отдельных сообщений нет"
+    assert store.group_pending_count() == 1, "ждёт только отложенный вход"
+
+
+def test_group_late_note_skipped_for_merged(db, monkeypatch):
+    """На склеенной карточке «цена ушла» неуместна — сделка уже закрыта."""
+    monkeypatch.setattr(bot, "SYMBOL", "AUDUSD")
+    monkeypatch.setattr(bot, "_late_note", lambda row, data: "\n⚠️ Цена ушла")
+    assert _group_entry("g4", time.time() - 10)
+    assert store.append_group_outcome("g4", "✅ Итог: Цель взята, +3.00R.")
+    sent = _capture_group_sends(monkeypatch)
+    bot.flush_pending()
+    assert sent and "Цена ушла" not in sent[0]
+
+
+def test_append_group_outcome_false_after_entry_sent(db):
+    assert _group_entry("g5", time.time() - 10)
+    rows = store.claim_group()
+    store.mark_group_sent(rows[0]["id"])
+    assert store.append_group_outcome("g5", "🛑 Итог: Минус, -1.00R.") is False

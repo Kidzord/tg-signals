@@ -22,6 +22,7 @@ import time
 import urllib.parse
 
 import config as cfg
+import devlog
 import render as card
 import tg
 import theme
@@ -96,7 +97,9 @@ def _generic_image(n: int, post: dict) -> str:
            display=True, color=theme.LABEL)
     c.text(0.06, 0.905, theme.spaced("ЖУРНАЛ СДЕЛОК"), size=8.5,
            color=theme.LABEL3)
-    c.text(0.94, 0.945, f"#{n:02d}", size=13, color=theme.ACCENT, ha="right")
+    label = post.get("label", f"#{n:02d}")
+    if label:
+        c.text(0.94, 0.945, str(label), size=13, color=theme.ACCENT, ha="right")
     c.hairline(0.06, 0.94, 0.875)
 
     y = 0.80
@@ -160,22 +163,73 @@ def send_signal(chat_id: str, token: str | None = None) -> bool:
         tg.send_plain("📈 Пока нет нового сигнала для Threads.",
                       token=token, chat_id=chat_id)
         return False
-    text = _finish(str(rec.get("caption", "")))
     image = str(rec.get("path", "") or "")
-    side = "LONG" if str(rec.get("side", "")).upper() == "LONG" else "SHORT"
-    caption = (f"📈 <b>Сигнал {side} {rec.get('symbol', '')}</b>\n"
+    symbol = str(rec.get("symbol", ""))
+    side = "лонг" if str(rec.get("side", "")).upper() == "LONG" else "шорт"
+    entry = float(rec.get("entry") or 0)
+    sl = float(rec.get("sl") or 0)
+    tp1 = float(rec.get("tp1") or 0)
+    if entry > 0 and sl > 0:
+        levels = f"Вход {entry:g}, стоп {sl:g}"
+        if tp1 > 0:
+            levels += f", цель {tp1:g}"
+        body = (f"День {devlog.day_number()}. Бот нашёл сетап: {side} {symbol}.\n"
+                f"{levels}.\n"
+                "Работаю до цели. Итог будет в журнале — вместе со стопами.")
+        text = _finish(body)
+    else:
+        text = _finish(str(rec.get("caption", "")))
+    caption = (f"📈 <b>Сигнал {side} {symbol}</b>\n"
                "Карточка готова. Текст ниже — для Threads.")
     return _send(chat_id, token, image, caption, text)
 
 
 def send_week(chat_id: str, token: str | None = None) -> bool:
-    text = _finish(track_record.text_report(7))
+    text = _finish(f"День {devlog.day_number()}.\n" + track_record.text_report(7))
     os.makedirs(RENDERS, exist_ok=True)
     image = track_record.render_equity(
         7, out_path=os.path.join(RENDERS, "threads_week.png"), portrait=True)
     caption = ("📊 <b>Итог недели</b>\n"
                "Картинка 1080×1350. Текст ниже — для Threads.")
     return _send(chat_id, token, image or None, caption, text)
+
+
+_RESULT_VOICE: dict[str, tuple[str, ...]] = {
+    "sl": (
+        "Бот вошёл по правилам, рынок сказал «нет». Журнал записал — идём дальше.",
+        "Стоп. Не каждый сетап выживает — потому и дневник, а не витрина.",
+        "Выбило по стопу. Риск был ограничен, эмоций ноль — за это и код.",
+    ),
+    "tp3": (
+        "Бот дожал финальную цель, я не мешал. Математика 3R против 1R работает.",
+        "Полный выход по цели. Заход скучный, выход по плану — иначе и не надо.",
+    ),
+    "tp": (
+        "Бот дожал цель, я не мешал. Одна 3R перекрывает три стопа.",
+        "Плюс. Такие сделки обычно пропускаешь глазами — а они и кормят.",
+    ),
+    "be": (
+        "Ноль. Выход в безубытке: часть спасли, часть отдали рынку. Так задумано.",
+        "В ноль — не минус. Правила сработали, идея не взлетела.",
+    ),
+    "time": (
+        "Закрыл по времени: идея выдохлась. Журнал честный, даже скучный.",
+        "Тайм-аут. Сетап не отработал за отведённое — фиксируем и дальше.",
+    ),
+}
+
+_RESULT_CLOSERS = (
+    "Публикую и плюсы, и минусы — это журнал, не витрина.",
+    "Цифры из журнала сделок, рисовать тут нечего.",
+    "Минусы публикую так же спокойно, как плюсы. Так работает дневник.",
+)
+
+
+def _pick(options: tuple[str, ...], seed: str) -> str:
+    import hashlib
+
+    h = int(hashlib.md5(seed.encode()).hexdigest()[:8], 16)
+    return options[h % len(options)]
 
 
 def send_result(chat_id: str, token: str | None = None) -> bool:
@@ -187,17 +241,14 @@ def send_result(chat_id: str, token: str | None = None) -> bool:
     kind = str(rec.get("kind", ""))
     r = float(rec.get("total_r", rec.get("r", 0)) or 0)
     symbol = str(rec.get("symbol", ""))
-    side = str(rec.get("side", ""))
+    side = "лонг" if str(rec.get("side", "")).upper() == "LONG" else "шорт"
     emoji = {"sl": "🛑", "tp3": "🏁", "tp": "✅", "be": "⚪", "time": "⏱"}.get(kind, "📌")
-    label = {
-        "sl": "Стоп по правилам.",
-        "tp3": "Цель взята.",
-        "tp": "Цель взята.",
-        "be": "Безубыток.",
-        "time": "Закрыл по времени.",
-    }.get(kind, "Сделка закрыта.")
-    body = (f"{emoji} {symbol}, {'лонг' if side == 'LONG' else 'шорт'}: {r:+.1f}R\n"
-            f"{label}\nПубликую и минусы, и плюсы — это и есть журнал.")
+    seed = str(rec.get("trade_id", "") or f"{symbol}{r}")
+    line = _pick(_RESULT_VOICE.get(kind) or _RESULT_VOICE["sl"], seed)
+    closer = _pick(_RESULT_CLOSERS, seed + "closer")
+    body = (f"День {devlog.day_number()}.\n"
+            f"{emoji} {symbol}, {side}: {r:+.1f}R\n"
+            f"{line}\n{closer}")
     text = _finish(body)
 
     image = str(rec.get("image") or "")
