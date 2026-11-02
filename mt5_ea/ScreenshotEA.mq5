@@ -234,6 +234,14 @@ void CheckRequest()
       return;
    }
 
+   // Ждём, пока терминал подтянет историю для нового графика.
+   int wait = 0;
+   while(Bars(symbol, tf) == 0 && wait < 50)
+   {
+      Sleep(100);
+      wait++;
+   }
+
    ConfigureChart(chart);
    DrawLevels(chart, symbol, side, label, entry, stop, tp1, tp2, tp3, exit_px, r);
    ChartRedraw(chart);
