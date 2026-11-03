@@ -133,24 +133,115 @@ def _note_stop(stops: dict, entry: float, side: str) -> None:
     stops[key] = stops.get(key, 0) + 1
 
 
+def side_ok(side: str, mode: str) -> bool:
+    """Разрешена ли сторона сделки: both / short / long."""
+    mode = (mode or "both").strip().lower()
+    if mode in ("short", "шорт", "sell"):
+        return side.upper() == "SHORT"
+    if mode in ("long", "лонг", "buy"):
+        return side.upper() == "LONG"
+    return True
+
+
+def trend_ok(htf_frame: st.Frame, ts: float, side: str, mode: str) -> bool:
+    """Совпадает ли сделка с направлением H4 EMA200 (последний закрытый бар).
+
+    mode: off — без фильтра; with — только по тренду; against — только против.
+    Нет EMA (мало истории) — пропускаем сделку (fail-open, как в live).
+    """
+    mode = (mode or "off").strip().lower()
+    if mode not in ("with", "against"):
+        return True
+    if htf_frame is None or len(htf_frame.c) < 210:
+        return True
+    ema = ta.ema(htf_frame.c, 200)
+    j = int(np.searchsorted(htf_frame.t, ts, side="right")) - 2
+    if j < 0 or j >= len(ema) or np.isnan(ema[j]):
+        return True
+    up = float(htf_frame.c[j]) > float(ema[j])
+    long_ = side.upper() == "LONG"
+    if mode == "with":
+        return up if long_ else not up
+    return (not up) if long_ else up
+
+
 def backtest(chart: st.Frame, zones: list[dict], htf_frame: st.Frame,
              stop_pts: float = 4.0, tp_r: float = 2.0, max_bars: int = 120,
              min_rr: float = 1.0, stop_mode: str = "points", swing_len: int = 12,
              stop_buf: float = 0.0, max_stop_pts: float = 20.0,
              max_stops: int = 2, stop_atr: float = 0.0, max_r: float = 4.0,
              session: str = "", smt=None, smt_look: int = 0,
-             entry_model: str = "next_open", er_max: float = 0.0) -> list[dict]:
+             entry_model: str = "next_open", er_max: float = 0.0,
+             side_allow: str = "both", limit_bars: int = 8,
+             stats: dict | None = None,
+             be_after_r: float = 0.0,
+             trend_filter: str = "off",
+             atr_ratio_min: float = 0.0, atr_ratio_max: float = 0.0,
+             confirm_atr: float = 0.0,
+             trail_after_r: float = 0.0, trail_k: float = 2.0,
+             zone_min_age: int = 0, zone_max_age: int = 0,
+             d1_tol: float = 0.0) -> list[dict]:
     """entry_model:
-      next_open — вход по рынку на открытии следующего бара (реалистично);
-      limit     — лимитка по цене уровня исполняется на баре сигнала (старая
-                  оптимистичная модель, для сравнения).
-    er_max > 0 — фильтр Kaufman ER до входа, как в живом боте."""
+      next_open    — вход по рынку на открытии следующего бара (реалистично);
+      limit        — лимитка по цене уровня исполняется на баре сигнала (старая
+                     оптимистичная модель, для сравнения);
+      limit_retest — лимитка по цене уровня, активная limit_bars баров ПОСЛЕ
+                     сигнала; заполняется только если цена вернулась к уровню.
+                     stats (если передан) получает signals/fills/cancelled.
+    er_max > 0 — фильтр Kaufman ER до входа, как в живом боте.
+
+    Доп. фильтры (0/off — выключены): be_after_r — перевод стопа в БУ после
+    N R; trend_filter — with/against направления H4 EMA200; atr_ratio_min/max —
+    коридор ATR14/ATR100; confirm_atr — закрытие за границей зоны на N ATR;
+    trail_after_r/trail_k — трейлинг по закрытию на K ATR после N R;
+    zone_min_age/zone_max_age — возраст зоны в H4-барах;
+    d1_tol — уровень зоны должен быть в N ATR от PDH/PDL прошлого дня."""
     n = len(chart.c)
     atr_h = ta.atr(htf_frame.h, htf_frame.l, htf_frame.c, 14)
     idx = np.searchsorted(htf_frame.t, chart.t, side="right") - 1
 
     atr_c = ta.atr(chart.h, chart.l, chart.c, 14)
     er = ta.efficiency_ratio(chart.c) if er_max > 0 else None
+    atr_slow = ta.atr(chart.h, chart.l, chart.c, 100) \
+        if (atr_ratio_min > 0 or atr_ratio_max > 0) else None
+    trend_up = trend_dn = None
+    if trend_filter != "off":
+        ema_h = ta.ema(htf_frame.c, 200)
+        # последний ЗАКРЫТЫЙ H4: -2, потому что htf_frame содержит текущий бар
+        jh = np.searchsorted(htf_frame.t, chart.t, side="right") - 2
+        trend_up = np.zeros(n, dtype=bool)
+        trend_dn = np.zeros(n, dtype=bool)
+        for k in range(n):
+            j = int(jh[k])
+            if 0 <= j < len(ema_h) and not np.isnan(ema_h[j]):
+                trend_up[k] = htf_frame.c[j] > ema_h[j]
+                trend_dn[k] = htf_frame.c[j] < ema_h[j]
+    pdh = pdl = None
+    if d1_tol > 0:
+        # предыдущий ПОЛНЫЙ день по H4-барам
+        day_hi: dict = {}
+        day_lo: dict = {}
+        order: list = []
+        for k in range(len(htf_frame.t)):
+            d = dt.datetime.fromtimestamp(float(htf_frame.t[k]), dt.timezone.utc).date()
+            if d not in day_hi:
+                day_hi[d] = float(htf_frame.h[k])
+                day_lo[d] = float(htf_frame.l[k])
+                order.append(d)
+            else:
+                day_hi[d] = max(day_hi[d], float(htf_frame.h[k]))
+                day_lo[d] = min(day_lo[d], float(htf_frame.l[k]))
+        prev = {}
+        for pos, d in enumerate(order):
+            if pos > 0:
+                pd = order[pos - 1]
+                prev[d] = (day_hi[pd], day_lo[pd])
+        pdh = np.full(n, np.nan)
+        pdl = np.full(n, np.nan)
+        for i in range(n):
+            d = dt.datetime.fromtimestamp(float(chart.t[i]), dt.timezone.utc).date()
+            if d in prev:
+                pdh[i], pdl[i] = prev[d]
     trades: list[dict] = []
     # Стопы по уровням. После max_stops неудач уровень блокируем — но не по
     # таймеру, а структурно: пока он не исчезнет из таблицы зон, т.е. пока его
@@ -165,6 +256,13 @@ def backtest(chart: st.Frame, zones: list[dict], htf_frame: st.Frame,
         if er is not None and (np.isnan(er[i]) or er[i] > er_max):
             i += 1
             continue
+        if atr_slow is not None and not np.isnan(atr_slow[i]) and atr_slow[i] > 0:
+            ratio = atr_c[i] / atr_slow[i]
+            if (atr_ratio_min > 0 and ratio < atr_ratio_min) or \
+                    (atr_ratio_max > 0 and ratio > atr_ratio_max):
+                i += 1
+                continue
+        conf = confirm_atr * (atr_c[i] if not np.isnan(atr_c[i]) else 0.0)
         lv_list = zones[i]["levels"]
         present = {(round(float(x["price"]), 2), x["kind"]) for x in lv_list}
         for k in list(stops):
@@ -173,12 +271,21 @@ def backtest(chart: st.Frame, zones: list[dict], htf_frame: st.Frame,
         sig = None
         for lv in lv_list:
             price = float(lv["price"])
+            if pdh is not None and not np.isnan(pdh[i]):
+                tol = d1_tol * (atr_c[i] if not np.isnan(atr_c[i]) else 0.0)
+                if abs(price - pdh[i]) > tol and abs(price - pdl[i]) > tol:
+                    continue
+            if lv.get("born") is not None:
+                age = int(zones[i].get("bar", 0)) - int(lv["born"])
+                if (zone_min_age > 0 and age < zone_min_age) or \
+                        (zone_max_age > 0 and age > zone_max_age):
+                    continue
             if max_stops > 0 and stops.get((round(price, 2), lv["kind"]), 0) >= max_stops:
                 continue
-            if lv["kind"] == "sup" and chart.l[i] <= price and chart.c[i] > price:
+            if lv["kind"] == "sup" and chart.l[i] <= price and chart.c[i] > price + conf:
                 sig = ("LONG", price)
                 break
-            if lv["kind"] == "res" and chart.h[i] >= price and chart.c[i] < price:
+            if lv["kind"] == "res" and chart.h[i] >= price and chart.c[i] < price - conf:
                 sig = ("SHORT", price)
                 break
         if not sig:
@@ -187,11 +294,24 @@ def backtest(chart: st.Frame, zones: list[dict], htf_frame: st.Frame,
 
         side, level_px = sig
         sgn = 1 if side == "LONG" else -1
+        if not side_ok(side, side_allow):
+            i += 1
+            continue
+        if trend_filter == "with" and (
+                (side == "LONG" and not trend_up[i]) or (side == "SHORT" and not trend_dn[i])):
+            i += 1
+            continue
+        if trend_filter == "against" and (
+                (side == "LONG" and not trend_dn[i]) or (side == "SHORT" and not trend_up[i])):
+            i += 1
+            continue
 
         # SMT-подтверждение входа (парный инструмент не снял тот же экстремум)
         if not smt_ok(chart, smt, i, side, smt_look):
             i += 1
             continue
+        if stats is not None:
+            stats["signals"] = stats.get("signals", 0) + 1
 
         if stop_mode == "swing":
             # стоп за ближайший свинг до бара входа
@@ -222,6 +342,73 @@ def backtest(chart: st.Frame, zones: list[dict], htf_frame: st.Frame,
             i += 1
             continue
 
+        if entry_model == "limit_retest":
+            # лимитка живёт limit_bars баров после сигнала; бар сигнала не
+            # считается — на его закрытии мы только узнали о сетапе
+            end = min(i + limit_bars, n - 1)
+            fill_j = fill_px = None
+            for j in range(i + 1, end + 1):
+                if side == "LONG" and chart.l[j] <= level_px:
+                    fill_j, fill_px = j, min(float(level_px), float(chart.o[j]))
+                    break
+                if side == "SHORT" and chart.h[j] >= level_px:
+                    fill_j, fill_px = j, max(float(level_px), float(chart.o[j]))
+                    break
+            if fill_j is None:
+                if stats is not None:
+                    stats["cancelled"] = stats.get("cancelled", 0) + 1
+                i = max(i + 1, end)      # не плодим сигналы, пока висит лимитка
+                continue
+            if stats is not None:
+                stats["fills"] = stats.get("fills", 0) + 1
+
+            entry = fill_px
+            stop = entry - sgn * risk
+            target = pick_target(zones[i]["levels"], side, entry, risk, tp_r, min_rr, max_r)
+
+            exit_i = exit_price = why = None
+            be_moved = False
+            trail_on = False
+            # на баре заполнения проверяем только стоп: путь внутри бара
+            # неизвестен, считать цель было бы оптимистично
+            if (side == "LONG" and chart.l[fill_j] <= stop) or \
+                    (side == "SHORT" and chart.h[fill_j] >= stop):
+                exit_i, exit_price, why = fill_j, stop, "SL"
+            else:
+                for j in range(fill_j + 1, min(fill_j + max_bars, n)):
+                    hit_sl = chart.l[j] <= stop if side == "LONG" else chart.h[j] >= stop
+                    hit_tp = chart.h[j] >= target if side == "LONG" else chart.l[j] <= target
+                    if hit_sl:
+                        exit_i, exit_price, why = j, stop, "SL"
+                        break
+                    if hit_tp:
+                        exit_i, exit_price, why = j, target, "TP"
+                        break
+                    if be_after_r > 0 and not be_moved:
+                        trig = entry + sgn * risk * be_after_r
+                        if (side == "LONG" and chart.h[j] >= trig) or \
+                                (side == "SHORT" and chart.l[j] <= trig):
+                            stop, be_moved = entry, True
+                    if trail_after_r > 0 and not np.isnan(atr_c[j]):
+                        trig = entry + sgn * risk * trail_after_r
+                        if not trail_on and ((side == "LONG" and chart.h[j] >= trig) or
+                                             (side == "SHORT" and chart.l[j] <= trig)):
+                            trail_on = True
+                        if trail_on:
+                            tr = float(chart.c[j]) - sgn * trail_k * float(atr_c[j])
+                            stop = max(stop, tr) if side == "LONG" else min(stop, tr)
+            if exit_i is None:
+                j = min(fill_j + max_bars, n - 1)
+                exit_i, exit_price, why = j, float(chart.c[j]), "TIME"
+            r = (exit_price - entry) * sgn / risk
+            trades.append({"side": side, "entry_i": fill_j, "exit_i": exit_i,
+                           "entry": entry, "stop": stop, "target": target, "risk": risk,
+                           "r": r, "exit": why, "limit": True})
+            if why == "SL":
+                _note_stop(stops, entry, side)
+            i = exit_i + 1
+            continue
+
         if entry_model == "next_open":
             # сигнал виден только на закрытии бара: вход — по рынку на открытии
             # следующего. Стоп и цель привязываем к фактической цене входа.
@@ -242,12 +429,15 @@ def backtest(chart: st.Frame, zones: list[dict], htf_frame: st.Frame,
                 (side == "LONG" and chart.l[i] <= stop) or (side == "SHORT" and chart.h[i] >= stop)):
             r = -1.0
             trades.append({"side": side, "entry_i": i, "exit_i": i, "entry": entry,
-                           "stop": stop, "target": target, "r": r, "exit": "SL-bar"})
+                           "stop": stop, "target": target, "risk": risk,
+                           "r": r, "exit": "SL-bar"})
             _note_stop(stops, entry, side)
             i += 1
             continue
 
         exit_i = exit_price = why = None
+        be_moved = False
+        trail_on = False
         for j in range(i + 1, min(i + 1 + max_bars, n)):
             hit_sl = chart.l[j] <= stop if side == "LONG" else chart.h[j] >= stop
             hit_tp = chart.h[j] >= target if side == "LONG" else chart.l[j] <= target
@@ -273,13 +463,27 @@ def backtest(chart: st.Frame, zones: list[dict], htf_frame: st.Frame,
             if hit_tp:
                 exit_i, exit_price, why = j, target, "TP"
                 break
+            if be_after_r > 0 and not be_moved:
+                trig = entry + sgn * risk * be_after_r
+                if (side == "LONG" and chart.h[j] >= trig) or \
+                        (side == "SHORT" and chart.l[j] <= trig):
+                    stop, be_moved = entry, True
+            if trail_after_r > 0 and not np.isnan(atr_c[j]):
+                trig = entry + sgn * risk * trail_after_r
+                if not trail_on and ((side == "LONG" and chart.h[j] >= trig) or
+                                     (side == "SHORT" and chart.l[j] <= trig)):
+                    trail_on = True
+                if trail_on:
+                    tr = float(chart.c[j]) - sgn * trail_k * float(atr_c[j])
+                    stop = max(stop, tr) if side == "LONG" else min(stop, tr)
         if exit_i is None:
             j = min(i + max_bars, n - 1)
             exit_i, exit_price, why = j, float(chart.c[j]), "TIME"
 
         r = (exit_price - entry) * sgn / risk
         trades.append({"side": side, "entry_i": i, "exit_i": exit_i, "entry": entry,
-                       "stop": stop, "target": target, "r": r, "exit": why})
+                       "stop": stop, "target": target, "risk": risk,
+                       "r": r, "exit": why})
         if why == "SL":
             _note_stop(stops, entry, side)
         i = exit_i + 1

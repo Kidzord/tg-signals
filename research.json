@@ -1,0 +1,90 @@
+{
+  "ideas": [
+    {
+      "id": "pro-mitigation-block-apex",
+      "title": "PRO Mitigation Block (APEX)",
+      "source": "APEX — карточка в Notion, Backtest Research",
+      "url": "",
+      "hypothesis": "многоступенчатая SMC-модель (свип → FVG → RB → MB) даёт высокий WR на H4",
+      "symbols": [
+        "XAUUSD"
+      ],
+      "tf": "240",
+      "status": "rejected",
+      "created": "2026-11-03 13:10 UTC",
+      "updated": "2026-11-03 13:10 UTC",
+      "wfa": null,
+      "notes": [
+        {
+          "ts": "2026-11-03 13:10 UTC",
+          "text": "[rejected] механический порт не воспроизвёл статистику автора, правила неустойчивы; см. docs/PMB_RULES.md"
+        }
+      ]
+    },
+    {
+      "id": "candle-range-theory-crt",
+      "title": "Candle Range Theory (CRT)",
+      "source": "@Romeotpt — розничная ICT-производная",
+      "url": "",
+      "hypothesis": "свип диапазона старшей свечи и возврат внутрь дают ход к противоположной границе",
+      "symbols": [
+        "USDCAD",
+        "XAUUSD"
+      ],
+      "tf": "60",
+      "status": "rejected",
+      "created": "2026-11-03 13:10 UTC",
+      "updated": "2026-11-03 13:10 UTC",
+      "wfa": null,
+      "notes": [
+        {
+          "ts": "2026-11-03 13:10 UTC",
+          "text": "[rejected] после спреда устойчивый плюс только USDCAD H1/M5 failed (+7.2%); в live не включена, см. docs/CRT_METHOD.md"
+        }
+      ]
+    },
+    {
+      "id": "ict-2022-model",
+      "title": "ICT 2022 Model",
+      "source": "@InnerCircleTrader (публичные разборы)",
+      "url": "",
+      "hypothesis": "свип ликвидности → FVG → вход на ретесте с целью по структуре",
+      "symbols": [
+        "XAUUSD"
+      ],
+      "tf": "15",
+      "status": "testing",
+      "created": "2026-11-03 13:10 UTC",
+      "updated": "2026-11-03 13:10 UTC",
+      "wfa": null,
+      "notes": [
+        {
+          "ts": "2026-11-03 13:10 UTC",
+          "text": "[testing] модуль ict2022.py реализован; WFA в реестре не зафиксирован"
+        }
+      ]
+    },
+    {
+      "id": "pdh-pdl-sweep",
+      "title": "PDH/PDL sweep",
+      "source": "внешние SMC/ICT-разборы",
+      "url": "",
+      "hypothesis": "снятие дневного максимума/минимума с возвратом даёт разворотный вход",
+      "symbols": [
+        "AUDUSD",
+        "USDCAD"
+      ],
+      "tf": "15",
+      "status": "testing",
+      "created": "2026-11-03 13:10 UTC",
+      "updated": "2026-11-03 13:10 UTC",
+      "wfa": null,
+      "notes": [
+        {
+          "ts": "2026-11-03 13:10 UTC",
+          "text": "[testing] модуль pdl_sweep.py реализован; WFA в реестре не зафиксирован"
+        }
+      ]
+    }
+  ]
+}

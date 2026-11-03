@@ -7,8 +7,8 @@
          python autoposts.py now promo  — продающий пост
          python autoposts.py now threads— напоминание про пост для Threads
          python autoposts.py now x      — напоминание про пост для X
-         python autoposts.py now vk     — напоминание про пост для VK
-         python autoposts.py now dzen   — напоминание про пост для Дзена
+         python autoposts.py now tiktok  — карусель для TikTok
+         python autoposts.py now tiktok_shipped — карусель «что сделал в боте»
 
 Что делает:
   * план на день — карточкой в группу (PLAN_TIME);
@@ -18,8 +18,8 @@
   * продающий пост — в группу (PROMO_TIME), кнопка на PREMIUM_URL;
   * напоминания о постах для Threads — в личку владельцу (THREADS_REMIND_TIMES);
   * напоминания о постах для X (англ.) — в личку (X_REMIND_TIMES);
-  * напоминания о постах для VK и Дзена (RU) — в личку (VK_REMIND_TIMES,
-    DZEN_REMIND_TIMES), банк текстов общий с Threads.
+  * карусели для TikTok — в личку (TIKTOK_REMIND_TIMES), два формата:
+    «что сделал в боте» и дневниковая история.
     Владелец привязывается командой /threads в premium-боте (owner.json).
 
 Время — в часовом поясе PROMO_TZ. Сигналы сюда не входят: их постит bot.py.
@@ -44,9 +44,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import backup
 import config as cfg
 import devlog
+from tools import prune as prune_tool
+from tools import restore as restore_tool
+from tools import symbol_report
 import render as card
 import revenue
-import ru_post
+import social_mix
 import store
 import telegram_editor
 import tg
@@ -197,6 +200,25 @@ def _note_for(sum_r: float, n: int) -> str:
 
 # ------------------------------------------------------------- посты в группу
 
+def _send_trade_shot(trade: dict | None,
+                     prefix: str = "Сделка в плюс") -> None:
+    """Скрин положительной сделки отдельным сообщением + зеркало владельцу."""
+    if not trade:
+        return
+    image = social_mix.image_for(trade)
+    if not image:
+        return
+    cap = (f"✅ <b>{prefix}</b>\n{social_mix.trade_line(trade)}\n"
+           "Вход, стоп и выход — на карточке. Это из журнала, не рисую задним числом.")
+    try:
+        ok, info = tg.send_photo(image, cap)
+        log.info("скрин сделки -> %s (%s)", ok, info)
+    except Exception as e:
+        log.error("скрин сделки: %s", e)
+        return
+    _mirror(image, cap)
+
+
 def post_plan(now: dt.datetime | None = None) -> bool:
     """Утренний план на день — карточкой в группу, в рамке дневника."""
     now = now or dt.datetime.now(TZ)
@@ -205,10 +227,12 @@ def post_plan(now: dt.datetime | None = None) -> bool:
     cap = os.getenv("MAX_DAILY_STOPS", "3").strip() or "3"
     risk = f"{cfg.PLAN_RISK_PCT:g}".replace(".", ",")
     day_no = devlog.day_number(now.date())
+    pos = social_mix.latest_positive()
+    pos_note = (f" Последняя закрытая в плюс — {social_mix.trade_line(pos)}."
+                if pos else "")
     body = [
-        f"День {day_no} дневника. Месяц пилю торгового бота — канал ведёт он сам: "
-        f"этот план, вечерний итог, пятничная сводка. Цифры берёт из журнала сделок, "
-        f"мне остаётся вычитывать.",
+        f"Вот мой план на сегодня.{pos_note} Месяц пилю торгового бота, "
+        f"пишу сам; цифры беру из журнала сделок.",
         f"Сегодня под наблюдением {a[0]} и {b[0]}: смотрю, где цена у границы "
         f"диапазона и есть ли реакция. Вход — только от уровня.",
         f"Правила на день без изменений: риск {risk}% на сделку, "
@@ -247,10 +271,15 @@ def post_day_summary(now: dt.datetime | None = None) -> bool:
     head = f"🌙 <b>День {day_no} · итог дня · {label}</b>"
     dev = devlog.next_devnote()
     dev_line = f"\n\n🛠 Из разработки: {dev}." if dev else ""
+    pos = social_mix.latest_positive()
+    pos_line = (f"\n\n✅ Последняя закрытая в плюс: "
+                f"{social_mix.trade_line(pos)}." if pos else "")
 
     if n == 0:
-        ok, info = tg.send_message(head + "\n\n" + note + dev_line)
-        _mirror(None, head + "\n\n" + note + dev_line)
+        text = head + "\n\n" + note + dev_line + pos_line
+        ok, info = tg.send_message(text)
+        _mirror(None, text)
+        _send_trade_shot(pos)
         log.info("итог дня (без сделок) -> %s (%s)", ok, info)
         return ok
 
@@ -263,11 +292,12 @@ def post_day_summary(now: dt.datetime | None = None) -> bool:
             title=f"День {day_no} · итог дня", period=label, trades=n, wins=wins,
             sum_r=sum_r, bal_start=bal_start, bal_end=bal_end, note=note,
             when=now), path)
-        ok, info = tg.send_photo(path, head + "\n\n" + note + dev_line)
+        ok, info = tg.send_photo(path, head + "\n\n" + note + dev_line + pos_line)
     except Exception as e:
         log.error("итог дня: карточка не отрисовалась (%s), шлю текстом", e)
-        ok, info = tg.send_message(head + "\n\n" + note + dev_line)
-    _mirror(path, head + "\n\n" + note + dev_line)
+        ok, info = tg.send_message(head + "\n\n" + note + dev_line + pos_line)
+    _mirror(path, head + "\n\n" + note + dev_line + pos_line)
+    _send_trade_shot(pos)
     log.info("итог дня -> %s (%s)", ok, info)
     return ok
 
@@ -282,6 +312,15 @@ def post_week_summary(now: dt.datetime | None = None) -> bool:
     before = [t for t in rows if t["ts"] < monday.timestamp()]
     week = [t for t in rows if monday.timestamp() <= t["ts"] < end.timestamp()]
     n, wins, sum_r = _stats(week)
+    full_week = [t for t in social_mix.load_trades()
+                 if monday.timestamp() <= t["ts"] < end.timestamp()]
+    winners = [t for t in full_week
+               if float(t.get("total_r", t.get("r", 0)) or 0) > 0.001]
+    best = max(winners,
+               key=lambda t: float(t.get("total_r", t.get("r", 0)) or 0),
+               default=None)
+    best_line = (f"\n\n🏆 Лучшая сделка недели: "
+                 f"{social_mix.trade_line(best)}." if best else "")
     label = period_label(monday.date(), (monday + dt.timedelta(days=4)).date())
     day_no = devlog.day_number(now.date())
     head = f"🏁 <b>День {day_no} · итог недели · {label}</b>"
@@ -313,11 +352,12 @@ def post_week_summary(now: dt.datetime | None = None) -> bool:
             title=f"День {day_no} · итог недели", period=label, trades=n, wins=wins,
             sum_r=sum_r, bal_start=bal_start, bal_end=bal_end, note=note,
             when=now), path)
-        ok, info = tg.send_photo(path, head + "\n\n" + note + dev_line)
+        ok, info = tg.send_photo(path, head + "\n\n" + note + dev_line + best_line)
     except Exception as e:
         log.error("итог недели: карточка не отрисовалась (%s), шлю текстом", e)
-        ok, info = tg.send_message(head + "\n\n" + note + dev_line)
-    _mirror(path, head + "\n\n" + note + dev_line)
+        ok, info = tg.send_message(head + "\n\n" + note + dev_line + best_line)
+    _mirror(path, head + "\n\n" + note + dev_line + best_line)
+    _send_trade_shot(best, "Лучшая сделка недели")
     log.info("итог недели -> %s (%s)", ok, info)
     return ok
 
@@ -430,17 +470,20 @@ def post_month(now: dt.datetime | None = None) -> bool:
 
 # ------------------------------------------------------- напоминания о Threads
 
-def remind_threads() -> bool:
-    """Прислать владельцу в личку готовый пост: картинка + текст для копирования."""
+def remind_threads(mix: bool = False) -> bool:
+    """Прислать владельцу готовый пост: mix — сделка+разработка, иначе банк."""
     chat = owner_chat()
     if not chat:
         log.warning("нет чата владельца: напиши /threads premium-боту (или задай OWNER_CHAT_ID)")
         return False
-    ok = threads_editor.send_next(chat, cfg.SUB_BOT_TOKEN or cfg.BOT_TOKEN)
+    token = cfg.SUB_BOT_TOKEN or cfg.BOT_TOKEN
+    ok = (threads_editor.send_mix(chat, token) if mix
+          else threads_editor.send_next(chat, token))
     if ok:
-        log.info("пост Threads отправлен владельцу")
+        log.info("пост Threads отправлен владельцу (%s)",
+                 "mix" if mix else "банк")
     else:
-        log.warning("пост Threads не отправлен (банк исчерпан?)")
+        log.warning("пост Threads не отправлен")
     return ok
 
 
@@ -458,14 +501,18 @@ def post_tg_content() -> bool:
     return ok
 
 
-def remind_tiktok() -> bool:
-    """Собрать карусель для TikTok и прислать владельцу в личку."""
+def remind_tiktok(variant: str = "story") -> bool:
+    """Собрать карусель для TikTok и прислать владельцу в личку.
+
+    variant: "shipped" — что сделал в боте, "story" — дневниковая история.
+    """
     chat = owner_chat()
     if not chat:
         log.warning("нет чата владельца для TikTok")
         return False
-    ok = tiktok_editor.send(chat, cfg.SUB_BOT_TOKEN or cfg.BOT_TOKEN)
-    log.info("карусель TikTok -> %s", ok)
+    ok = tiktok_editor.send(chat, cfg.SUB_BOT_TOKEN or cfg.BOT_TOKEN,
+                            variant=variant)
+    log.info("карусель TikTok (%s) -> %s", variant, ok)
     return ok
 
 
@@ -510,90 +557,28 @@ def build_landing_job() -> bool:
 
 
 def remind_x() -> bool:
-    """Прислать владельцу в личку следующий неопубликованный пост для X (EN)."""
+    """Прислать владельцу готовый пост для X: сделка + разработка + цифры."""
     chat = owner_chat()
     if not chat:
         log.warning("нет чата владельца: напиши /threads premium-боту (или задай OWNER_CHAT_ID)")
         return False
 
-    n = x_post.next_unused()
-    if n is None:
-        st = load_json(STATE_PATH)
-        if not st.get("x_exhausted"):
-            st["x_exhausted"] = True
-            save_json(STATE_PATH, st)
-            tg.send_message(
-                "🐦 Банк постов для X закончился — все 28 опубликованы.\n"
-                "Пора пополнить: скажи мне, и я добавлю новые.",
-                token=cfg.SUB_BOT_TOKEN, chat_id=chat)
-        else:
-            log.info("банк X исчерпан, напоминание уже отправлялось")
-        return False
-
-    post = x_post.POSTS[n - 1]
-    text = x_post.tweet_text(n)
+    text = x_post.mix_text()
+    image = x_post.mix_image()
     url = x_post.INTENT + urllib.parse.quote(text, safe="")
-    cap = (f"🐦 <b>Пост для X #{n}</b> · {post['title']}\n\n"
-           f"{html.escape(text)}\n\n"
-           f"— скопируй текст или открой X с готовым постом 👇")
+    cap = (f"🐦 <b>Мой пост для X</b>\n\n{html.escape(text)}\n\n"
+           "— скопируй текст или открой X с готовым постом 👇")
     markup = {"inline_keyboard": [[{"text": "Открыть X", "url": url}]]}
-    img = x_post.IMG_DIR / f"{n:02d}.png"
-    if img.exists():
-        ok, info = tg.send_photo(str(img), cap, token=cfg.SUB_BOT_TOKEN,
+    if image:
+        ok, info = tg.send_photo(image, cap, token=cfg.SUB_BOT_TOKEN,
                                  chat_id=chat, markup=markup)
     else:
         ok, info = tg.send_message(cap, token=cfg.SUB_BOT_TOKEN, chat_id=chat,
                                    markup=markup)
     if ok:
-        x_post.mark_used(n)
-        log.info("напоминание X #%d отправлено", n)
+        log.info("напоминание X отправлено (mix)")
     else:
         log.error("напоминание X: %s", info)
-    return ok
-
-
-def remind_ru(net: str) -> bool:
-    """Прислать владельцу следующий пост для VK/Дзена (RU, банк общий с Threads)."""
-    chat = owner_chat()
-    if not chat:
-        log.warning("нет чата владельца: напиши /threads premium-боту (или задай OWNER_CHAT_ID)")
-        return False
-
-    title = ru_post.NETS[net]["title"]
-    n = ru_post.next_unused(net)
-    if n is None:
-        st = load_json(STATE_PATH)
-        key = f"{net}_exhausted"
-        if not st.get(key):
-            st[key] = True
-            save_json(STATE_PATH, st)
-            tg.send_message(
-                f"📮 Банк постов для {title} закончился — все опубликованы.\n"
-                f"Пора пополнить: скажи мне, и я добавлю новые.",
-                token=cfg.SUB_BOT_TOKEN, chat_id=chat)
-        else:
-            log.info("банк %s исчерпан, напоминание уже отправлялось", net)
-        return False
-
-    post = ru_post.POSTS[n - 1]
-    text = post["text"]
-    cap = (f"📮 <b>Пост для {title} #{n}</b> · {post['title']}\n\n"
-           f"{html.escape(text)}\n\n"
-           f"— скопируй текст или открой {title} и вставь из буфера 👇")
-    markup = {"inline_keyboard": [[{"text": f"Открыть {title}",
-                                    "url": ru_post.NETS[net]["url"]}]]}
-    img = ru_post.IMG_DIR / f"{n:02d}.png"
-    if img.exists():
-        ok, info = tg.send_photo(str(img), cap, token=cfg.SUB_BOT_TOKEN,
-                                 chat_id=chat, markup=markup)
-    else:
-        ok, info = tg.send_message(cap, token=cfg.SUB_BOT_TOKEN, chat_id=chat,
-                                   markup=markup)
-    if ok:
-        ru_post.mark_used(net, n)
-        log.info("напоминание %s #%d отправлено", title, n)
-    else:
-        log.error("напоминание %s: %s", title, info)
     return ok
 
 
@@ -634,6 +619,37 @@ def cleanup_artifacts() -> bool:
     return True
 
 
+def post_forward_control() -> bool:
+    """Воскресный разбор живых сделок: деградация → алерт и предложение отключить."""
+    report = symbol_report.build_report()
+    if not cfg.OWNER_CHAT_ID:
+        log.warning("forward-контроль: OWNER_CHAT_ID пуст, отчёт не отправлен")
+        return True
+    ok, info = tg.send_message(report, chat_id=cfg.OWNER_CHAT_ID)
+    log.info("forward-контроль -> %s (%s)", ok, info)
+    return ok
+
+
+def restore_drill_job() -> bool:
+    """Раз в неделю разворачивает последний бэкап в песочницу и проверяет."""
+    res = restore_tool.drill()
+    if res.get("ok"):
+        log.info("restore-drill ok: снимок %s, users=%s, сделок=%s",
+                 res.get("snapshot"), res.get("users"),
+                 res.get("trades.jsonl_lines"))
+        return True
+    detail = "; ".join(res.get("errors") or ["неизвестная ошибка"])
+    log.error("restore-drill: %s", detail)
+    if cfg.OWNER_CHAT_ID:
+        tg.send_message(
+            f"🔴 <b>Restore-drill не прошёл</b>\n"
+            f"Снимок: {res.get('snapshot', '?')}\n{detail}\n\n"
+            "Пока проверка красная, бэкап нельзя считать рабочим.",
+            chat_id=cfg.OWNER_CHAT_ID,
+        )
+    return True   # алерт отправлен: не повторяем догон в тот же день
+
+
 def daily_plan() -> list[tuple[str, str, str, object]]:
     """Ежедневные/недельные задания: (id, ЧЧ:ММ, дни, функция)."""
     plan: list[tuple[str, str, str, object]] = [
@@ -645,6 +661,12 @@ def daily_plan() -> list[tuple[str, str, str, object]]:
         ("backup", "03:00", "*", backup.snapshot),
         ("cleanup", "03:30", "*", cleanup_artifacts),
     ]
+    if cfg.FORWARD_CONTROL_ENABLED:
+        plan.append(("forward", cfg.FORWARD_CONTROL_TIME, "sun",
+                     post_forward_control))
+    if cfg.RESTORE_DRILL_ENABLED:
+        plan.append(("restore_drill", cfg.RESTORE_DRILL_TIME, "sun",
+                     restore_drill_job))
     if cfg.PROMO_ENABLED:
         plan.append(("promo", cfg.PROMO_TIME, "*", post_promo))
     if cfg.TG_CONTENT_ENABLED:
@@ -741,7 +763,9 @@ def build_scheduler() -> BackgroundScheduler:
             if not hm:
                 log.error("напоминание Threads: неверное время %r", when)
                 continue
-            sch.add_job(remind_threads,
+            # первый слот дня — смешанный пост (сделка + разработка),
+            # остальные — банк обучающих постов
+            sch.add_job(lambda m=(i == 1): remind_threads(m),
                         CronTrigger(hour=hm[0], minute=hm[1], timezone=TZ),
                         id=f"threads_{i}", replace_existing=True)
 
@@ -775,6 +799,19 @@ def build_scheduler() -> BackgroundScheduler:
         else:
             log.error("месяц в цифрах: неверное время %r", cfg.MONTH_SUMMARY_TIME)
 
+    # Ретеншн картинок: старые рендеры и скриншоты не нужны, но копятся.
+    if getattr(cfg, "PRUNE_ENABLED", False):
+        hm = _hhmm(getattr(cfg, "PRUNE_TIME", "04:00"))
+        if hm:
+            def prune_job() -> None:
+                report = prune_tool.prune(int(cfg.PRUNE_DAYS), apply=True)
+                log.info("ретеншн %s дн.: %s", cfg.PRUNE_DAYS,
+                         prune_tool.text_report(report, int(cfg.PRUNE_DAYS), True))
+            sch.add_job(prune_job, CronTrigger(hour=hm[0], minute=hm[1], timezone=TZ),
+                        id="prune", replace_existing=True)
+        else:
+            log.error("ретеншн: неверное время %r", cfg.PRUNE_TIME)
+
     if cfg.X_REMIND_ENABLED:
         for i, when in enumerate(_times(cfg.X_REMIND_TIMES), 1):
             hm = _hhmm(when)
@@ -785,24 +822,16 @@ def build_scheduler() -> BackgroundScheduler:
                         CronTrigger(hour=hm[0], minute=hm[1], timezone=TZ),
                         id=f"x_{i}", replace_existing=True)
 
-    if cfg.RU_REMIND_ENABLED:
-        for net, raw in (("vk", cfg.VK_REMIND_TIMES), ("dzen", cfg.DZEN_REMIND_TIMES)):
-            for i, when in enumerate(_times(raw), 1):
-                hm = _hhmm(when)
-                if not hm:
-                    log.error("напоминание %s: неверное время %r", net, when)
-                    continue
-                sch.add_job(lambda n=net: remind_ru(n),
-                            CronTrigger(hour=hm[0], minute=hm[1], timezone=TZ),
-                            id=f"{net}_{i}", replace_existing=True)
-
     if cfg.TIKTOK_REMIND_ENABLED:
+        # чередуем форматы: днём — «что сделал», вечером — дневниковая история
+        variants = ("shipped", "story")
         for i, when in enumerate(_times(cfg.TIKTOK_REMIND_TIMES), 1):
             hm = _hhmm(when)
             if not hm:
                 log.error("напоминание TikTok: неверное время %r", when)
                 continue
-            sch.add_job(remind_tiktok,
+            variant = variants[(i - 1) % len(variants)]
+            sch.add_job(lambda v=variant: remind_tiktok(v),
                         CronTrigger(hour=hm[0], minute=hm[1], timezone=TZ),
                         id=f"tiktok_{i}", replace_existing=True)
     return sch
@@ -812,16 +841,21 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "now":
         what = sys.argv[2] if len(sys.argv) > 2 else "plan"
         jobs = {"plan": post_plan, "day": post_day_summary, "week": post_week_summary,
-                "promo": post_promo, "threads": remind_threads, "x": remind_x,
+                "promo": post_promo, "threads": remind_threads,
+                "threads_mix": lambda: remind_threads(True), "x": remind_x,
                 "revenue": revenue.send_report, "backup": backup.snapshot,
                 "tgcontent": post_tg_content, "tiktok": remind_tiktok,
+                "tiktok_shipped": lambda: remind_tiktok("shipped"),
                 "threads_result": remind_threads_result,
                 "threads_week": remind_threads_week,
                 "landing": build_landing_job,
-                "vk": lambda: remind_ru("vk"), "dzen": lambda: remind_ru("dzen")}
+                "forward": post_forward_control,
+                "drill": restore_drill_job}
         job = jobs.get(what)
         if not job:
-            print("Формат: python autoposts.py now plan|day|week|promo|threads|x|vk|dzen")
+            print("Формат: python autoposts.py now "
+                  "plan|day|week|promo|threads|threads_mix|x|tiktok|"
+                  "tiktok_shipped|forward|drill")
             return
         print(f"{what}: {'ок' if job() else 'не отправлено'}")
         return
@@ -837,7 +871,7 @@ def main() -> None:
         print(f"  {j.id:<10} {j.trigger}")
     if not owner_chat():
         print("! нет чата владельца — напиши /threads premium-боту, иначе напоминания "
-              "о постах для Threads, X, VK и Дзена не придут")
+              "о постах для Threads, X и TikTok не придут")
     # старт после простоя: свежий бэкап и догон недавно пропущенного слота
     try:
         backup.ensure_fresh()

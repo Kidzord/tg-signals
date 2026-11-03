@@ -18,6 +18,7 @@ import tiktok_editor  # noqa: E402
 
 def test_caption_has_cta_and_hashtags():
     text = tiktok_editor.caption()
+    assert "Вот мой пост на сегодня" in text
     assert "t.me/" in text
     assert "#трейдинг" in text
     assert len(text) <= 2200
@@ -58,18 +59,47 @@ def test_media_group_builds_multipart(tmp_path, monkeypatch):
 
 def test_owner_tt_command(monkeypatch):
     monkeypatch.setattr(subbot.cfg, "OWNER_CHAT_ID", "42")
-    called: list[str] = []
-    monkeypatch.setattr(subbot.tiktok_editor, "send",
-                        lambda uid, token: called.append(uid) or True)
+    called: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        subbot.tiktok_editor, "send",
+        lambda uid, token, variant="story": called.append((uid, variant)) or True)
     subbot.handle({}, "42", "/tt")
-    assert called == ["42"]
+    assert called == [("42", "story")]
+    called.clear()
+    subbot.handle({}, "42", "/tt shipped")
+    assert called == [("42", "shipped")]
+
+
+def test_shipped_slides_have_notes_and_stats():
+    slides = tiktok_editor._shipped_slides(
+        7, "KidzordFX", ["добавил kill-switch", "проверил бэкап"])
+    titles = [s[1] for s in slides]
+    assert titles[0] == "ДЕНЬ 7"
+    assert "ЧТО ДОБАВИЛ" in titles
+    assert "ЦИФРЫ НЕДЕЛИ" in titles
+    bodies = " ".join(s[2] for s in slides)
+    assert "добавил kill-switch" in bodies
+    assert "За 7 дней" in bodies
+
+
+def test_shipped_caption_does_not_consume_devlog(monkeypatch):
+    def boom():
+        raise AssertionError("TikTok не должен расходовать банк дневника")
+
+    monkeypatch.setattr(tiktok_editor.devlog, "next_devnote", boom)
+    text = tiktok_editor.caption("shipped")
+    assert "Вот мой пост на сегодня" in text
+    assert "что сделал по проекту" in text
+    assert "За 7 дней" in text
+
 
 def test_story_slides_carry_journal_hook():
     slides = tiktok_editor._story_slides(7, "KidzordFX")
     titles = [s[1] for s in slides]
     assert titles[0] == "ДЕНЬ 7"
     bodies = " ".join(s[2] for s in slides)
-    assert "написал не я" in bodies
+    assert "Вот мой пост" in bodies
+    assert "Пишу сам" in bodies
     assert "ИЩУ ТЕСТЕРОВ" in titles
     assert "Telegram: @KidzordFX" in bodies
     # каждый слайд влезает в шаблон карточки: 2 строки заголовка, 7 строк текста

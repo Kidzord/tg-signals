@@ -13,6 +13,10 @@
 Запуск:
     python tools/walk_forward.py              # все стратегии
     python tools/walk_forward.py classic      # одну
+    python tools/walk_forward.py range --json out.json   # машинный результат
+
+Символ задаётся BOT_SYMBOL (по умолчанию XAUUSD). JSON нужен research.py,
+чтобы гейт опирался на числа, а не на разбор консольного текста.
 """
 from __future__ import annotations
 
@@ -65,14 +69,19 @@ def run_range(chart, htf, params):
     return range_v2.backtest(chart, zones, H, stop_atr=params["stop_atr"],
                              tp_r=params["tp_r"], max_r=params["tp_r"] + 2.0,
                              session="", smt=None, smt_look=0,
-                             max_bars=bot.PARAMS.max_bars, er_max=params["er_max"])
+                             max_bars=bot.PARAMS.max_bars, er_max=params["er_max"],
+                             side_allow=params.get("side", "both"),
+                             trend_filter=params.get("trend", "off"),
+                             trail_after_r=params.get("trail_after_r", 0.0),
+                             trail_k=params.get("trail_k", 2.0),
+                             d1_tol=params.get("d1_tol", 0.0))
 
 
 def run_ict(chart, htf, params):
     import ict2022
-    return ict2022.backtest(chart, swing_len=bot.ICT_SWING,
-                            fvg_window=bot.ICT_FVG_WINDOW,
-                            retest_look=bot.ICT_RETEST_LOOK,
+    return ict2022.backtest(chart, swing_len=params.get("swing", bot.ICT_SWING),
+                            fvg_window=params.get("fvg_window", bot.ICT_FVG_WINDOW),
+                            retest_look=params.get("retest_look", bot.ICT_RETEST_LOOK),
                             stop_buf_atr=params["stop_buf"],
                             tp_r=params["tp_r"], max_bars=120)
 
@@ -91,17 +100,95 @@ STRATEGIES = {
     },
     "range": {
         "runner": run_range,
-        "grid": [{"tp_r": t, "stop_atr": 1.0, "er_max": e}
+        "grid": [{"tp_r": t, "stop_atr": 1.0, "er_max": e, "side": "both"}
                  for t in (2.0, 3.0, 4.0) for e in (0.0, 0.20)],
+    },
+    # тот же протокол, но сделки только в шорт: проверяем гипотезу стороны
+    # как фиксированный вариант, а не как ещё один подбираемый параметр
+    "range_short": {
+        "runner": run_range,
+        "grid": [{"tp_r": t, "stop_atr": 1.0, "er_max": e, "side": "short"}
+                 for t in (2.0, 3.0, 4.0) for e in (0.0, 0.20)],
+    },
+    "range_er10grid": {
+        "runner": run_range,
+        "grid": [{"tp_r": t, "stop_atr": 1.0, "er_max": e, "side": "both"}
+                 for t in (2.0, 3.0, 4.0) for e in (0.0, 0.10, 0.20)],
+    },
+    # фиксированные кандидаты: OOS без подбора, чистая проверка одной настройки
+    "range_live": {
+        "runner": run_range,
+        "grid": [{"tp_r": 3.0, "stop_atr": 1.0, "er_max": 0.20, "side": "both"}],
+    },
+    "range_er10_tp3": {
+        "runner": run_range,
+        "grid": [{"tp_r": 3.0, "stop_atr": 1.0, "er_max": 0.10, "side": "both"}],
+    },
+    "range_er10_tp4": {
+        "runner": run_range,
+        "grid": [{"tp_r": 4.0, "stop_atr": 1.0, "er_max": 0.10, "side": "both"}],
+    },
+    "range_er0_tp3": {
+        "runner": run_range,
+        "grid": [{"tp_r": 3.0, "stop_atr": 1.0, "er_max": 0.0, "side": "both"}],
+    },
+    "range_er0_tp4": {
+        "runner": run_range,
+        "grid": [{"tp_r": 4.0, "stop_atr": 1.0, "er_max": 0.0, "side": "both"}],
+    },
+    "range_er20_tp4": {
+        "runner": run_range,
+        "grid": [{"tp_r": 4.0, "stop_atr": 1.0, "er_max": 0.20, "side": "both"}],
+    },
+    "range_er0_tp2": {
+        "runner": run_range,
+        "grid": [{"tp_r": 2.0, "stop_atr": 1.0, "er_max": 0.0, "side": "both"}],
+    },
+    "range_er20_tp2": {
+        "runner": run_range,
+        "grid": [{"tp_r": 2.0, "stop_atr": 1.0, "er_max": 0.20, "side": "both"}],
+    },
+    "range_trend_eur": {
+        "runner": run_range,
+        "grid": [{"tp_r": 3.0, "stop_atr": 1.0, "er_max": 0.0,
+                  "side": "both", "trend": "with"}],
+    },
+    "range_trend_aud": {
+        "runner": run_range,
+        "grid": [{"tp_r": 3.0, "stop_atr": 1.0, "er_max": 0.10,
+                  "side": "both", "trend": "with"}],
+    },
+    "range_cad_trail": {
+        "runner": run_range,
+        "grid": [{"tp_r": 3.0, "stop_atr": 1.0, "er_max": 0.20,
+                  "side": "both", "trail_after_r": 1.0, "trail_k": 1.5}],
     },
     "ict": {
         "runner": run_ict,
         "grid": [{"tp_r": t, "stop_buf": b} for t in (2.0, 4.0) for b in (0.25, 0.5)],
     },
+    # фиксированные кандидаты по золоту (отобраны на in-sample, проверяем OOS)
+    "classic_nopart": {
+        "runner": run_classic,
+        "grid": [{"p1_pct": 0.0, "p2_pct": 0.0}],
+        "apply": lambda p: dataclasses.replace(bot.PARAMS, **p),
+    },
+    "ict_gold3": {
+        "runner": run_ict,
+        "grid": [{"tp_r": 3.0, "stop_buf": 0.20}],
+    },
+    "ict_gold4": {
+        "runner": run_ict,
+        "grid": [{"tp_r": 4.0, "stop_buf": 0.25}],
+    },
+    "ict_swing30": {
+        "runner": run_ict,
+        "grid": [{"tp_r": 4.0, "stop_buf": 0.25, "swing": 30}],
+    },
 }
 
 
-def wfa(name: str, cfg: dict, chart, htf) -> None:
+def wfa(name: str, cfg: dict, chart, htf) -> dict:
     runner = cfg["runner"]
     grid = cfg["grid"]
     opt = OPT_DAYS * BARS_PER_DAY
@@ -127,7 +214,9 @@ def wfa(name: str, cfg: dict, chart, htf) -> None:
                 trades = runner(opt_slice, htf, pp)
             except Exception as e:
                 print(f"  ошибка на фолде {when}: {e!r}")
-                return
+                return {"name": name, "verdict": "ОШИБКА", "error": repr(e),
+                        "trades": 0, "net_r": 0.0, "avg_r": 0.0,
+                        "folds": 0, "folds_positive": 0}
             r = sum(t["r"] for t in trades) - COST_R * len(trades)
             if best_r is None or r > best_r:
                 best_r, best_params = r, gp
@@ -144,21 +233,53 @@ def wfa(name: str, cfg: dict, chart, htf) -> None:
     total_raw = sum(f[4] + COST_R * f[2] for f in fold_rows)
     total_net = sum(f[4] for f in fold_rows)
     pos_folds = sum(1 for f in fold_rows if f[4] > 0)
+    active = [f for f in fold_rows if f[2] > 0]
+    pos_active = sum(1 for f in active if f[4] > 0)
     print(f"{'фолд':>7} {'сделок':>7} {'raw R':>8} {'net R':>8}  параметры")
     for when, gp, cnt, raw, net in fold_rows:
         print(f"{when:>7} {cnt:>7} {raw:>+8.2f} {net:>+8.2f}  {gp}")
     avg = total_net / len(all_oos) if all_oos else 0.0
     print(f"\nOOS итог: {len(all_oos)} сделок · net {total_net:+.2f}R · "
-          f"средняя {avg:+.3f}R · фолдов в плюсе {pos_folds}/{len(fold_rows)}")
+          f"средняя {avg:+.3f}R · фолдов в плюсе {pos_folds}/{len(fold_rows)} · "
+          f"активных {len(active)}, из них в плюсе {pos_active}")
     verdict = ("ПРОХОДИТ" if (total_net > 5 and pos_folds >= 0.6 * len(fold_rows) and avg > 0.05)
                else "НЕ ПРОХОДИТ")
     print(f"Вердикт walk-forward: {verdict}")
+    return {
+        "name": name,
+        "verdict": verdict,
+        "trades": len(all_oos),
+        "net_r": round(total_net, 4),
+        "avg_r": round(avg, 4),
+        "folds": len(fold_rows),
+        "folds_positive": pos_folds,
+        "folds_active": len(active),
+        "folds_active_positive": pos_active,
+    }
+
+
+def _cli_args(argv: list[str]) -> tuple[str | None, str | None]:
+    """Разбирает «[имя_стратегии] [--json путь]» без argparse-зависимости."""
+    only, json_path = None, None
+    rest = list(argv)
+    while rest:
+        arg = rest.pop(0)
+        if arg == "--json":
+            json_path = rest.pop(0) if rest else None
+        elif arg.startswith("--json="):
+            json_path = arg.split("=", 1)[1]
+        elif not arg.startswith("-") and only is None:
+            only = arg
+    return only, json_path
 
 
 def main() -> int:
-    only = sys.argv[1] if len(sys.argv) > 1 else None
+    only, json_path = _cli_args(sys.argv[1:])
     symbol = os.getenv("BOT_SYMBOL", "XAUUSD").strip()
     data = bot.connect()
+    if data is None:
+        print("нет подключения к MT5: запусти терминал, войди в счёт и повтори")
+        return 3
     chart, htf = bot.load_frames(data, symbol, bot.TF, BARS)
     days = (chart.t[-1] - chart.t[0]) / 86400
     global BARS_PER_DAY
@@ -167,11 +288,19 @@ def main() -> int:
     print(f"данные {symbol}: {len(chart.c)} баров ({days:.0f} дн., ~{BARS_PER_DAY}/день), "
           f"фолдов на стратегию ~{int((days - OPT_DAYS) // TEST_DAYS)}")
     names = [only] if only else list(STRATEGIES)
+    results = []
     for name in names:
-        if only and only != name and len(sys.argv) > 1:
-            continue
-        wfa(name, STRATEGIES[name], chart, htf)
+        if name not in STRATEGIES:
+            print(f"неизвестная стратегия {name!r}; есть: {', '.join(STRATEGIES)}")
+            data.close()
+            return 2
+        results.append(wfa(name, STRATEGIES[name], chart, htf))
     data.close()
+    if json_path:
+        import json
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        print(f"JSON: {json_path}")
     return 0
 
 

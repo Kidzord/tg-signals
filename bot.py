@@ -3,7 +3,7 @@
 Режимы:
     python bot.py            — цикл: опрос MT5, сигналы, ведение сделки
     python bot.py once       — одна проверка и выход
-    python bot.py scan       — бэктест стратегии из STRATEGY (range/sonar/classic)
+    python bot.py scan       — бэктест стратегии из STRATEGY (range/sonar/classic/crt)
 
 Переменные окружения (кроме .env):
     BOT_TF=15          рабочий таймфрейм
@@ -23,9 +23,13 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import consensus
+import crt
 import feeds
 import mt5_screenshot
+import news_calendar
 import render as card
+import risk_guard
 import sonar
 import store
 import strategy as st
@@ -49,6 +53,13 @@ RANGE_TP_R = float(os.getenv("RANGE_TP_R", "2.0"))
 RANGE_ZONE_TF = os.getenv("RANGE_ZONE_TF", "240").strip()
 RANGE_FLIP_KEEP = int(os.getenv("RANGE_FLIP_KEEP", "60"))
 RANGE_ER_MAX = float(os.getenv("RANGE_ER_MAX", "0.20"))
+# Сторона сделок range: both / short / long. WFA 2026-11-03 гипотезу
+# «только шорт» не подтвердил (AUDUSD: шорты +1.15R против +19.25R у both),
+# переключатель оставлен для экспериментов; live по умолчанию — both.
+RANGE_SIDE = os.getenv("RANGE_SIDE", "both").strip().lower()
+# Тренд-фильтр range по H4 EMA200: off / with / against. WFA 2026-11-03:
+# EURUSD with +41.9R OOS (63% активных фолдов), AUDUSD +21.2R (58%).
+RANGE_TREND = os.getenv("RANGE_TREND", "off").strip().lower()
 # Окно торговли по времени СЕРВЕРА (у этого брокера UTC+2), вид "0800-2300".
 # Пусто — фильтр выключен. По бэктесту окно не улучшает ни прибыль, ни риск.
 RANGE_SESSION = os.getenv("RANGE_SESSION", "").strip()
@@ -68,6 +79,10 @@ ICT_SWING = int(os.getenv("ICT_SWING", "20"))
 ICT_FVG_WINDOW = int(os.getenv("ICT_FVG_WINDOW", "20"))
 ICT_RETEST_LOOK = int(os.getenv("ICT_RETEST_LOOK", "40"))
 ICT_STOP_BUF = float(os.getenv("ICT_STOP_BUF", "0.25"))
+# CRT (Candle Range Theory): диапазон C1 и свип C2 на старшем ТФ, вход на
+# рабочем (crt.py). H4/M15 — «народный» дефолт методички.
+CRT_RANGE_TF = os.getenv("CRT_RANGE_TF", "240").strip() or "240"
+CRT_PARAMS = crt.params_from_env(os.environ)
 STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              f"bot_state_{SYMBOL.replace('.', '_')}_{STRATEGY}.json")
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "renders")
@@ -87,7 +102,7 @@ MT5_SCREENSHOT = os.getenv("MT5_SCREENSHOT", "1").strip().lower() in ("1", "true
 # тоже ходят вместе. Кросс-лок не даёт группе набрать стек одновременных ставок.
 RISK_GROUP = {
     "US500": "indices", "EUSTX50": "indices", "UK100": "indices", "DE40": "indices",
-    "AUDUSD": "usd_fx", "USDCAD": "usd_fx", "GBPUSD": "usd_fx",
+    "AUDUSD": "usd_fx", "USDCAD": "usd_fx", "GBPUSD": "usd_fx", "EURUSD": "usd_fx",
     "XAUUSD": "metals",
 }
 # Задержка публикации сигнала в бесплатную группу, секунд (0 — без задержки).
@@ -99,6 +114,9 @@ TEASER_NEAR_PCT = float(os.getenv("TEASER_NEAR_PCT", "0.15") or 0.15)
 # Пометка «поздно» у отложенного поста: цена ушла от входа в нашу сторону больше этого %
 LATE_ENABLED = os.getenv("LATE_ENABLED", "1").strip().lower() in ("1", "true", "yes")
 LATE_MOVE_PCT = float(os.getenv("LATE_MOVE_PCT", "0.2") or 0.2)
+# Пропуск сигнала, если текущий спред больше доли риска сделки (0 — выкл).
+# Ловит новостные/ролловерные расширения, когда фиксированный риск рушится.
+SPREAD_MAX_R = float(os.getenv("SPREAD_MAX_R", "0.25") or 0.25)
 # Разбор к итогу сделки: почему стоп/цель — часть системы, а не случайность
 POSTMORTEM_ENABLED = os.getenv("POSTMORTEM_ENABLED", "1").strip().lower() in ("1", "true", "yes")
 # Подпись-дисклеймер (как в config.DISCLAIMER, но bot.py читает .env напрямую)
@@ -120,6 +138,10 @@ PARAMS = st.Params(
     # узкий стоп-коридор и R:R >= 2; env-ручки на случай отката
     risk_max_atr=float(os.getenv("CL_RISK_MAX_ATR", "2.0")),
     min_rr=float(os.getenv("CL_MIN_RR", "2.0")),
+    # Доли частичных фиксаций classic. 0/0 = не закрывать на TP1/TP2, держать
+    # до TP3 со стопом в БУ после TP1 (WFA 2026-11-03: OOS +17.8R против +5.4R).
+    p1_pct=float(os.getenv("CL_P1_PCT", "40")),
+    p2_pct=float(os.getenv("CL_P2_PCT", "30")),
 )
 
 
@@ -453,8 +475,44 @@ def open_trades_in_group(group: str) -> int:
     return n
 
 
+def spread_cost_r(symbol: str, risk: float) -> float | None:
+    """Текущий спред в долях риска сделки; None — MT5 недоступен (fail-open)."""
+    if risk <= 0:
+        return None
+    try:
+        import MetaTrader5 as mt5
+        si = mt5.symbol_info(symbol)
+        if si is None:
+            return None
+        spread = float(si.spread * si.point)
+        if spread <= 0:
+            spread = max(0.0, float(si.ask) - float(si.bid))
+        return spread / risk
+    except Exception:
+        return None
+
+
+def spread_guard_ok(symbol: str, risk: float) -> bool:
+    """False — спред шире SPREAD_MAX_R от риска сделки, вход пропускаем."""
+    if SPREAD_MAX_R <= 0:
+        return True
+    sr = spread_cost_r(symbol, risk)
+    return sr is None or sr <= SPREAD_MAX_R
+
+
 def post_signal(sig: card.Signal, chart: st.Frame, regime: str | None = None,
                 trade_id: str | None = None) -> bool:
+    # портфельный kill-switch: недельный лимит убытка останавливает новые входы
+    pause = risk_guard.pause_state()
+    if pause["paused"]:
+        print(f"kill-switch: {pause['reason']} — сигнал пропущен "
+              f"(до {risk_guard.until_text(pause['until'])})")
+        return False
+    # красные новости валюты символа: не входим за N минут до и после события
+    blocked, event = news_calendar.blackout(SYMBOL, allow_fetch=False)
+    if blocked and event:
+        print(f"новости: {news_calendar.describe(event)} — сигнал пропущен")
+        return False
     # кросс-символьный риск-лок: не больше CROSS_MAX_OPEN открытых сделок
     # в группе коррелированных символов
     max_open = int(os.getenv("CROSS_MAX_OPEN", "2"))
@@ -464,6 +522,20 @@ def post_signal(sig: card.Signal, chart: st.Frame, regime: str | None = None,
         if same >= max_open:
             print(f"кросс-лок: группа {group} уже несёт {same} открытых — сигнал пропущен")
             return False
+    if not spread_guard_ok(SYMBOL, sig.risk):
+        print(f"спред шире {SPREAD_MAX_R:.2f}R от риска — сигнал пропущен")
+        return False
+    # консенсус внешних источников: только внутренний фильтр, чужие сигналы
+    # не публикуются. Fail-open — ошибка фильтра не останавливает бота.
+    allowed, vote = consensus.precheck(SYMBOL, sig.side)
+    if not allowed:
+        print(f"консенсус: {vote['against']} источник(ов) против "
+              f"({', '.join(vote['sources_against'])}) — сигнал пропущен")
+        return False
+    if vote.get("decision") == "confirm":
+        print(f"консенсус: подтверждён {vote['for']} источник(ами)")
+    elif vote.get("decision") == "error":
+        print(f"консенсус: ошибка фильтра {vote.get('error')} — пропускаю")
     if DRY:
         print("[dry] сигнал:", sig.side, sig.entry, "SL", sig.sl, "TP", sig.tp1, sig.tp2, sig.tp3)
         return True
@@ -633,6 +705,7 @@ def manage_trade(state: dict, chart: st.Frame, i: int) -> None:
     side = "LONG" if is_long else "SHORT"
     p1 = float(tr.get("p1", PARAMS.p1_pct / 100.0))
     p2 = float(tr.get("p2", PARAMS.p2_pct / 100.0))
+    p3 = float(tr.get("p3", (100.0 - PARAMS.p1_pct - PARAMS.p2_pct) / 100.0))
     # Множители целей берём из самой сделки: у sonar/range цель одна (2R/3R),
     # у classic их три (1R/2R/3R). PARAMS — только значение по умолчанию.
     r1 = float(tr.get("r1", PARAMS.tp1_r))
@@ -715,13 +788,16 @@ def manage_trade(state: dict, chart: st.Frame, i: int) -> None:
         rp += add
         done += p1
         tr["r_partial"], tr["done"] = rp, done
-        note = "стоп в безубыток" if PARAMS.be_after == 1 else ""
-        t1, t2, t3 = chart_tps()
-        post_result("tp1", side, add, entry=tr["entry"], stop=tr["stop"],
-                    exit_px=tp1, note=note,
-                    trade_id=str(tr.get("trade_id", "")), total_r=rp,
-                    chart=chart, entry_ts=tr.get("bar_ts"), exit_idx=i,
-                    tp1=t1, tp2=t2, tp3=t3)
+        # нулевая доля — не частичный вход, а просто перевод стопа в БУ:
+        # не постим в канал «TP1 0R»
+        if p1 > 0:
+            note = "стоп в безубыток" if PARAMS.be_after == 1 else ""
+            t1, t2, t3 = chart_tps()
+            post_result("tp1", side, add, entry=tr["entry"], stop=tr["stop"],
+                        exit_px=tp1, note=note,
+                        trade_id=str(tr.get("trade_id", "")), total_r=rp,
+                        chart=chart, entry_ts=tr.get("bar_ts"), exit_idx=i,
+                        tp1=t1, tp2=t2, tp3=t3)
         if PARAMS.be_after == 1:
             tr["stop"], tr["be"] = tr["entry"], True
 
@@ -731,15 +807,20 @@ def manage_trade(state: dict, chart: st.Frame, i: int) -> None:
         rp += add
         done += p2
         tr["r_partial"], tr["done"] = rp, done
-        t1, t2, t3 = chart_tps()
-        post_result("tp2", side, add, entry=tr["entry"], stop=tr["stop"], exit_px=tp2,
-                    trade_id=str(tr.get("trade_id", "")), total_r=rp,
-                    chart=chart, entry_ts=tr.get("bar_ts"), exit_idx=i,
-                    tp1=t1, tp2=t2, tp3=t3)
+        if p3 <= 0:
+            # у сделки всего две цели (CRT): остаток закрываем на второй
+            close(rp, "tp2", exit_px=tp2)
+            return
+        if p2 > 0:
+            t1, t2, t3 = chart_tps()
+            post_result("tp2", side, add, entry=tr["entry"], stop=tr["stop"], exit_px=tp2,
+                        trade_id=str(tr.get("trade_id", "")), total_r=rp,
+                        chart=chart, entry_ts=tr.get("bar_ts"), exit_idx=i,
+                        tp1=t1, tp2=t2, tp3=t3)
         if PARAMS.be_after == 2:
             tr["stop"], tr["be"] = tr["entry"], True
 
-    if not single and (hi >= tp3 if is_long else lo <= tp3) and tr["hit2"] and not tr["hit3"]:
+    if not single and p3 > 0 and (hi >= tp3 if is_long else lo <= tp3) and tr["hit2"] and not tr["hit3"]:
         tr["hit3"] = True
         close(rp + (1.0 - done) * r3, "tp3", exit_px=tp3)
         return
@@ -791,6 +872,8 @@ def step(data: MT5Data, state: dict) -> dict:
         return step_range(state, chart, htf, smt_reference(data, chart))
     if STRATEGY == "ict":
         return step_ict(state, chart)
+    if STRATEGY == "crt":
+        return step_crt(data, state, chart, htf)
     res = st.evaluate(chart, htf, PARAMS)
     if not res.get("ok"):
         return {"ok": False, "reason": res.get("reason")}
@@ -839,7 +922,9 @@ def step(data: MT5Data, state: dict) -> dict:
     # тизер: сетап вооружился, но триггера ещё нет — предупреждаем группу
     if (TEASER_ENABLED and not entry and not state.get("trade")
             and prev_state == 0 and int(cl["state"]) == 1
-            and bar_ts > float(state.get("last_teaser_bar", 0))):
+            and bar_ts > float(state.get("last_teaser_bar", 0))
+            and not risk_guard.pause_state()["paused"]
+            and not news_calendar.blackout(SYMBOL, allow_fetch=False)[0]):
         t_side = "LONG" if bool(res["is_long"][i]) else "SHORT"
         stop_lvl = float(res["stop_l"][i] if t_side == "LONG" else res["stop_s"][i])
         px = float(chart.c[i])
@@ -1031,7 +1116,7 @@ def _trades_bar_key(trades: list[dict]) -> str:
 def scan(data: MT5Data) -> None:
     """История сигналов и сделок — для сверки с графиком.
     Тестирует ту стратегию, которая выбрана в STRATEGY
-    (range/sonar/classic/pdl/ict)."""
+    (range/sonar/classic/pdl/ict/crt)."""
     if STRATEGY == "range":
         return scan_range(data)
     if STRATEGY == "sonar":
@@ -1040,6 +1125,8 @@ def scan(data: MT5Data) -> None:
         return scan_pdl(data)
     if STRATEGY == "ict":
         return scan_ict(data)
+    if STRATEGY == "crt":
+        return scan_crt(data)
     return scan_classic(data)
 
 
@@ -1067,6 +1154,24 @@ def scan_ict(data: MT5Data) -> None:
     chart, _htf = load_frames(data, SYMBOL, TF, BARS)
     scan_generic("стратегия ict (свип -> FVG -> ретест)",
                  ict2022.backtest(chart), chart)
+
+
+def _crt_range_frame(data: MT5Data, chart: st.Frame) -> st.Frame:
+    """Старший ТФ для диапазона C1: из load_frames или отдельным запросом."""
+    range_tf = CRT_RANGE_TF
+    span = float(chart.t[-1] - chart.t[0])
+    mins = feeds.TF_MINUTES.get(range_tf.upper(), 240)
+    need = int(span / (mins * 60)) + 320
+    return data.frame(SYMBOL, range_tf, need)
+
+
+def scan_crt(data: MT5Data) -> None:
+    """Бэктест CRT: диапазон C1 -> свип C2 с возвратом -> EQ и граница."""
+    chart, htf = load_frames(data, SYMBOL, TF, BARS)
+    H = htf.get(CRT_RANGE_TF) or _crt_range_frame(data, chart)
+    scan_generic(f"стратегия crt ({CRT_PARAMS.variant}, диапазон "
+                 f"{feeds.tf_label(CRT_RANGE_TF)})",
+                 crt.backtest(chart, H, CRT_PARAMS), chart)
 
 
 def scan_classic(data: MT5Data) -> None:
@@ -1120,7 +1225,8 @@ def scan_range(data: MT5Data) -> None:
     trades = range_v2.backtest(chart, zones, H, stop_atr=RANGE_STOP_ATR,
                                tp_r=RANGE_TP_R, max_r=RANGE_TP_R + 2.0,
                                session=RANGE_SESSION, smt=smt, smt_look=SMT_LOOK,
-                               max_bars=PARAMS.max_bars, er_max=RANGE_ER_MAX)
+                               max_bars=PARAMS.max_bars, er_max=RANGE_ER_MAX,
+                               side_allow=RANGE_SIDE, trend_filter=RANGE_TREND)
     if trades:
         print_trades_stats(trades, chart, key=_trades_bar_key(trades))
     else:
@@ -1142,30 +1248,84 @@ def scan_sonar(data: MT5Data) -> None:
         print("сделок нет")
 
 
-def step_sonar(state: dict, chart: st.Frame, htf: dict) -> dict:
-    """Вход по реакции от уровня (Sonar) с фильтром тренда 4H."""
+# --- общий каркас step_*: одинаковые проверки не должны разъезжаться -------
+
+def _bar_ctx(chart: st.Frame) -> tuple[int, float, dt.datetime]:
+    """(индекс последнего бара, его время, время закрытия) — одинаково у всех."""
     i = len(chart.c) - 1
     bar_ts = float(chart.t[i])
     bar_sec = feeds.TF_MINUTES.get(TF.upper(), 15) * 60
-    when = dt.datetime.fromtimestamp(bar_ts + bar_sec, dt.timezone.utc)
+    return i, bar_ts, dt.datetime.fromtimestamp(bar_ts + bar_sec, dt.timezone.utc)
+
+
+def _step_info(state: dict, bar_ts: float, when, marks: str) -> dict:
+    return {"ok": True, "bar": bar_ts, "when": when, "marks": marks,
+            "missing": 0, "side": "-", "posted": False,
+            "trade": bool(state.get("trade"))}
+
+
+def _manage_if_new_bar(state: dict, chart: st.Frame, i: int, bar_ts: float) -> None:
+    """Ведём открытую сделку на новом баре; старые входы не пересчитываем."""
+    if state.get("trade") and bar_ts > state["trade"]["bar_ts"]:
+        manage_open_trade(state, chart, i)
+        save_state(state)
+
+
+def _already_posted(state: dict, bar_ts: float) -> bool:
+    return bar_ts <= state.get("last_signal_bar", 0)
+
+
+def _daily_limit(info: dict, bar_ts: float) -> bool:
+    if MAX_DAILY_STOPS > 0 and risk_stops_today(bar_ts) >= MAX_DAILY_STOPS:
+        info["marks"] += " · дневной лимит стопов"
+        return True
+    return False
+
+
+def _open_trade(state: dict, info: dict, csig: card.Signal, *, tid: str,
+                i: int, bar_ts: float, tp1: float, tp2: float,
+                tp3: float | None, single: bool, p1: float, p2: float,
+                r1: float, extra: dict | None = None) -> None:
+    """Запоминает сделку после успешной публикации. Поля общие для стратегий."""
+    sgn = 1 if csig.side == "LONG" else -1
+    trade = {
+        "trade_id": tid,
+        "dir": sgn, "entry": csig.entry, "stop": csig.sl,
+        "risk": abs(csig.entry - csig.sl),
+        "tp1": tp1, "tp2": tp2, "tp3": tp3,
+        "bar_idx": i, "bar_ts": bar_ts,
+        "last_mgd_ts": bar_ts, "ts_saved": time.time(),
+        "hit1": False, "hit2": False, "hit3": False, "be": False,
+        "done": 0.0, "r_partial": 0.0,
+        "p1": p1, "p2": p2,
+        "single": single, "r1": r1,
+    }
+    if extra:
+        trade.update(extra)
+    state["last_signal_bar"] = bar_ts
+    state["trade"] = trade
+    save_state(state)
+    info["posted"] = True
+    info["trade"] = True
+    print(f"СИГНАЛ {csig.side} {csig.entry} · SL {csig.sl} · цель {csig.tp1}")
+
+
+def step_sonar(state: dict, chart: st.Frame, htf: dict) -> dict:
+    """Вход по реакции от уровня (Sonar) с фильтром тренда 4H."""
+    i, bar_ts, when = _bar_ctx(chart)
 
     atr = sonar.build_atr(chart)
     lv = sonar.find_levels(chart, atr, min_touches=SONAR_TOUCHES)
     levels = lv[i]["levels"]
 
-    info = {"ok": True, "bar": bar_ts, "when": when, "marks": f"{len(levels)} ур.",
-            "missing": 0, "side": "-", "posted": False,
-            "trade": bool(state.get("trade"))}
+    info = _step_info(state, bar_ts, when, f"{len(levels)} ур.")
 
-    if state.get("trade") and bar_ts > state["trade"]["bar_ts"]:
-        manage_open_trade(state, chart, i)
-        save_state(state)
+    _manage_if_new_bar(state, chart, i, bar_ts)
     if state.get("trade"):
         return info
-    if bar_ts <= state.get("last_signal_bar", 0):
+    if _already_posted(state, bar_ts):
         return info
-    if MAX_DAILY_STOPS > 0 and risk_stops_today(bar_ts) >= MAX_DAILY_STOPS:
-        info["marks"] += " · дневной лимит стопов"
+    if _daily_limit(info, bar_ts):
         return info
 
     sig = sonar.detect_at(chart, atr, lv, i)
@@ -1194,22 +1354,9 @@ def step_sonar(state: dict, chart: st.Frame, htf: dict) -> dict:
     if not post_signal(csig, chart, trade_id=tid):
         return info
 
-    state["last_signal_bar"] = bar_ts
-    state["trade"] = {
-        "trade_id": tid,
-        "dir": sgn, "entry": csig.entry, "stop": csig.sl,
-        "risk": abs(csig.entry - csig.sl),
-        "tp1": tp, "tp2": tp, "tp3": tp,
-        "bar_idx": i, "bar_ts": bar_ts,
-        "last_mgd_ts": bar_ts, "ts_saved": time.time(),
-        "hit1": False, "hit2": False, "hit3": False, "be": False,
-        "done": 0.0, "r_partial": 0.0, "p1": 1.0, "p2": 0.0,
-        "single": True, "r1": SONAR_TARGET_R,
-    }
-    save_state(state)
-    info["posted"] = True
-    info["trade"] = True
-    print(f"СИГНАЛ {side} {csig.entry} · SL {csig.sl} · цель {tp}")
+    _open_trade(state, info, csig, tid=tid, i=i, bar_ts=bar_ts,
+                tp1=tp, tp2=tp, tp3=tp, single=True, p1=1.0, p2=0.0,
+                r1=SONAR_TARGET_R)
     return info
 
 
@@ -1217,10 +1364,7 @@ def step_range(state: dict, chart: st.Frame, htf: dict, smt=None) -> dict:
     """Вход от границы зоны старшего ТФ (MSNR) по рынку на закрытии бара."""
     import range_v2
 
-    i = len(chart.c) - 1
-    bar_ts = float(chart.t[i])
-    bar_sec = feeds.TF_MINUTES.get(TF.upper(), 15) * 60
-    when = dt.datetime.fromtimestamp(bar_ts + bar_sec, dt.timezone.utc)
+    i, bar_ts, when = _bar_ctx(chart)
 
     H = htf.get(RANGE_ZONE_TF)
     if H is None:
@@ -1228,16 +1372,12 @@ def step_range(state: dict, chart: st.Frame, htf: dict, smt=None) -> dict:
     zones = range_v2.zones_for_chart(chart, H, touches=2, flips_keep=RANGE_FLIP_KEEP)
     levels = zones[i]["levels"]
 
-    info = {"ok": True, "bar": bar_ts, "when": when, "marks": f"{len(levels)} зон",
-            "missing": 0, "side": "-", "posted": False,
-            "trade": bool(state.get("trade"))}
+    info = _step_info(state, bar_ts, when, f"{len(levels)} зон")
 
-    if state.get("trade") and bar_ts > state["trade"]["bar_ts"]:
-        manage_open_trade(state, chart, i)
-        save_state(state)
+    _manage_if_new_bar(state, chart, i, bar_ts)
     if state.get("trade"):
         return info
-    if bar_ts <= state.get("last_signal_bar", 0):
+    if _already_posted(state, bar_ts):
         return info
 
     # фильтр режима: во флэте преимущество, в тренде его почти нет
@@ -1250,8 +1390,7 @@ def step_range(state: dict, chart: st.Frame, htf: dict, smt=None) -> dict:
         return info
 
     # дневной риск-гард: после N стопов на счёте день закрыт, новых входов нет
-    if MAX_DAILY_STOPS > 0 and risk_stops_today(bar_ts) >= MAX_DAILY_STOPS:
-        info["marks"] += " · дневной лимит стопов"
+    if _daily_limit(info, bar_ts):
         return info
 
     # структурная инвалидация: уровень, от которого уже ловили стопы, не берём,
@@ -1276,6 +1415,12 @@ def step_range(state: dict, chart: st.Frame, htf: dict, smt=None) -> dict:
         return info
 
     side, _level_px = sig
+    if not range_v2.side_ok(side, RANGE_SIDE):
+        info["marks"] += f" · сторона {side} выключена"
+        return info
+    if not range_v2.trend_ok(H, bar_ts, side, RANGE_TREND):
+        info["marks"] += " · против тренда H4"
+        return info
     sgn = 1 if side == "LONG" else -1
 
     # SMT-подтверждение: парный инструмент (серебро) не снял тот же экстремум
@@ -1314,23 +1459,11 @@ def step_range(state: dict, chart: st.Frame, htf: dict, smt=None) -> dict:
     if not post_signal(csig, chart, regime=csig_regime, trade_id=tid):
         return info
 
-    state["last_signal_bar"] = bar_ts
-    state["trade"] = {
-        "trade_id": tid,
-        "dir": sgn, "entry": csig.entry, "stop": csig.sl,
-        "risk": abs(csig.entry - csig.sl),
-        "tp1": csig.tp1, "tp2": csig.tp1, "tp3": csig.tp1,
-        "bar_idx": i, "bar_ts": bar_ts,
-        "last_mgd_ts": bar_ts, "ts_saved": time.time(),
-        "level": float(_level_px),
-        "hit1": False, "hit2": False, "hit3": False, "be": False,
-        "done": 0.0, "r_partial": 0.0, "p1": 1.0, "p2": 0.0,
-        "single": True, "r1": abs(target - entry) / risk,
-    }
-    save_state(state)
-    info["posted"] = True
-    info["trade"] = True
-    print(f"СИГНАЛ {side} {csig.entry} · SL {csig.sl} · цель {csig.tp1}")
+    _open_trade(state, info, csig, tid=tid, i=i, bar_ts=bar_ts,
+                tp1=csig.tp1, tp2=csig.tp1, tp3=csig.tp1,
+                single=True, p1=1.0, p2=0.0,
+                r1=abs(target - entry) / risk,
+                extra={"level": float(_level_px)})
     return info
 
 
@@ -1343,18 +1476,12 @@ def step_ict(state: dict, chart: st.Frame) -> dict:
     """
     import ict2022
 
-    i = len(chart.c) - 1
-    bar_ts = float(chart.t[i])
+    i, bar_ts, when = _bar_ctx(chart)
     bar_sec = feeds.TF_MINUTES.get(TF.upper(), 15) * 60
-    when = dt.datetime.fromtimestamp(bar_ts + bar_sec, dt.timezone.utc)
 
-    info = {"ok": True, "bar": bar_ts, "when": when, "marks": "ICT",
-            "missing": 0, "side": "-", "posted": False,
-            "trade": bool(state.get("trade"))}
+    info = _step_info(state, bar_ts, when, "ICT")
 
-    if state.get("trade") and bar_ts > state["trade"]["bar_ts"]:
-        manage_open_trade(state, chart, i)
-        save_state(state)
+    _manage_if_new_bar(state, chart, i, bar_ts)
 
     # машина состояний идёт по каждому закрытому бару, даже пока открыта
     # сделка; сигнал на таком баре теряется — как в бэктесте
@@ -1367,12 +1494,11 @@ def step_ict(state: dict, chart: st.Frame) -> dict:
 
     if state.get("trade"):
         return info
-    if bar_ts <= state.get("last_signal_bar", 0):
+    if _already_posted(state, bar_ts):
         return info
 
     # дневной риск-гард: как у range, общий на счёт
-    if MAX_DAILY_STOPS > 0 and risk_stops_today(bar_ts) >= MAX_DAILY_STOPS:
-        info["marks"] += " · дневной лимит стопов"
+    if _daily_limit(info, bar_ts):
         return info
 
     if not sig:
@@ -1394,22 +1520,76 @@ def step_ict(state: dict, chart: st.Frame) -> dict:
     if not post_signal(csig, chart, regime="ICT · свип → FVG", trade_id=tid):
         return info
 
-    state["last_signal_bar"] = bar_ts
-    state["trade"] = {
-        "trade_id": tid,
-        "dir": sgn, "entry": csig.entry, "stop": csig.sl,
-        "risk": abs(csig.entry - csig.sl),
-        "tp1": tp, "tp2": tp, "tp3": tp,
-        "bar_idx": i, "bar_ts": bar_ts,
-        "last_mgd_ts": bar_ts, "ts_saved": time.time(),
-        "hit1": False, "hit2": False, "hit3": False, "be": False,
-        "done": 0.0, "r_partial": 0.0, "p1": 1.0, "p2": 0.0,
-        "single": True, "r1": ICT_TP_R,
-    }
-    save_state(state)
-    info["posted"] = True
-    info["trade"] = True
-    print(f"СИГНАЛ {side} {csig.entry} · SL {csig.sl} · цель {csig.tp1}")
+    _open_trade(state, info, csig, tid=tid, i=i, bar_ts=bar_ts,
+                tp1=tp, tp2=tp, tp3=tp, single=True, p1=1.0, p2=0.0,
+                r1=ICT_TP_R)
+    return info
+
+
+def step_crt(data: MT5Data, state: dict, chart: st.Frame, htf: dict) -> dict:
+    """Вход по CRT (crt.signal_at): диапазон C1 -> свип C2 с возвратом.
+
+    Сигнал ставится на первом закрытом баре после закрытия C2 на старшем ТФ;
+    вход по рынку по цене закрытия этого бара, как у ict/range.
+    """
+    i, bar_ts, when = _bar_ctx(chart)
+
+    info = _step_info(state, bar_ts, when, "CRT")
+
+    _manage_if_new_bar(state, chart, i, bar_ts)
+
+    H = htf.get(CRT_RANGE_TF) or _crt_range_frame(data, chart)
+    sig = crt.signal_at(crt.scan(chart, H, CRT_PARAMS), i)
+
+    if state.get("trade"):
+        return info
+    if _already_posted(state, bar_ts):
+        return info
+    if _daily_limit(info, bar_ts):
+        return info
+    if not sig:
+        return info
+
+    side = sig["side"]
+    sgn = 1 if side == "LONG" else -1
+    entry = float(chart.c[i])
+    risk = abs(entry - sig["stop"])
+    if risk <= 0:
+        return info
+    atr_i = float(ta.atr(chart.h, chart.l, chart.c, 14)[i])
+    if CRT_PARAMS.min_risk_atr > 0 and atr_i > 0 and \
+            risk < CRT_PARAMS.min_risk_atr * atr_i:
+        info["marks"] += " · стоп слишком близко"
+        return info
+    stop = entry - sgn * risk
+
+    tp2 = float(sig["tp2"])
+    r2 = sgn * (tp2 - entry) / risk
+    if r2 <= 0:
+        return info
+    tp1 = sig["tp1"]
+    if tp1 is not None:
+        r1 = sgn * (float(tp1) - entry) / risk
+        if r1 < 0.05:                      # цена уже за серединой — без частичного
+            tp1 = None
+    if tp1 is None:
+        single, p1, p2, r1v = True, 1.0, 0.0, r2
+        tp_card1 = tp2
+    else:
+        single, p1, p2, r1v = False, 0.5, 0.5, r1
+        tp_card1 = float(tp1)
+
+    info["side"] = side
+    csig = card.Signal(side=side, symbol=SYMBOL, tf=TF, entry=entry, sl=stop,
+                       tp1=tp_card1, tp2=tp2, tp3=None if single else tp2, when=when)
+    tid = trade_id_for(csig, bar_ts)
+    if not post_signal(csig, chart, regime="CRT · свип → возврат", trade_id=tid):
+        return info
+
+    _open_trade(state, info, csig, tid=tid, i=i, bar_ts=bar_ts,
+                tp1=tp_card1, tp2=tp2, tp3=None,
+                single=single, p1=p1, p2=p2, r1=r1v,
+                extra={"p3": 0.0, "r2": r2, "r3": r2})
     return info
 
 
@@ -1434,6 +1614,7 @@ def connect() -> MT5Data | None:
 
 def main() -> None:
     store.init_db()
+    news_calendar.start_background_refresh()
     state = load_state()
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
 

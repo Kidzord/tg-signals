@@ -30,6 +30,7 @@ import requests
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config as cfg
+import risk_guard
 import store
 import tg
 
@@ -37,6 +38,16 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 STATE_PATH = os.path.join(HERE, "monitor_state.json")
 # pending дольше этого — считаем, что доставка встала
 BACKLOG_STALE_SEC = 30 * 60
+_BOT_RE = re.compile(r"(?<![a-z])bot\.py", re.I)
+# Компоненты, которые watchdog поднимает молча; если кого-то нет дольше
+# COMPONENT_ALERT_MIN минут — сообщаем владельцу.
+COMPONENTS = (
+    ("premium-бот", re.compile(r"subbot\.py", re.I)),
+    ("автопосты", re.compile(r"autoposts\.py", re.I)),
+    ("heartbeat", re.compile(r"heartbeat\.py", re.I)),
+    ("мониторинг", re.compile(r"monitor\.py", re.I)),
+    ("watchdog", re.compile(r"watchdog\.ps1", re.I)),
+)
 
 
 def _load_state() -> dict:
@@ -75,7 +86,23 @@ def _transition(key: str, bad: bool, bad_text: str, ok_text: str, state: dict) -
     state[key] = bad
 
 
-def check_heartbeats() -> tuple[bool, str]:
+def _process_cmdlines() -> list[str] | None:
+    """Командные строки python.exe/powershell.exe одним запросом."""
+    script = ("@(Get-CimInstance Win32_Process -Filter "
+              "\"Name='python.exe' OR Name='powershell.exe'\" | "
+              "ForEach-Object { $_.CommandLine })")
+    try:
+        ps = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                            capture_output=True, timeout=30)
+        if ps.returncode != 0:
+            return None
+        text = ps.stdout.decode("utf-8", errors="ignore")
+        return [line.strip() for line in text.splitlines() if line.strip()]
+    except Exception:
+        return None
+
+
+def check_heartbeats(cmdlines: list[str] | None = None) -> tuple[bool, str]:
     """Свежесть hb-файлов и число процессов bot.py."""
     now = time.time()
     files = glob.glob(os.path.join(HERE, "hb_*.json"))
@@ -98,17 +125,11 @@ def check_heartbeats() -> tuple[bool, str]:
         except (OSError, ValueError):
             pass
     # число процессов — второй сигнал: файл мог остаться от прошлого запуска
+    if cmdlines is None:
+        cmdlines = _process_cmdlines()
     procs = -1
-    try:
-        ps = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "(Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
-             "Where-Object { $_.CommandLine -match '(?<![a-z])bot\\.py' }).Count"],
-            capture_output=True, timeout=30)
-        m = re.search(r"\d+", ps.stdout.decode("utf-8", errors="ignore"))
-        procs = int(m.group()) if m else -1
-    except Exception:
-        pass
+    if cmdlines is not None:
+        procs = sum(1 for line in cmdlines if _BOT_RE.search(line))
     problems: list[str] = []
     if stale:
         problems.append("нет пульса: " + ", ".join(stale))
@@ -121,6 +142,53 @@ def check_heartbeats() -> tuple[bool, str]:
     elif not files and procs < 0:
         problems.append("нет heartbeat-файлов, процессы проверить не удалось")
     return (not problems), ("; ".join(problems) or "все боты живы")
+
+
+def check_components(state: dict, cmdlines: list[str] | None = None,
+                     now: float | None = None) -> tuple[bool, str]:
+    """Долгое отсутствие subbot/autoposts/heartbeat/monitor/watchdog."""
+    now = time.time() if now is None else now
+    if cmdlines is None:
+        cmdlines = _process_cmdlines()
+    if cmdlines is None:
+        return False, "не удалось получить список процессов"
+    since_map = state.get("missing_since")
+    if not isinstance(since_map, dict):
+        since_map = {}
+    problems: list[str] = []
+    present: list[str] = []
+    for name, pattern in COMPONENTS:
+        if any(pattern.search(line) for line in cmdlines):
+            since_map.pop(name, None)
+            present.append(name)
+            continue
+        since = float(since_map.get(name) or now)
+        since_map[name] = since
+        age_min = (now - since) / 60.0
+        if age_min >= cfg.COMPONENT_ALERT_MIN:
+            problems.append(f"{name} нет {age_min:.0f} мин")
+    state["missing_since"] = since_map
+    if problems:
+        return False, "; ".join(problems)
+    return True, "на месте: " + ", ".join(present)
+
+
+def check_killswitch(state: dict,
+                     apply_pause: bool = True) -> tuple[bool, str]:
+    """Недельный лимит убытка: включить паузу и сообщить владельцу."""
+    res = risk_guard.apply() if apply_pause else risk_guard.evaluate()
+    if res["paused"]:
+        text = (f"⛔ <b>Портфельный kill-switch</b>\n"
+                f"{res['r']:+.2f}R за {res['n']} сделок с начала недели "
+                f"(лимит {res['limit']:+.1f}R).\n"
+                f"Новые сигналы приостановлены до "
+                f"{risk_guard.until_text(res['until'])}.\n"
+                "Снять: /guard resume")
+    else:
+        text = "🟢 <b>Kill-switch</b> снят — новые сигналы снова публикуются."
+    if apply_pause:
+        _transition("killswitch", bool(res["paused"]), text, text, state)
+    return bool(res["paused"]), risk_guard.status_text()
 
 
 def check_delivery() -> tuple[bool, str]:
@@ -218,14 +286,20 @@ def set_healthcheck(url: str) -> bool:
 def run_once(send_alerts: bool = True) -> dict:
     store.init_db()
     state = _load_state()
-    ok_b, text_b = check_heartbeats()
+    cmdlines = _process_cmdlines()
+    ok_b, text_b = check_heartbeats(cmdlines)
+    ok_c, text_c = check_components(state, cmdlines)
     ok_d, text_d = check_delivery()
     ok_bk, text_bk = check_backup()
     ok_lg, text_lg = check_logs()
+    ok_k, text_k = check_killswitch(state, apply_pause=send_alerts)
     if send_alerts:
         _transition("bots", not ok_b,
                     f"🔴 <b>Боты сигналов</b>\n{text_b}",
                     "🟢 <b>Боты сигналов</b> снова на связи.", state)
+        _transition("components", not ok_c,
+                    f"🔴 <b>Компоненты</b>\n{text_c}",
+                    "🟢 <b>Компоненты</b> снова на месте.", state)
         _transition("delivery", not ok_d,
                     f"🔴 <b>Доставка</b>\n{text_d}",
                     "🟢 <b>Доставка</b> восстановлена.", state)
@@ -238,9 +312,11 @@ def run_once(send_alerts: bool = True) -> dict:
         _save_state(state)
     ping_healthcheck()
     return {"bots": ok_b, "bots_text": text_b,
+            "components": ok_c, "components_text": text_c,
             "delivery": ok_d, "delivery_text": text_d,
             "backup": ok_bk, "backup_text": text_bk,
-            "logs": ok_lg, "logs_text": text_lg}
+            "logs": ok_lg, "logs_text": text_lg,
+            "killswitch": ok_k, "killswitch_text": text_k}
 
 
 def main() -> None:
@@ -250,9 +326,13 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "once":
         res = run_once(send_alerts=False)
         print("боты:", "ok" if res["bots"] else "ПРОБЛЕМА", "-", res["bots_text"])
+        print("компоненты:", "ok" if res["components"] else "ПРОБЛЕМА", "-",
+              res["components_text"])
         print("доставка:", "ok" if res["delivery"] else "ПРОБЛЕМА", "-", res["delivery_text"])
         print("бэкапы:", "ok" if res["backup"] else "ПРОБЛЕМА", "-", res["backup_text"])
         print("логи:", "ok" if res["logs"] else "ПРОБЛЕМА", "-", res["logs_text"])
+        print("kill-switch:", "ПАУЗА" if res["killswitch"] else "ok", "-",
+              res["killswitch_text"].replace("\n", " | "))
         return
     print(f"monitor: каждые {cfg.MONITOR_EVERY_MIN} мин, "
           f"порог пульса {cfg.MONITOR_STALE_MIN} мин, "

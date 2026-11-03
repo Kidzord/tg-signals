@@ -13,3 +13,9 @@ tzdata>=2024.1
 # Опционально: только Windows и только если есть запущенный терминал MT5.
 # Без него карточка рисуется по CSV или демо-данным.
 # MetaTrader5>=5.0.45
+
+# Опционально: Discord-приём (discord_intake.py).
+# discord.py>=2.3
+# Для OCR скриншотов достаточно одного бэкенда:
+# rapidocr-onnxruntime>=1.3
+# pytesseract>=0.3.10   # плюс установленный tesseract и язык eng

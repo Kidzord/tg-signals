@@ -78,7 +78,7 @@ PORT = int(os.getenv("PORT", "8080"))
 SYMBOL_FILTER = tuple(
     s.strip().upper() for s in os.getenv(
         "SYMBOL_FILTER",
-        "XAU,GOLD,AUDUSD,USDCAD,GBPUSD,US500,EUSTX50,UK100,DE40,JPN225",
+        "XAU,GOLD,AUDUSD,USDCAD,EURUSD,GBPUSD,US500,EUSTX50,UK100,DE40,JPN225",
     ).split(",") if s.strip()
 )
 
@@ -128,13 +128,10 @@ LANDING_TIME = os.getenv("LANDING_TIME", "23:55").strip()
 # Напоминания о постах для X (отдельный англ. аккаунт) в личку
 X_REMIND_ENABLED = _flag("X_REMIND_ENABLED", "1")
 X_REMIND_TIMES = os.getenv("X_REMIND_TIMES", "10:30,16:30").strip()
-# Напоминания о постах для VK и Дзена (RU, тот же банк, что у Threads)
-RU_REMIND_ENABLED = _flag("RU_REMIND_ENABLED", "1")
-VK_REMIND_TIMES = os.getenv("VK_REMIND_TIMES", "11:00,17:00").strip()
-DZEN_REMIND_TIMES = os.getenv("DZEN_REMIND_TIMES", "12:00,18:00").strip()
-# TikTok: карусель из карточек и текста в личку владельцу (API требует аудита)
+# TikTok: карусель из карточек и текста в личку владельцу (API требует аудита).
+# Два слота в день: днём — «что сделал в боте», вечером — дневниковая история.
 TIKTOK_REMIND_ENABLED = _flag("TIKTOK_REMIND_ENABLED", "1")
-TIKTOK_REMIND_TIMES = os.getenv("TIKTOK_REMIND_TIMES", "19:00").strip()
+TIKTOK_REMIND_TIMES = os.getenv("TIKTOK_REMIND_TIMES", "12:30,19:30").strip()
 
 # --- Пробный доступ и рефералы (premium-бот) ---
 # Пробный доступ: сколько дней даём один раз новому пользователю (0/выкл — не даём)
@@ -170,11 +167,83 @@ MONITOR_ENABLED = _flag("MONITOR_ENABLED", "1")
 MONITOR_EVERY_MIN = int(_float("MONITOR_EVERY_MIN", 15.0))
 # если пульса нет дольше M минут — алерт владельцу в личку
 MONITOR_STALE_MIN = int(_float("MONITOR_STALE_MIN", 15.0))
-# сколько процессов bot.py должно работать (range AUDUSD+USDCAD + classic XAUUSD)
-EXPECTED_BOTS = int(_float("HEARTBEAT_EXPECT_BOTS", 3.0))
+# сколько процессов bot.py должно работать (range AUDUSD+USDCAD+EURUSD + classic XAUUSD)
+EXPECTED_BOTS = int(_float("HEARTBEAT_EXPECT_BOTS", 4.0))
 # Внешний dead-man switch: URL healthchecks.io (или аналога). Пока ПК жив,
 # monitor.py раз в цикл пингует его; если ПК упал — сервис шлёт алерт.
 HEALTHCHECK_URL = os.getenv("HEALTHCHECK_URL", "").strip()
+# Компонент (subbot/autoposts/heartbeat/monitor/watchdog) отсутствует дольше
+# COMPONENT_ALERT_MIN минут — алерт владельцу. Watchdog обычно поднимает
+# раньше, поэтому короткие перезапуски не спамят.
+COMPONENT_ALERT_MIN = int(_float("COMPONENT_ALERT_MIN", 10.0))
+
+# --- Надёжность: kill-switch, форвард-контроль, restore-drill, новости ---
+# Портфельный kill-switch: сумма R закрытых сделок с начала недели ниже
+# PORTFOLIO_WEEK_LIMIT_R (и сделок не меньше PORTFOLIO_WEEK_MIN_TRADES)
+# останавливает новые сигналы до следующего понедельника.
+PORTFOLIO_WEEK_LIMIT_R = _float("PORTFOLIO_WEEK_LIMIT_R", -6.0)
+PORTFOLIO_WEEK_MIN_TRADES = int(_float("PORTFOLIO_WEEK_MIN_TRADES", 4.0))
+# Форвард-контроль: последние FORWARD_WINDOW сделок символа дали
+# <= FORWARD_DEGRADE_R — кандидат на отключение (алерт в вс 18:00).
+FORWARD_WINDOW = int(_float("FORWARD_WINDOW", 20.0))
+FORWARD_DEGRADE_R = _float("FORWARD_DEGRADE_R", -3.0)
+FORWARD_CONTROL_ENABLED = _flag("FORWARD_CONTROL_ENABLED", "1")
+FORWARD_CONTROL_TIME = os.getenv("FORWARD_CONTROL_TIME", "18:00").strip()
+# Тренировочное восстановление из последнего бэкапа в песочницу.
+RESTORE_DRILL_ENABLED = _flag("RESTORE_DRILL_ENABLED", "1")
+RESTORE_DRILL_TIME = os.getenv("RESTORE_DRILL_TIME", "18:10").strip()
+# Новостной фильтр: красные события экономического календаря ForexFactory.
+NEWS_FILTER_ENABLED = _flag("NEWS_FILTER_ENABLED", "1")
+NEWS_BLOCK_BEFORE_MIN = int(_float("NEWS_BLOCK_BEFORE_MIN", 30.0))
+NEWS_BLOCK_AFTER_MIN = int(_float("NEWS_BLOCK_AFTER_MIN", 15.0))
+NEWS_CACHE_TTL_H = _float("NEWS_CACHE_TTL_H", 6.0)
+
+# --- Консенсус внешних источников (только внутренний фильтр) ---
+# Бот не читает чужие каналы сам: сигналы попадают в consensus_signals.jsonl
+# только авторизованно (CLI, /consensus/{secret} в app.py) и не публикуются.
+# warn — писать в консоль, filter — пропускать вход при конфликте.
+CONSENSUS_ENABLED = _flag("CONSENSUS_ENABLED", "0")
+CONSENSUS_MODE = os.getenv("CONSENSUS_MODE", "warn").strip().lower()
+CONSENSUS_MIN_AGREE = int(_float("CONSENSUS_MIN_AGREE", 2.0))
+CONSENSUS_WINDOW_MIN = int(_float("CONSENSUS_WINDOW_MIN", 60.0))
+CONSENSUS_MAX_AGE_MIN = int(_float("CONSENSUS_MAX_AGE_MIN", 240.0))
+CONSENSUS_SOURCES = tuple(
+    s.strip().lower()
+    for s in os.getenv("CONSENSUS_SOURCES", "").split(",")
+    if s.strip()
+)
+CONSENSUS_BLOCK_CONFLICT = _flag("CONSENSUS_BLOCK_CONFLICT", "1")
+CONSENSUS_PATH = os.getenv("CONSENSUS_PATH", "").strip()
+
+# --- Research-гейт для идей из внешних источников ---
+# Порог, ниже которого WFA-результат не считается основанием для включения.
+RESEARCH_MIN_TRADES = int(_float("RESEARCH_MIN_TRADES", 20.0))
+RESEARCH_MIN_POS_FOLDS = _float("RESEARCH_MIN_POS_FOLDS", 0.6)
+RESEARCH_PATH = os.getenv("RESEARCH_PATH", "").strip()
+
+# --- Discord-приём (официальный Bot API, см. discord_intake.py) ---
+# Бот слушает только каналы из DISCORD_CHANNELS: пусто — не слушает ничего.
+# Текст разбирается сразу, картинки — через OCR; нераспознанное идёт в очередь
+# на проверку, а не в голоса консенсуса.
+DISCORD_INTAKE_ENABLED = _flag("DISCORD_INTAKE_ENABLED", "0")
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+DISCORD_CHANNELS = tuple(
+    s.strip() for s in os.getenv("DISCORD_CHANNELS", "").split(",") if s.strip()
+)
+DISCORD_REVIEW_ALERT = _flag("DISCORD_REVIEW_ALERT", "1")
+# Каналы с разборами сделок (профит/убыток) — это не голоса, а корпус для
+# research: сообщения оттуда архивируются в discord_trades.jsonl.
+DISCORD_ARCHIVE_CHANNELS = tuple(
+    s.strip() for s in os.getenv("DISCORD_ARCHIVE_CHANNELS", "").split(",") if s.strip()
+)
+
+# --- Ретеншн файлов (tools/prune.py) ---
+# Чистятся только renders/, tg_screenshots/, discord_inbox/, preview/ —
+# обычные файлы старше PRUNE_DAYS. Запуск по расписанию в autoposts.py.
+PRUNE_ENABLED = _flag("PRUNE_ENABLED", "1")
+PRUNE_TIME = os.getenv("PRUNE_TIME", "04:00").strip()
+PRUNE_DAYS = int(_float("PRUNE_DAYS", 30.0))
+
 # Доставка: сколько попыток и максимальная пауза между ними.
 DELIVERY_MAX_ATTEMPTS = int(_float("DELIVERY_MAX_ATTEMPTS", 6.0))
 DELIVERY_ALERT = _flag("DELIVERY_ALERT", "1")

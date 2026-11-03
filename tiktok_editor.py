@@ -6,7 +6,10 @@ OAuth и аудит; до аудита посты уходят только в �
 в приложении и выбирает музыку.
 
 Команда в premium-боте (только владелец):
-    /tt          собрать карусель по последним данным
+    /tt            дневниковая карусель (кто пишет, сделки, цифры)
+    /tt shipped    карусель «что сделал в боте» (изменения + статистика)
+
+Запуск: python tiktok_editor.py [story|shipped]
 """
 from __future__ import annotations
 
@@ -14,12 +17,15 @@ import datetime as dt
 import json
 import os
 import re
+import sys
+import time
 
 from PIL import Image
 
 import config as cfg
 import devlog
 import render as card
+import social_mix
 import tg
 import threads_editor
 import track_record
@@ -84,26 +90,92 @@ def _latest_trade() -> dict | None:
     return _read_last(TRADES_PATH)
 
 
-def caption() -> str:
+def _week_rows(now_ts: float | None = None) -> list[dict]:
+    """Закрытые сделки за последние 7 дней — цифры для карусели."""
+    cutoff = (time.time() if now_ts is None else now_ts) - 7 * 86400
+    rows: list[dict] = []
+    if not os.path.exists(TRADES_PATH):
+        return rows
+    try:
+        with open(TRADES_PATH, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("kind") in ("tp1", "tp2"):
+                    continue
+                if float(rec.get("ts", 0)) >= cutoff:
+                    rows.append(rec)
+    except OSError:
+        return rows
+    return rows
+
+
+def _trades_word(n: int) -> str:
+    n10, n100 = n % 10, n % 100
+    if n10 == 1 and n100 != 11:
+        return "сделка"
+    if 2 <= n10 <= 4 and not 12 <= n100 <= 14:
+        return "сделки"
+    return "сделок"
+
+
+def _stats_text(now_ts: float | None = None) -> str:
+    rows = _week_rows(now_ts)
+    if not rows:
+        return "За 7 дней сделок не было.\nЖду сетап, а не повод зайти."
+    n = len(rows)
+    total = sum(float(t.get("r", 0)) for t in rows)
+    wins = sum(1 for t in rows if float(t.get("r", 0)) > 0)
+    return (f"За 7 дней: {n} {_trades_word(n)}, {total:+.1f}R.\n"
+            f"Винрейт {100.0 * wins / n:.0f}%.")
+
+
+def _short(text: str, limit: int = 170) -> str:
+    """Обрезать длинную заметку по границе слова — для слайда."""
+    text = " ".join(str(text).split())
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(" ", 1)[0]
+    return cut.rstrip(".,;:!?") + "…"
+
+
+def caption(variant: str = "story") -> str:
     """Короткий текст для TikTok (до 2200 символов), в тоне дневника разработки."""
     handle = (cfg.CHANNEL_HANDLE or "@KidzordFX").lstrip("@")
     day_no = devlog.day_number()
-    lines = [f"День {day_no} дневника. Я — обычный парень, месяц пилю торгового "
-             "бота: канал и соцсети ведёт он сам, я пишу код и вычитываю."]
-    trade = _latest_trade()
-    if trade:
-        r = float(trade.get("total_r", trade.get("r", 0)) or 0)
-        lines.append(f"Последняя сделка: {trade.get('symbol', '')} {r:+.1f}R. "
-                     "Вход, стоп и выход — в карусели, цифры из журнала сделок.")
+    trade = social_mix.latest_positive()
+    trade_line = (f"Последняя закрытая в плюс: {social_mix.trade_line(trade)}. "
+                  "Скрин — в карусели." if trade else "")
+    if variant == "shipped":
+        notes = [devlog.note_for_day(day_no, i) for i in (0, 1)]
+        lines = [f"Вот мой пост на сегодня. День {day_no}: что сделал по проекту."]
+        for note in notes:
+            if note:
+                lines.append(f"— {note}.")
+        if trade_line:
+            lines.append(trade_line)
+        lines.append(_stats_text().replace("\n", " "))
+        lines.append(f"Полный дневник и журнал сделок — в Telegram: t.me/{handle}")
     else:
-        sig = _latest_signal()
-        if sig:
-            lines.append(f"Свежий сигнал: {sig.get('side', '')} {sig.get('symbol', '')}. "
-                         "Вход, стоп и цели — в карусели.")
-    note = devlog.next_devnote()
-    if note:
-        lines.append(f"В разработке: {note}.")
-    lines.append(f"Полный дневник и журнал сделок — в Telegram: t.me/{handle}")
+        lines = [f"Вот мой пост на сегодня. День {day_no}: месяц пилю торгового "
+                 "бота, пишу сам, цифры беру из журнала сделок."]
+        if trade_line:
+            lines.append(trade_line)
+        else:
+            sig = _latest_signal()
+            if sig:
+                lines.append(f"Свежий сигнал: {sig.get('side', '')} {sig.get('symbol', '')}. "
+                             "Вход, стоп и цели — в карусели.")
+        note = devlog.note_for_day(day_no, 0)
+        if note:
+            lines.append(f"Что делал по проекту: {note}.")
+        lines.append(_stats_text().replace("\n", " "))
+        lines.append(f"Полный дневник и журнал сделок — в Telegram: t.me/{handle}")
     days = cfg.PROMO_CODES.get("TIKTOK")
     if days:
         lines.append(f"Промокод TIKTOK: +{days} дн. к доступу в боте.")
@@ -118,28 +190,48 @@ def _story_slides(day_no: int, handle: str) -> list[tuple[int, str, str, str]]:
     и CTA. Между ними бот вставляет реальные карточки: вход, выход, счёт, equity.
     """
     return [
-        (210, f"ДЕНЬ {day_no}",
-         "Этот пост написал не я.\n"
-         "Его написал бот, которого пишу я.\n\n"
+        (310, f"ДЕНЬ {day_no}",
+         "Вот мой пост на сегодня.\n"
+         "Код, сделки и цифры — без прикрас.\n\n"
          "Месяц пилю торгового бота.", "01_cover"),
-        (211, "КТО ЗДЕСЬ ПИШЕТ",
-         "Обычный парень. Код — по вечерам, вместе с ИИ.\n"
-         "Канал и соцсети ведёт сам бот.", "02_who"),
-        (212, "ЧТО БУДЕТ В ДНЕВНИКЕ",
+        (311, "КТО ЗДЕСЬ ПИШЕТ",
+         "Пишу сам. Код — по вечерам, вместе с ИИ.\n"
+         "Бот считает цифры, текст — мой.", "02_who"),
+        (312, "ЧТО БУДЕТ В ДНЕВНИКЕ",
          "Код. Сделки. Стопы. Цифры из журнала.\n"
          "Ничего не рисую, ничего не удаляю.", "03_what"),
-        (213, "ИЩУ ТЕСТЕРОВ",
+        (313, "ИЩУ ТЕСТЕРОВ",
          "Заходи в группу в Telegram: покрути бота, поломай, поругай.\n"
          "Бесплатно — за фидбек.", "08_testers"),
-        (214, "ДНЕВНИК РАЗРАБОТКИ",
+        (314, "ДНЕВНИК РАЗРАБОТКИ",
          "Каждый день: что добавил в код.\n"
          "Каждая сделка: вход, стоп, итог.\n"
          f"Telegram: @{handle}", "09_cta"),
     ]
 
 
-def build() -> tuple[list[str], str]:
-    """Собрать карусель: сюжет дневника + настоящие карточки сделок и цифр."""
+def _shipped_slides(day_no: int, handle: str,
+                    notes: list[str]) -> list[tuple[int, str, str, str]]:
+    """Слайды «что сделал в боте»: обложка, две заметки, цифры, CTA."""
+    first = _short(notes[0]) if notes else "Новые правки в коде и доставке."
+    second = (_short(notes[1]) if len(notes) > 1
+              else "Продолжаю чинить то, что ломается на живых данных.")
+    return [
+        (320, f"ДЕНЬ {day_no}",
+         "Вот мой пост на сегодня.\n"
+         "Что реально изменилось в проекте.\n"
+         "Без маркетинга: только код.", "01_shipped_cover"),
+        (321, "ЧТО ДОБАВИЛ", first, "02_shipped_note1"),
+        (322, "ЕЩЁ В КОДЕ", second, "03_shipped_note2"),
+        (323, "ЦИФРЫ НЕДЕЛИ", _stats_text(), "04_shipped_stats"),
+        (324, "ДНЕВНИК РАЗРАБОТКИ",
+         "Каждый день: что добавил в код.\n"
+         f"Telegram: @{handle}", "07_shipped_cta"),
+    ]
+
+
+def _build_story() -> tuple[list[str], str]:
+    """Собрать дневниковую карусель: сюжет + настоящие карточки сделок и цифр."""
     images: list[str] = []
     day_no = devlog.day_number()
     handle = (cfg.CHANNEL_HANDLE or "@KidzordFX").lstrip("@")
@@ -156,7 +248,7 @@ def build() -> tuple[list[str], str]:
         if entry:
             images.append(entry)
 
-    trade = _latest_trade()
+    trade = social_mix.latest_positive()
     if trade:
         exit_img = _fit(str(trade.get("image", "") or ""), "05_exit")
         if exit_img:
@@ -199,19 +291,72 @@ def build() -> tuple[list[str], str]:
     # Дубликаты бывают, если сигнал и результат ссылаются на один файл.
     seen: set[str] = set()
     unique = [p for p in images if p and not (p in seen or seen.add(p))]
-    return unique[:10], caption()
+    return unique[:10], caption("story")
 
 
-def send(chat_id: str, token: str | None = None) -> bool:
-    images, text = build()
+def _build_shipped() -> tuple[list[str], str]:
+    """Карусель «что сделал в боте»: заметки из дневника + статистика недели."""
+    images: list[str] = []
+    day_no = devlog.day_number()
+    handle = (cfg.CHANNEL_HANDLE or "@KidzordFX").lstrip("@")
+    notes = [n for n in (devlog.note_for_day(day_no, i) for i in (0, 1)) if n]
+    slides = _shipped_slides(day_no, handle, notes)
+
+    for seed, title, body, name in slides[:4]:
+        img = _generic(seed, title, body, name)
+        if img:
+            images.append(img)
+
+    trade = social_mix.latest_positive()
+    if trade:
+        exit_img = _fit(str(trade.get("image", "") or ""), "05_shipped_exit")
+        if exit_img:
+            images.append(exit_img)
+
+    try:
+        eq = track_record.render_equity(
+            30, out_path=os.path.join(OUT_DIR, "06_shipped_equity.png"),
+            portrait=True)
+        fitted = _fit(eq, "06_shipped_equity")
+        if fitted:
+            images.append(fitted)
+    except Exception as e:
+        print("tiktok: equity не отрисовалась", e)
+
+    seed, title, body, name = slides[4]
+    cta = _generic(seed, title, body, name)
+    if cta:
+        images.append(cta)
+
+    seen: set[str] = set()
+    unique = [p for p in images if p and not (p in seen or seen.add(p))]
+    return unique[:10], caption("shipped")
+
+
+def build(variant: str = "story") -> tuple[list[str], str]:
+    """Собрать карусель: story — дневник, shipped — что сделал в боте."""
+    if variant == "shipped":
+        return _build_shipped()
+    return _build_story()
+
+
+def send(chat_id: str, token: str | None = None,
+         variant: str = "story") -> bool:
+    images, text = build(variant)
     if not images:
         tg.send_plain("Не удалось собрать карусель: нет картинок.",
                       token=token, chat_id=chat_id)
         return False
+    if variant == "shipped":
+        header = ("🎠 <b>Карусель для TikTok · что сделал</b>\n"
+                  "Порядок: обложка → что добавил → ещё в коде → цифры недели "
+                  "→ сделка → CTA. Сохрани фото как есть.")
+    else:
+        header = ("🎠 <b>Карусель для TikTok · дневник</b>\n"
+                  "Порядок: крючок → кто пишет → что в дневнике → сделки и цифры "
+                  "→ тестеры → CTA. Сохрани фото как есть.")
     res = tg.send_media_group(
-        images, caption="🎠 <b>Карусель для TikTok · дневник</b>\n"
-                        "Порядок: крючок → кто пишет → что в дневнике → сделки "
-                        "и цифры → тестеры → CTA. Сохрани фото как есть.",
+        images, caption=header,
         token=token, chat_id=chat_id)
     if not res.ok:
         tg.send_plain(f"Альбом не ушёл: {res.error[:200]}", token=token, chat_id=chat_id)
@@ -225,7 +370,7 @@ def send(chat_id: str, token: str | None = None) -> bool:
 
 
 if __name__ == "__main__":
-    imgs, text = build()
+    imgs, text = build(sys.argv[1] if len(sys.argv) > 1 else "story")
     print("images:", len(imgs))
     for p in imgs:
         print(" ", p)

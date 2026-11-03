@@ -22,6 +22,8 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config as cfg
+import consensus
+import discord_intake
 import logger_config
 import tg
 
@@ -34,7 +36,7 @@ DIGEST_TIME = os.getenv("DIGEST_TIME", "21:00").strip()
 QUEUE_PATH = Path(__file__).parent / "signals_queue.jsonl"
 TRADES_PATH = Path(__file__).parent / "trades.jsonl"
 STATE_PATH = Path(__file__).parent / "heartbeat_state.json"
-EXPECTED_BOTS = int(os.getenv("HEARTBEAT_EXPECT_BOTS", "3"))  # range AUDUSD+USDCAD + classic XAUUSD
+EXPECTED_BOTS = int(os.getenv("HEARTBEAT_EXPECT_BOTS", "4"))  # range AUDUSD+USDCAD+EURUSD + classic XAUUSD
 
 
 def _num(v, default: float = 0.0) -> float:
@@ -133,6 +135,14 @@ def build_report() -> str:
     else:
         lines.append("⚠️ не удалось посчитать процессы")
     lines.append(f"Сигналов за 24ч: {len(sigs)}")
+    # Внешние голоса — только владельцу, в публичный дайджест они не попадают.
+    try:
+        lines.append(consensus.summary_text(24))
+        queued = discord_intake.review_count()
+        if queued:
+            lines.append(f"Очередь Discord: {queued} — подтвердить в premium-боте")
+    except Exception:                       # noqa: BLE001 — отчёт важнее статистики
+        pass
     if closed:
         lines.append(f"Сделок закрыто за 24ч: {len(closed)} · сумма {r_sum:+.2f}R")
         by_sym: dict[str, float] = {}

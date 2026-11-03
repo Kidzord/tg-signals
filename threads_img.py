@@ -4,7 +4,7 @@
 плоский фон, золотой акцент, DejaVu Sans. У части постов — крупная цифра
 или схематичный график (диапазон, снятие ликвидности, сессии, EMA200, серия стопов).
 
-Язык надписей задаётся параметром lang («ru» — Threads/VK/Дзен, «en» — X).
+Язык надписей задаётся параметром lang («ru» — Threads, «en» — X).
 
 Запуск:
     python threads_img.py          # все карточки Threads (RU) в threads_img/
@@ -165,7 +165,7 @@ def _chart(ax, kind: str, L: dict[str, str]) -> None:
 
 
 def render(idx: int, post: dict, lang: str = "ru", out_dir: Path | None = None) -> str:
-    """Отрисовать карточку поста. lang: «ru» (Threads/VK/Дзен) или «en» (X)."""
+    """Отрисовать карточку поста. lang: «ru» (Threads) или «en» (X)."""
     lang = lang if lang in LANGS else "ru"
     L = LANGS[lang]
     out = Path(out_dir) if out_dir else OUT

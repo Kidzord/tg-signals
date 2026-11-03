@@ -58,6 +58,19 @@ def test_manage_trade_processes_bar_once(monkeypatch):
     assert state["trade"] is not None, "повторный проход закрыл сделку в безубыток"
 
 
+def test_zero_partials_only_move_stop_to_breakeven(monkeypatch):
+    """p1=p2=0: TP1 не постится как «0R», но стоп переводится в БУ."""
+    seen: list[str] = []
+    monkeypatch.setattr(bot, "post_result", lambda kind, *a, **kw: seen.append(kind))
+    monkeypatch.setattr(bot, "risk_note_stop", lambda *a: None)
+    chart = _frame([0, 900, 1800], [100, 100, 106], [99, 99, 99], [100, 100, 101])
+    state = {"trade": _trade(p1=0.0, p2=0.0, p3=1.0)}
+    bot.manage_trade(state, chart, 2)
+    assert state["trade"]["hit1"] is True
+    assert state["trade"]["stop"] == 100.0
+    assert "tp1" not in seen
+
+
 def test_manage_trade_time_exit_uses_bar_time(monkeypatch):
     """max_bars считается по времени: индекс в окне постоянен и не растёт."""
     seen: list[str] = []
@@ -82,6 +95,19 @@ def test_manage_open_trade_replays_missed_bars(monkeypatch):
     bot.manage_open_trade(state, chart, 3)
     assert state["trade"] is None
     assert "sl" in seen
+
+
+def test_spread_guard_blocks_only_wide_spread(monkeypatch):
+    monkeypatch.setattr(bot, "SPREAD_MAX_R", 0.25)
+    monkeypatch.setattr(bot, "spread_cost_r", lambda s, r: 0.40)
+    assert bot.spread_guard_ok("XAUUSD", 1.0) is False
+    monkeypatch.setattr(bot, "spread_cost_r", lambda s, r: 0.10)
+    assert bot.spread_guard_ok("XAUUSD", 1.0) is True
+    monkeypatch.setattr(bot, "spread_cost_r", lambda s, r: None)   # нет MT5
+    assert bot.spread_guard_ok("XAUUSD", 1.0) is True
+    monkeypatch.setattr(bot, "SPREAD_MAX_R", 0.0)                  # выключено
+    monkeypatch.setattr(bot, "spread_cost_r", lambda s, r: 9.0)
+    assert bot.spread_guard_ok("XAUUSD", 1.0) is True
 
 
 def test_heartbeat_sent_state_survives_restart(tmp_path, monkeypatch):

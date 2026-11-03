@@ -26,25 +26,36 @@ signals_queue.jsonl, а premium-бот рассылает их подписчи�
     /id                твой Telegram ID
     /threads           привязать этот чат владельцу (напоминания о постах для Threads)
     /help              список команд
+
+Владельцу: перешли пост из чужого канала — бот разберёт его как голос
+консенсуса (см. consensus.py). Без пересылки: /ext @канал XAUUSD BUY 4020.
+Чужие тексты никуда не публикуются, источник обязателен.
 """
 from __future__ import annotations
 
 import datetime as dt
 import json
 import os
+import re
 import sys
 import time
 from zoneinfo import ZoneInfo
+
+import requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import brand
 import backup
 import config as cfg
+import consensus
 import crypto_pay
+import discord_intake
 import edu_posts
+import ocr_text
 import render as card
 import revenue
+import risk_guard
 import store
 import telegram_editor
 import tg
@@ -1176,6 +1187,35 @@ def handle_callback(users: dict, uid: str, chat_id: str, mid: int, data: str) ->
             threads_editor.send_result(uid, TOKEN)
         return None
 
+    # Очередь Discord: владелец подтверждает сторону одной кнопкой.
+    if data.startswith("drev:") and str(uid) == str(cfg.OWNER_CHAT_ID):
+        parts = data.split(":")
+        if len(parts) < 3:
+            return None
+        discord_mid, action = parts[1], parts[2].upper()
+        if action == "SKIP":
+            res = discord_intake.resolve_review(discord_mid, None)
+            note = "⏭ пропущено"
+        else:
+            res = discord_intake.resolve_review(discord_mid, action)
+            if not res.get("ok"):
+                note = "⚠️ " + str(res.get("error", "не получилось"))
+            elif res.get("stored"):
+                note = f"✅ записано как голос: {res.get('symbol', '')} {action}"
+            else:
+                note = f"♻️ {res.get('symbol', '')} {action} уже был — дубликат"
+        row = res.get("row") or {}
+        caption = discord_intake.review_caption(row, note) if row else note
+        # кнопки убираем только когда элемент закрыт; при ошибке пусть можно
+        # нажать другую сторону, не теряя разметку
+        markup = {"inline_keyboard": []} if res.get("ok") else None
+        ok_edit, _ = tg.edit_caption(chat_id, mid, caption, markup=markup, token=TOKEN)
+        if not ok_edit:
+            ok_edit, _ = tg.edit_text(chat_id, mid, caption, markup=markup, token=TOKEN)
+        if not ok_edit:
+            reply(uid, note)
+        return None
+
     # Превью/публикация Telegram-поста — только владельцу.
     if data.startswith("tgpost:") and str(uid) == str(cfg.OWNER_CHAT_ID):
         parts = data.split(":")
@@ -1444,8 +1484,35 @@ def handle(users: dict, uid: str, raw: str, name: str = "") -> dict | None:
 
     # owner-only: деньги, бэкап и редактор Threads
     if str(uid) == str(cfg.OWNER_CHAT_ID):
+        if cmd in ("ext", "consensus"):
+            # ручной ввод без пересылки: /ext @канал XAUUSD BUY 4020 SL 4005
+            if len(parts) < 3:
+                reply(uid, "Формат: /ext @канал XAUUSD BUY 4020 SL 4005\n"
+                           "Или просто перешли пост из канала.")
+                return None
+            source = parts[1]
+            body = text.split(None, 2)[2]
+            _intake_save(uid, source, body)
+            return None
         if cmd in ("revenue", "money"):
             reply(uid, revenue.text_report(30))
+            return None
+        if cmd in ("guard", "killswitch"):
+            arg = args[0].lower() if args else "status"
+            if arg in ("resume", "off", "clear"):
+                key = risk_guard.resume()
+                reply(uid, f"🟢 Kill-switch снят до конца недели {key}. "
+                           "Новые сигналы снова публикуются.")
+            else:
+                reply(uid, risk_guard.status_text())
+            return None
+        if cmd == "refund":
+            if not args:
+                reply(uid, "Формат: /refund <id> — возврат Stars по номеру платежа "
+                           "(номера видны в /revenue). Крипта возвращается вручную "
+                           "через @CryptoBot.")
+                return None
+            _refund_stars(uid, args[0])
             return None
         if cmd == "backup":
             try:
@@ -1456,7 +1523,9 @@ def handle(users: dict, uid: str, raw: str, name: str = "") -> dict | None:
             return None
         if cmd == "post":
             arg = args[0].lower() if args else "next"
-            if arg == "signal":
+            if arg in ("mix", "today"):
+                threads_editor.send_mix(uid, TOKEN)
+            elif arg == "signal":
                 threads_editor.send_signal(uid, TOKEN)
             elif arg in ("week", "stats"):
                 threads_editor.send_week(uid, TOKEN)
@@ -1482,21 +1551,16 @@ def handle(users: dict, uid: str, raw: str, name: str = "") -> dict | None:
                 telegram_editor.publish_next(uid, TOKEN)
             return None
         if cmd in ("tt", "tiktok"):
-            tiktok_editor.send(uid, TOKEN)
+            variant = args[0].lower() if args else "story"
+            if variant not in ("story", "shipped"):
+                variant = "story"
+            tiktok_editor.send(uid, TOKEN, variant=variant)
             return None
 
     # фидбек доступен всем — это канал связи с автором для тестеров
     if cmd == "feedback":
         _send_feedback(users, uid, raw)
         return None
-        if cmd == "refund":
-            if not args:
-                reply(uid, "Формат: /refund <id> — возврат Stars по номеру платежа "
-                           "(номера видны в /revenue). Крипта возвращается вручную "
-                           "через @CryptoBot.")
-                return None
-            _refund_stars(uid, args[0])
-            return None
 
     # остальное — только по активной подписке
     if not is_paid(users, uid):
@@ -1594,7 +1658,12 @@ def handle(users: dict, uid: str, raw: str, name: str = "") -> dict | None:
         reply(uid, f"Лимит входов за 24 ч: <b>{n or 'без лимита'}</b>")
         return None
 
-    reply(uid, "Не понял. Пользуйся кнопками внизу или глянь /help.")
+    if str(uid) == str(cfg.OWNER_CHAT_ID):
+        reply(uid, "Не понял. Владельцу: перешли пост из канала текстом или "
+                   "скриншотом — разберу как сигнал или разбор (для разбора "
+                   "добавь в подпись «разбор» или #trade). Остальное — /help.")
+    else:
+        reply(uid, "Не понял. Пользуйся кнопками внизу или глянь /help.")
     return None
 
 
@@ -1769,6 +1838,187 @@ def poll_crypto(users: dict) -> bool:
 
 # ------------------------------------------------------------------ запуск
 
+def forward_source(msg: dict) -> str:
+    """Источник пересланного поста. Пусто — источник скрыт или это не пересылка."""
+    origin = msg.get("forward_origin") or {}
+    kind = origin.get("type")
+    if kind == "channel":
+        return _chan_label(origin.get("chat") or {})
+    if kind == "chat":
+        return _chan_label(origin.get("sender_chat") or {})
+    if kind == "user":
+        user = origin.get("sender_user") or {}
+        if user.get("username"):
+            return "@" + user["username"]
+        return f"user:{user.get('id')}" if user.get("id") else ""
+    if kind == "hidden_user":
+        return ""
+    # старый формат Bot API (до 7.0)
+    if msg.get("forward_from_chat"):
+        return _chan_label(msg["forward_from_chat"])
+    user = msg.get("forward_from") or {}
+    if user.get("username"):
+        return "@" + user["username"]
+    if user.get("id"):
+        return f"user:{user['id']}"
+    return ""
+
+
+def _chan_label(chat: dict) -> str:
+    if chat.get("username"):
+        return "@" + chat["username"]
+    return str(chat.get("title") or "")
+
+
+def _is_forward(msg: dict) -> bool:
+    return bool(msg.get("forward_origin") or msg.get("forward_from_chat")
+                or msg.get("forward_from") or msg.get("forward_sender_name")
+                or msg.get("forward_date"))
+
+
+def _intake_save(uid: str, source: str, text: str) -> bool:
+    try:
+        row = consensus.add_payload({"source": source, "text": text})
+    except Exception as e:                  # noqa: BLE001 — чат не должен падать
+        print(f"intake: ошибка сохранения ({source}): {e!r}")
+        reply(uid, f"⚠️ Не сохранил: {e}")
+        return False
+    if row is None:
+        print(f"intake: не распознан или дубликат ({source}): {text[:120]!r}")
+        reply(uid, f"⚠️ {source}: сигнал не распознан (нужны тикер и сторона — "
+                   "buy/sell, лонг/шорт) или это дубликат.")
+        return False
+    print(f"intake: записан {row['symbol']} {row['side']} · {source}")
+    reply(uid, f"✅ {row['symbol']} {row['side']} · {source} — записано. "
+               "Учитывается как голос консенсуса.")
+    return True
+
+
+def _has_media(msg: dict) -> bool:
+    if msg.get("photo"):
+        return True
+    doc = msg.get("document") or {}
+    return str(doc.get("mime_type", "")).startswith("image/")
+
+
+def _image_file_id(msg: dict) -> str:
+    """Файл вместо сжатого фото: скриншот с текстом так читается лучше."""
+    doc = msg.get("document") or {}
+    if str(doc.get("mime_type", "")).startswith("image/"):
+        return str(doc.get("file_id", ""))
+    photos = msg.get("photo") or []
+    return str(photos[-1].get("file_id", "")) if photos else ""
+
+
+def _caption_source(msg: dict) -> str:
+    """Источник из подписи к скриншоту: «#trades» или «@channel»."""
+    caption = str(msg.get("caption") or "")
+    m = re.search(r"([@#][A-Za-zА-Яа-яЁё0-9_]{2,})", caption)
+    return m.group(1) if m else ""
+
+
+def download_telegram_image(msg: dict, name: str) -> str:
+    """Скачивает фото/файл из сообщения в tg_screenshots/. Пусто — не вышло."""
+    file_id = _image_file_id(msg)
+    if not file_id:
+        return ""
+    res = tg.api_call("getFile", {"file_id": file_id}, token=TOKEN)
+    path = str((res.result or {}).get("file_path", "")) if res.ok else ""
+    if not path:
+        return ""
+    folder = os.path.join(HERE, "tg_screenshots")
+    os.makedirs(folder, exist_ok=True)
+    target = os.path.join(folder, name + os.path.splitext(path)[1])
+    try:
+        url = f"https://api.telegram.org/file/bot{TOKEN}/{path}"
+        with requests.get(url, timeout=20) as resp:
+            if resp.status_code != 200:
+                return ""
+            with open(target, "wb") as f:
+                f.write(resp.content)
+        return target
+    except Exception:                       # noqa: BLE001
+        return ""
+
+
+# «#trades» (канал сделок) не должен ловиться как «#trade»: нужен \b
+BREAKDOWN_RE = re.compile(
+    r"(разбор\w*|#trade\b|#сделка\w*|#итог\w*|итог сделки)", re.IGNORECASE)
+
+
+def _is_breakdown(msg: dict) -> bool:
+    return bool(BREAKDOWN_RE.search(str(msg.get("caption") or "")))
+
+
+def intake_media(msg: dict, uid: str) -> bool:
+    """Скриншот владельца (пересланный или свой) → OCR → голос или очередь.
+
+    Если в подписи есть «разбор» / #trade / #сделка — это закрытая сделка:
+    она идёт в архив разборов, а не в голоса консенсуса.
+    """
+    if not cfg.OWNER_CHAT_ID or str(uid) != str(cfg.OWNER_CHAT_ID):
+        return False
+    if not _has_media(msg):
+        return False
+    source = forward_source(msg) or _caption_source(msg) or "tg:скриншот"
+    key = f"tg_{msg.get('message_id', '')}"
+    path = download_telegram_image(msg, key)
+    if not path:
+        reply(uid, "Не смог скачать картинку — пришли её файлом (не сжатым фото).")
+        return True
+    text = ocr_text.image_text(path)
+    print(f"intake: скриншот {key} · источник {source} · OCR "
+          f"{'ок' if text else 'пусто'}")
+    if not text:
+        reply(uid, "OCR недоступен или не прочитал текст. "
+                   "Поставь rapidocr (см. docs/EXTERNAL_SOURCES.md) "
+                   "или добавь вручную: /ext @канал <текст>.")
+        return True
+    if _is_breakdown(msg):
+        row = discord_intake.build_archive_row(
+            source=source, message_id=key, url="",
+            author="owner", text=str(msg.get("caption") or ""),
+            images=[path], ocr=text)
+        added = discord_intake.archive_rows([row])
+        reply(uid, f"🗂 Разбор в архив ({'новый' if added else 'уже был'}): "
+                   f"{row.get('symbol') or '?'} · "
+                   f"{row.get('outcome') or 'без метки'} · R {row.get('r')}")
+        return True
+    parsed = consensus.parse_external(text, source)
+    if parsed is not None:
+        _intake_save(uid, source, text)
+        return True
+    row = discord_intake.make_review_row(
+        source, message_id=key, ocr=text, images=[path],
+        symbol=consensus.find_symbol(text) or "")
+    discord_intake.add_review(row)
+    tg.send_message(discord_intake.review_caption(row), token=TOKEN,
+                    chat_id=uid, markup=discord_intake.review_markup(key))
+    return True
+
+
+def intake_forward(msg: dict, uid: str) -> bool:
+    """Владелец переслал пост — сохраняем как голос. True = сообщение обработано."""
+    if not cfg.OWNER_CHAT_ID or str(uid) != str(cfg.OWNER_CHAT_ID):
+        return False
+    if not _is_forward(msg):
+        return False
+    text = (msg.get("text") or msg.get("caption") or "").strip()
+    if not text:
+        if _has_media(msg):
+            return False        # картинку разберёт intake_media
+        reply(uid, "В пересланном посте нет текста — перешли текст или скриншот.")
+        return True
+    source = forward_source(msg)
+    if not source:
+        reply(uid, "Источник скрыт: канал запрещает пересылку с автором. "
+                   "Такой сигнал не учитываю — нужна атрибуция. "
+                   "Можно вручную: /ext @канал <текст>.")
+        return True
+    _intake_save(uid, source, text)
+    return True
+
+
 def handle_update(users: dict, state: dict, up: dict) -> None:
     query = up.get("pre_checkout_query")
     if query:
@@ -1809,6 +2059,13 @@ def handle_update(users: dict, state: dict, up: dict) -> None:
     if (users.get(uid) or {}).get("blocked"):
         users[uid]["blocked"] = 0
         save_json(USERS_PATH, users)
+
+    # владелец переслал пост из чужого канала — это голос консенсуса, не команда
+    if intake_forward(msg, uid):
+        return
+    # скриншот (свой или пересланный) — OCR и либо голос, либо очередь с кнопками
+    if intake_media(msg, uid):
+        return
 
     refund = msg.get("refunded_payment")
     if refund:

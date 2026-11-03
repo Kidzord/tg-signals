@@ -51,3 +51,10 @@ def test_devnotes_exhausted_returns_none(state):
 def test_next_devnotes_takes_k(state):
     notes = devlog.next_devnotes(2)
     assert notes == list(devlog.DEVNOTES[:2])
+
+
+def test_note_for_day_does_not_consume_bank(state):
+    note = devlog.note_for_day(3, 0)
+    assert note in devlog.DEVNOTES
+    # следующая «расходуемая» заметка всё ещё первая
+    assert devlog.next_devnote() == devlog.DEVNOTES[0]

@@ -8,6 +8,7 @@ API Threads не нужен. Владелец получает в личку д�
 
 Команды в premium-боте (только владелец):
     /post              следующий пост из банка
+    /post mix          смешанный пост: сделка в плюс + разработка + цифры
     /post 3            конкретный пост
     /post signal       последний сигнал с карточкой
     /post result       последняя закрытая сделка
@@ -24,6 +25,7 @@ import urllib.parse
 import config as cfg
 import devlog
 import render as card
+import social_mix
 import tg
 import theme
 import threads
@@ -157,6 +159,17 @@ def send_next(chat_id: str, token: str | None = None, number: int | None = None)
     return ok
 
 
+def send_mix(chat_id: str, token: str | None = None) -> bool:
+    """«Средний» пост: последняя сделка в плюс + что сделал + цифры недели."""
+    trade = social_mix.latest_positive()
+    text = _finish(social_mix.ru_short(trade=trade))
+    image = social_mix.image_for(trade) if trade else ""
+    caption = ("📝 <b>Мой пост на сегодня</b>\n"
+               "Картинка — последняя закрытая в плюс. "
+               "Текст ниже — скопируй одним нажатием.")
+    return _send(chat_id, token, image or None, caption, text)
+
+
 def send_signal(chat_id: str, token: str | None = None) -> bool:
     rec = _read_last(SIGNALS_PATH)
     if not rec or rec.get("kind") != "entry":
@@ -173,7 +186,7 @@ def send_signal(chat_id: str, token: str | None = None) -> bool:
         levels = f"Вход {entry:g}, стоп {sl:g}"
         if tp1 > 0:
             levels += f", цель {tp1:g}"
-        body = (f"День {devlog.day_number()}. Бот нашёл сетап: {side} {symbol}.\n"
+        body = (f"День {devlog.day_number()}. Взял сетап: {side} {symbol}.\n"
                 f"{levels}.\n"
                 "Работаю до цели. Итог будет в журнале — вместе со стопами.")
         text = _finish(body)
@@ -185,7 +198,8 @@ def send_signal(chat_id: str, token: str | None = None) -> bool:
 
 
 def send_week(chat_id: str, token: str | None = None) -> bool:
-    text = _finish(f"День {devlog.day_number()}.\n" + track_record.text_report(7))
+    text = _finish(f"День {devlog.day_number()}. Вот итог недели.\n"
+                   + track_record.text_report(7))
     os.makedirs(RENDERS, exist_ok=True)
     image = track_record.render_equity(
         7, out_path=os.path.join(RENDERS, "threads_week.png"), portrait=True)
@@ -196,16 +210,16 @@ def send_week(chat_id: str, token: str | None = None) -> bool:
 
 _RESULT_VOICE: dict[str, tuple[str, ...]] = {
     "sl": (
-        "Бот вошёл по правилам, рынок сказал «нет». Журнал записал — идём дальше.",
+        "Вошёл по правилам, рынок сказал «нет». Журнал записал — идём дальше.",
         "Стоп. Не каждый сетап выживает — потому и дневник, а не витрина.",
         "Выбило по стопу. Риск был ограничен, эмоций ноль — за это и код.",
     ),
     "tp3": (
-        "Бот дожал финальную цель, я не мешал. Математика 3R против 1R работает.",
+        "Додержал до финальной цели, не мешал. Математика 3R против 1R работает.",
         "Полный выход по цели. Заход скучный, выход по плану — иначе и не надо.",
     ),
     "tp": (
-        "Бот дожал цель, я не мешал. Одна 3R перекрывает три стопа.",
+        "Додержал до цели, не мешал. Одна 3R перекрывает три стопа.",
         "Плюс. Такие сделки обычно пропускаешь глазами — а они и кормят.",
     ),
     "be": (
@@ -246,7 +260,7 @@ def send_result(chat_id: str, token: str | None = None) -> bool:
     seed = str(rec.get("trade_id", "") or f"{symbol}{r}")
     line = _pick(_RESULT_VOICE.get(kind) or _RESULT_VOICE["sl"], seed)
     closer = _pick(_RESULT_CLOSERS, seed + "closer")
-    body = (f"День {devlog.day_number()}.\n"
+    body = (f"День {devlog.day_number()}. Вот результат по сделке.\n"
             f"{emoji} {symbol}, {side}: {r:+.1f}R\n"
             f"{line}\n{closer}")
     text = _finish(body)

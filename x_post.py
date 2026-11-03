@@ -27,6 +27,10 @@ import urllib.parse
 import webbrowser
 from pathlib import Path
 
+import config as cfg
+import devlog
+import social_mix
+
 HERE = Path(__file__).resolve().parent
 USED_PATH = HERE / "x_used.json"
 IMG_DIR = HERE / "x_img"
@@ -187,6 +191,22 @@ TAG_LINES: list[str] = [
     "#trading #propfirm #riskmanagement #forex",
 ]
 
+# Короткие англ. заметки для смешанного поста (ротация по дню дневника).
+X_DEVNOTES: tuple[str, ...] = (
+    "a portfolio kill-switch — at -6R for the week new entries pause",
+    "an economic-calendar filter — no entries around red-folder news",
+    "a weekly backup drill — the archive is actually restored and checked",
+    "a monitor that pings me if any process disappears for 10 minutes",
+    "a durable delivery queue — restarts no longer lose signals",
+    "a payment ledger — a repeated webhook can't extend a subscription twice",
+    "a cross-symbol risk lock — max two correlated trades at once",
+    "a public trade journal — entries, stops and results in R, losses included",
+    "a landing page rebuilt every night from the trade journal",
+    "a weekly track record — equity, profit factor, drawdown, losing streaks",
+    "a referral program — both sides get subscription days",
+    "a trial nurture chain — new subscribers are guided through the first days",
+)
+
 # Описание профиля X (bio, лимит 160 символов). Команда: python x_post.py bio
 BIO = (
     "Gold, forex, indices. Smart-money entries: range + sweep. "
@@ -199,6 +219,44 @@ def tweet_text(i: int) -> str:
     """Текст твита: тело поста + строка хештегов (то, что реально публикуем)."""
     body = POSTS[i - 1]["text"]
     return body + "\n\n" + TAG_LINES[(i - 1) % len(TAG_LINES)]
+
+
+def _devnote(offset: int = 0) -> str:
+    return X_DEVNOTES[(devlog.day_number() - 1 + offset) % len(X_DEVNOTES)]
+
+
+def mix_text(trade: dict | None = None, note: str | None = None,
+             stats: dict | None = None) -> str:
+    """Смешанный твит от первого лица: сделка + что сделал + цифры."""
+    trade = social_mix.latest_positive() if trade is None else trade
+    note = _devnote() if note is None else note
+    stats = social_mix.week_stats() if stats is None else stats
+    lines = ["My post for today."]
+    if trade:
+        lines.append(f"Closed {social_mix.trade_line(trade, 'en')} — chart attached.")
+    if note:
+        short = note.strip().rstrip(".")
+        if len(short) > 85:
+            short = short[:85].rsplit(" ", 1)[0] + "…"
+        lines.append(f"Shipped: {short}.")
+    if stats.get("n"):
+        lines.append(f"Last 7 days: {stats['n']} trades, {stats['r']:+.1f}R, "
+                     f"{stats['win']:.0f}% win.")
+    handle = (cfg.CHANNEL_HANDLE or "@KidzordFX").lstrip("@")
+    lines.append(f"Journal: t.me/{handle}")
+    text = "\n".join(lines)
+    tags = TAG_LINES[0]
+    if len(text) + 2 + len(tags) > LIMIT:
+        lines = [line for line in lines if not line.startswith("Last 7 days:")]
+        text = "\n".join(lines)
+    if len(text) + 2 + len(tags) > LIMIT:
+        text = text[:LIMIT - len(tags) - 3].rstrip() + "…"
+    return text + "\n\n" + tags
+
+
+def mix_image() -> str:
+    """Скрин последней закрытой в плюс сделки (если есть)."""
+    return social_mix.image_for(social_mix.latest_positive())
 
 
 def _load_used() -> set:

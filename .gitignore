@@ -23,13 +23,13 @@ state.db-shm
 monitor_state.json
 autoposts_state.json
 heartbeat_state.json
+risk_guard.json
+news_cache.json
 *.corrupt-*
 *.tmp
 backups/
 crypto_paid.json
 tg_posts_used.json
-vk_used.json
-dzen_used.json
 mt5_screenshot.lock
 threads_img/generated/
 threads_img/1??.png
@@ -48,3 +48,12 @@ mt5_ea/*.log
 Ict2022EA_tmp.*
 devlog_state.json
 landing-deploy.zip
+
+# голоса консенсуса — рабочие данные, не коммитим
+consensus_signals.jsonl
+discord_state.json
+discord_review.jsonl
+discord_inbox/
+.ocr_vendor/
+discord_trades.jsonl
+tg_screenshots/

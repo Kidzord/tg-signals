@@ -53,12 +53,16 @@ if (Test-Running 'subbot\.py') {
 }
 Start-Sleep -Seconds 2
 
-#--- 2. Range-боты: только символы, прошедшие walk-forward (проверено 2026-11-02,
-#    tools/walk_forward.py, XAUUSD...JPN225): AUDUSD +8.65R net (8/13 фолдов),
-#    USDCAD +19.1R net (7/13, лучшая средняя +0.47R). Отключены как непрошедшие:
-#    GBPUSD -14.9R, JPN225 -12.6R, XAUUSD -9.0R (на золоте теперь classic),
-#    DE40 -5.8R, US500 +0.45R (ноль), EUSTX50 -1.1R (ноль). Вернуть — добавить в список.
-$symbols = @("AUDUSD", "USDCAD")
+#--- 2. Range-боты: только символы, прошедшие walk-forward.
+#    2026-11-03 добавлен EURUSD: фиксированные er=0/tp=3, OOS +30.3R
+#    (13/22 активных фолдов в плюсе, средняя +0.27R). AUDUSD/USDCAD — из .env
+#    (er=0.20, tp=3.0). Отключены как непрошедшие/шум: GBPUSD, JPN225, DE40,
+#    US500, EUSTX50, XAUUSD-range (на золоте classic). UK100 — данные невалидны.
+$symbols = @("AUDUSD", "USDCAD", "EURUSD")
+$rangeTuning = @{
+    "AUDUSD" = @{ ER = "0.10"; TP = "3.0"; TREND = "with" }
+    "EURUSD" = @{ ER = "0.0"; TP = "3.0"; TREND = "with" }
+}
 Write-Host "Запуск range-ботов: $($symbols -join ', ')..." -ForegroundColor Yellow
 foreach ($sym in $symbols) {
     if (Test-BotAlive $sym "range") {
@@ -67,10 +71,23 @@ foreach ($sym in $symbols) {
     }
     $env:BOT_SYMBOL = $sym
     $env:STRATEGY = "range"
+    if ($rangeTuning.ContainsKey($sym)) {
+        $env:RANGE_ER_MAX = $rangeTuning[$sym].ER
+        $env:RANGE_TP_R = $rangeTuning[$sym].TP
+        $env:RANGE_TREND = $rangeTuning[$sym].TREND
+    } else {
+        $env:RANGE_ER_MAX = "0.20"
+        $env:RANGE_TP_R = "3.0"
+        $env:RANGE_TREND = "off"
+    }
     Start-Process -FilePath "cmd.exe" -ArgumentList "/c bot.bat" -WorkingDirectory $DIR -WindowStyle Minimized
     Write-Host "  Range-бот $sym запущен"
     Start-Sleep -Seconds 1
 }
+# вернуть значения .env, чтобы не влиять на остальные компоненты
+$env:RANGE_ER_MAX = "0.20"
+$env:RANGE_TP_R = "3.0"
+$env:RANGE_TREND = "off"
 
 #--- 3. Classic-стратегия на золоте (прошла walk-forward: +8.6R net, 5/8 фолдов)
 $env:BOT_SYMBOL = "XAUUSD"
@@ -115,7 +132,26 @@ if (Test-Running 'monitor\.py') {
     Start-Process -FilePath "cmd.exe" -ArgumentList "/c monitor.bat" -WorkingDirectory $DIR -WindowStyle Minimized
 }
 
-#--- 7. Watchdog: сам поднимает упавшие компоненты каждые 5 минут
+#--- 7. Discord-приём (logs\discord_intake.log): только если задан токен.
+#    Без DISCORD_TOKEN процесс не нужен и в флоте не держится.
+$discordToken = ""
+if (Test-Path "$DIR\.env") {
+    $m = Select-String -Path "$DIR\.env" -Pattern '^\s*DISCORD_TOKEN\s*=\s*(\S+)' |
+        Select-Object -First 1
+    if ($m) { $discordToken = $m.Matches[0].Groups[1].Value.Trim() }
+}
+if ($discordToken) {
+    if (Test-Running 'discord_intake\.py') {
+        Write-Host "Discord-приём уже работает — пропускаю" -ForegroundColor DarkGray
+    } else {
+        Write-Host "Запуск Discord-приёма..." -ForegroundColor Yellow
+        Start-Process -FilePath "cmd.exe" -ArgumentList "/c discord_intake.bat" -WorkingDirectory $DIR -WindowStyle Minimized
+    }
+} else {
+    Write-Host "Discord-приём не настроен (нет DISCORD_TOKEN) — пропускаю" -ForegroundColor DarkGray
+}
+
+#--- 8. Watchdog: сам поднимает упавшие компоненты каждые 5 минут
 $wd = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -match 'watchdog\.ps1' })
 if ($wd.Count -gt 0) {
@@ -138,4 +174,7 @@ Write-Host "  - Classic-бот XAUUSD (logs\bot_XAUUSD_classic.log)"
 Write-Host "  - Автопосты: план/итоги/промо + напоминания (logs\autoposts.log)"
 Write-Host "  - Heartbeat в Telegram (09:00 МСК; logs\heartbeat.log)"
 Write-Host "  - Мониторинг ботов и доставки (logs\monitor.log)"
+if ($discordToken) {
+    Write-Host "  - Discord-приём сигналов (logs\discord_intake.log)"
+}
 Write-Host "  - Watchdog: автоперезапуск каждые 5 минут (logs\watchdog.log)"

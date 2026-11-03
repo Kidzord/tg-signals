@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import cache
 import config as cfg
+import consensus
 import feeds
 import health
 import logger_config
@@ -129,6 +130,13 @@ def symbol_allowed(symbol: str) -> bool:
 # ------------------------------------------------------------------ отправка
 
 def publish(sig: card.Signal) -> tuple[bool, str]:
+    # тот же внутренний фильтр, что в bot.py: внешние голоса не публикуются,
+    # только отсекают вход при конфликте (fail-open внутри precheck)
+    allowed, vote = consensus.precheck(sig.symbol, sig.side)
+    if not allowed:
+        log.info("консенсус: %s источник(ов) против %s %s — сигнал пропущен",
+                 vote["against"], sig.side, sig.symbol)
+        return False, ""
     bars, source, is_demo = feeds.load_bars(sig.symbol, sig.tf)
     out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "renders")
     os.makedirs(out_dir, exist_ok=True)
@@ -291,6 +299,50 @@ async def tradingview(secret: str, request: Request):
         logger_config.metrics.increment("webhook_failed")
 
     return {"ok": ok, "file": os.path.basename(path)}
+
+
+@app.post("/consensus/{secret}")
+async def consensus_feed(secret: str, request: Request):
+    """Приём сигналов внешних источников для внутреннего фильтра.
+
+    Ничего не публикует: записи идут в consensus_signals.jsonl, bot.py читает
+    их только как голоса «за/против» своего входа. Нужен тот же WEBHOOK_SECRET,
+    что и у /tv. Присылать сюда можно лишь источники, на которые есть право.
+    """
+    if secret != cfg.WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="forbidden")
+
+    client_ip = (
+        request.headers.get("cf-connecting-ip")
+        or (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+        or (request.client.host if request.client else "unknown")
+    )
+    allowed, retry_after = rate_limit.check_webhook(client_ip)
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Rate limited, retry after {retry_after}s",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="нужен JSON")
+
+    if isinstance(payload, dict) and isinstance(payload.get("signals"), list):
+        items = payload["signals"]
+    elif isinstance(payload, dict):
+        items = [payload]
+    elif isinstance(payload, list):
+        items = payload
+    else:
+        raise HTTPException(status_code=400, detail="ожидается объект или список")
+
+    res = await run_in_threadpool(consensus.ingest, items)
+    log.info("консенсус: принято %s, пропущено %s, ошибок %s",
+             res["stored"], res["skipped"], len(res["errors"]))
+    return {"ok": not res["errors"], **res}
 
 
 # ------------------------------------------------------------------ локальные режимы

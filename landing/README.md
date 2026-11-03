@@ -37,6 +37,21 @@ python tools\build_landing.py
 с `?start=src_method`, чтобы источник был виден в атрибуции
 (`revenue.py` → `/revenue`).
 
+## Ссылки для bio
+
+У каждой площадки свой тег — иначе не понять, откуда пришёл человек:
+
+```
+python tools/links.py            # все площадки
+python tools/links.py threads    # одна
+```
+
+Threads → `?start=src_threads`, TikTok → `src_tiktok`, X → `src_x`,
+Instagram → `src_instagram`, Discord → `src_discord`. Бот сохраняет первый
+`src_*` в `users.json`, при оплате он уходит в `payments`, а `/revenue`
+показывает разбивку «люди / оплаты / деньги» по источникам. Повторный заход
+с другим тегом источник не перезаписывает — атрибуция по первому касанию.
+
 ## Важно
 
 * Не добавляй в папку `.env`, токены и реальные номера счетов.

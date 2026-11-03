@@ -21,7 +21,7 @@ import feeds
 import theme
 from feeds import Bar
 
-# Публичные имена палитры: на них завязаны пост-статистика (post_month.py) и
+# Публичные имена палитры: на них завязаны пост-статистика (autoposts.py) и
 # отчёт по кривой доходности (report.py). Значения — из дизайн-системы.
 BG = theme.BASE
 PANEL = theme.PANEL
@@ -194,7 +194,8 @@ def render_card(sig: Signal, bars: list[Bar], source: str, is_demo: bool, out_pa
     c.text(0.035, 0.095, left, size=10.5)
 
     stamp = sig.when.strftime("%d.%m.%Y %H:%M")
-    src_txt = f"данные: {source}"
+    # у демо-данных своя подпись: «данные: демо-данные» читалось как тавтология
+    src_txt = "данные: демо" if is_demo else f"данные: {source}"
     # Защита от устаревших данных: терминал мог отвалиться, а алерт — прийти.
     if source == "MT5" and not is_demo and bars:
         last_t = bars[-1].t

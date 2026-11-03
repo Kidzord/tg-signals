@@ -26,6 +26,12 @@ DOWNSIDE_R = -3.0        # сумма R ниже этого при достат�
 
 sys.path.insert(0, str(ROOT))
 
+import config as cfg  # noqa: E402
+
+# Форвард-контроль: последние N сделок символа против порога.
+FORWARD_WINDOW = int(getattr(cfg, "FORWARD_WINDOW", 20))
+FORWARD_DEGRADE_R = float(getattr(cfg, "FORWARD_DEGRADE_R", -3.0))
+
 
 def read_jsonl(path: Path, since: float = 0.0) -> list[dict]:
     out: list[dict] = []
@@ -52,6 +58,53 @@ def agg(trades: list[dict]) -> dict:
     return {"n": n, "r": r, "wr": 100.0 * wins / n if n else 0.0}
 
 
+def load_closed(path: Path = TRADES) -> list[dict]:
+    """Закрытые сделки: без частичных выходов и дублей, по времени."""
+    rows = [t for t in read_jsonl(path)
+            if t.get("kind") not in ("tp1", "tp2")]
+    seen: set[tuple[str, str]] = set()
+    out: list[dict] = []
+    for rec in rows:
+        tid = str(rec.get("trade_id") or "")
+        key = (tid, str(rec.get("kind") or "")) if tid else None
+        if key is not None and key in seen:
+            continue
+        if key is not None:
+            seen.add(key)
+        out.append(rec)
+    out.sort(key=lambda r: float(r.get("ts", 0)))
+    return out
+
+
+def recent_by_symbol(closed: list[dict],
+                     window: int | None = None) -> dict[str, dict]:
+    """По каждому символу — агрегат последних window сделок."""
+    window = FORWARD_WINDOW if window is None else window
+    by: dict[str, list[dict]] = {}
+    for rec in closed:
+        by.setdefault(str(rec.get("symbol") or "?"), []).append(rec)
+    out: dict[str, dict] = {}
+    for sym, rows in by.items():
+        a = agg(rows[-window:])
+        a["window"] = window
+        a["total"] = len(rows)
+        out[sym] = a
+    return out
+
+
+def degraded(closed: list[dict], window: int | None = None,
+             limit: float | None = None) -> list[dict]:
+    """Символы, у которых последние window сделок дали <= limit R."""
+    window = FORWARD_WINDOW if window is None else window
+    limit = FORWARD_DEGRADE_R if limit is None else limit
+    out: list[dict] = []
+    for sym, a in recent_by_symbol(closed, window).items():
+        if a["n"] >= window and a["r"] <= limit:
+            out.append({"symbol": sym, "n": a["n"], "r": a["r"],
+                        "window": window})
+    return sorted(out, key=lambda d: d["r"])
+
+
 def fmt_row(sym: str, a: dict) -> str:
     mark = ""
     if a["n"] >= MIN_TRADES:
@@ -65,9 +118,7 @@ def fmt_row(sym: str, a: dict) -> str:
 def build_report(now: float | None = None) -> str:
     now = now or time.time()
     week_ago = now - 7 * 86400
-    trades_all = read_jsonl(TRADES)
-    # частичные выходы не пишутся, но на всякий случай фильтруем как bot.py
-    closed = [t for t in trades_all if t.get("kind") not in ("tp1", "tp2")]
+    closed = load_closed()
     trades_week = [t for t in closed if float(t.get("ts", 0)) >= week_ago]
     sigs_all = read_jsonl(QUEUE)
     sigs_week = [s for s in sigs_all if float(s.get("ts", 0)) >= week_ago]
@@ -107,13 +158,36 @@ def build_report(now: float | None = None) -> str:
     lines.append(f"  ИТОГО     {total['n']:>4} сд · {total['r']:+7.2f}R · win {total['wr']:.0f}%")
 
     lines.append("")
-    if verdicts:
-        lines.append("⚠️ Кандидаты на отключение: " + ", ".join(verdicts))
-        lines.append(f"(сумма R ≤ {DOWNSIDE_R} при ≥ {MIN_TRADES} сделках; "
-                     "решение — за тобой: убрать символ из start_all.ps1)")
+    lines.append(f"Форвард (последние {FORWARD_WINDOW} сделок по символу):")
+    recent = recent_by_symbol(closed)
+    degraded_syms: list[str] = []
+    for sym in symbols:
+        a = recent.get(sym)
+        if not a:
+            continue
+        bad = a["n"] >= FORWARD_WINDOW and a["r"] <= FORWARD_DEGRADE_R
+        if bad:
+            degraded_syms.append(sym)
+        mark = (" ← деградация" if bad
+                else " (мало данных)" if a["n"] < FORWARD_WINDOW else "")
+        lines.append(f"  {sym:<8} {a['n']:>3}/{FORWARD_WINDOW} сд · "
+                     f"{a['r']:+6.2f}R{mark}")
+
+    lines.append("")
+    actions = sorted(set(verdicts) | set(degraded_syms))
+    if actions:
+        lines.append("⚠️ Кандидаты на отключение: " + ", ".join(actions))
+        if degraded_syms:
+            lines.append(f"Деградация: {', '.join(degraded_syms)} — последние "
+                         f"{FORWARD_WINDOW} сделок дали ≤ {FORWARD_DEGRADE_R}R.")
+        if verdicts:
+            lines.append(f"Исторически: {', '.join(verdicts)} — сумма R ≤ "
+                         f"{DOWNSIDE_R} при ≥ {MIN_TRADES} сделках.")
+        lines.append("Решение — за тобой: убрать символ из start_all.ps1.")
     else:
         lines.append("✅ Явных балластных символов нет "
-                     f"(порог: ≤ {DOWNSIDE_R}R при ≥ {MIN_TRADES} сделках).")
+                     f"(пороги: ≤ {DOWNSIDE_R}R при ≥ {MIN_TRADES} сделках "
+                     f"или ≤ {FORWARD_DEGRADE_R}R за {FORWARD_WINDOW} сделок).")
     return "\n".join(lines)
 
 

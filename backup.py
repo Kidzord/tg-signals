@@ -33,11 +33,10 @@ FILES = (
     "heartbeat_state.json",
     "autoposts_state.json",
     "monitor_state.json",
+    "risk_guard.json",
     "crypto_paid.json",
     "tg_posts_used.json",
     "x_used.json",
-    "vk_used.json",
-    "dzen_used.json",
     "threads_used.json",
 )
 
