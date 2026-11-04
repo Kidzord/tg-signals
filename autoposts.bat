@@ -8,6 +8,7 @@ call "%~dp0pyfind.bat"
 if not defined PY goto nopython
 
 echo Интерпретатор: %PY%
+set "PYTHONIOENCODING=utf-8"
 "%PY%" -u autoposts.py %*
 echo.
 echo Код выхода: %errorlevel%

@@ -118,6 +118,29 @@ def test_heartbeat_sent_state_survives_restart(tmp_path, monkeypatch):
     assert heartbeat.load_sent() == {"hb": "2026-11-02"}
 
 
+class _Cp1251Console:
+    """Консоль Windows без эмодзи: запись падает так же, как cp1251."""
+
+    def write(self, _text):
+        raise UnicodeEncodeError("charmap", "🫀", 0, 1, "character maps to <undefined>")
+
+    def flush(self):
+        pass
+
+    def reconfigure(self, **_kwargs):
+        raise ValueError("not configurable")
+
+
+def test_heartbeat_send_does_not_resend_when_console_cannot_print(monkeypatch):
+    # Отчёт уже улетел в Telegram; падение print не должно превращаться в
+    # «ошибка отправки» и повтор каждые 5 минут.
+    monkeypatch.setattr(heartbeat.sys, "stdout", _Cp1251Console())
+    monkeypatch.setattr(heartbeat, "build_report", lambda: "🫀 Heartbeat")
+    monkeypatch.setattr(heartbeat.cfg, "OWNER_CHAT_ID", "1")
+    monkeypatch.setattr(heartbeat.tg, "send_message", lambda *a, **k: (True, None))
+    assert heartbeat.send_report() is True
+
+
 def _write_jsonl(path, rows) -> str:
     path.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
                     encoding="utf-8")

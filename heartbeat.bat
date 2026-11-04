@@ -8,6 +8,7 @@ if not defined PY goto nopython
 
 rem daily TG heartbeat; output goes to logs\heartbeat.log
 if not exist logs mkdir logs
+set "PYTHONIOENCODING=utf-8"
 echo === start %date% %time% === >> logs\heartbeat.log
 "%PY%" -u heartbeat.py >> logs\heartbeat.log 2>&1
 exit /b 0

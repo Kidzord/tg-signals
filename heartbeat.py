@@ -30,6 +30,34 @@ import tg
 logger_config.setup_logging(level=cfg.LOG_LEVEL, json_logs=cfg.LOG_JSON)
 log = logger_config.get_logger("heartbeat")
 
+
+def _safe_stdout() -> None:
+    """Консоль Windows в cp1251 не печатает эмодзи — вывод не должен ронять отчёт."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
+def say(*args: object) -> None:
+    """print, который не падает на символах вне кодировки консоли."""
+    msg = " ".join(str(a) for a in args) + "\n"
+    try:
+        sys.stdout.write(msg)
+        sys.stdout.flush()
+    except UnicodeEncodeError:
+        try:
+            sys.stdout.write(msg.encode("ascii", "replace").decode("ascii"))
+            sys.stdout.flush()
+        except (UnicodeEncodeError, OSError):
+            pass
+    except OSError:
+        pass
+
+
+_safe_stdout()
+
 TZ = ZoneInfo(cfg.DISPLAY_TZ)
 HEARTBEAT_TIME = os.getenv("HEARTBEAT_TIME", "09:00").strip()
 DIGEST_TIME = os.getenv("DIGEST_TIME", "21:00").strip()
@@ -159,12 +187,12 @@ def build_report() -> str:
 def send_report() -> bool:
     text = build_report()
     if not cfg.OWNER_CHAT_ID:
-        print("OWNER_CHAT_ID пуст — некому отправлять")
+        say("OWNER_CHAT_ID пуст — некому отправлять")
         return False
     ok, err = tg.send_message(text, token=cfg.SUB_BOT_TOKEN or cfg.BOT_TOKEN,
                              chat_id=cfg.OWNER_CHAT_ID)
-    print(("отправлено" if ok else f"ошибка отправки: {err}"))
-    print(text)
+    say(("отправлено" if ok else f"ошибка отправки: {err}"))
+    say(text)
     return ok
 
 
@@ -218,11 +246,11 @@ def build_digest() -> str:
 def send_digest() -> bool:
     text = build_digest()
     if not cfg.CHAT_ID:
-        print("CHAT_ID пуст — дайджест некуда отправлять")
+        say("CHAT_ID пуст — дайджест некуда отправлять")
         return False
     ok, err = tg.send_message(text, chat_id=cfg.CHAT_ID)
-    print(("дайджест отправлен" if ok else f"ошибка дайджеста: {err}"))
-    print(text)
+    say(("дайджест отправлен" if ok else f"ошибка дайджеста: {err}"))
+    say(text)
     return ok
 
 
@@ -242,7 +270,7 @@ def main() -> None:
         if "--digest" in sys.argv:
             send_digest()
         return
-    print(f"heartbeat: отчёт владельцу в {HEARTBEAT_TIME}, дайджест в канал в {DIGEST_TIME} "
+    say(f"heartbeat: отчёт владельцу в {HEARTBEAT_TIME}, дайджест в канал в {DIGEST_TIME} "
           f"({cfg.DISPLAY_TZ}); проверка — python heartbeat.py once")
     tasks = [
         (HEARTBEAT_TIME, send_report, "hb"),
@@ -250,7 +278,7 @@ def main() -> None:
     ]
     for hhmm, _fn, tag in tasks:
         if not _hhmm(hhmm):
-            print(f"{tag}: неверное время {hhmm!r} — ожидается ЧЧ:ММ, отчёт выключен")
+            say(f"{tag}: неверное время {hhmm!r} — ожидается ЧЧ:ММ, отчёт выключен")
     last_sent = load_sent()
     retry_at: dict[str, float] = {}
     while True:
@@ -268,7 +296,7 @@ def main() -> None:
             try:
                 ok = fn()
             except Exception as e:
-                print("ошибка отчёта:", repr(e))
+                say("ошибка отчёта:", repr(e))
                 ok = False
             if ok:
                 last_sent[tag] = today
