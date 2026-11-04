@@ -53,6 +53,7 @@ import crypto_pay
 import discord_intake
 import edu_posts
 import ocr_text
+import position_size
 import render as card
 import revenue
 import risk_guard
@@ -244,6 +245,28 @@ def paid_until(users: dict, uid: str) -> float:
 
 def is_paid(users: dict, uid: str) -> bool:
     return paid_until(users, uid) > time.time()
+
+
+def size_line(users: dict, uid: str, rec: dict) -> str:
+    """Объём под депозит и риск конкретного подписчика (или пустая строка)."""
+    size = rec.get("size") if isinstance(rec, dict) else None
+    if not isinstance(size, dict):
+        return ""
+    p = user_plan(users, uid)
+    try:
+        risk_money = float(p.get("deposit", 0)) * float(p.get("risk", 0)) / 100.0
+    except (TypeError, ValueError):
+        return ""
+    res = position_size.size_for_risk(risk_money, size)
+    if not res:
+        return ""
+    step = float(size.get("step") or 0.01)
+    if res["exceeds"]:
+        minimum = position_size.fmt_lots(float(size.get("min") or step), step)
+        return (f"📐 Мин. лот {minimum} даст риск {usd(res['risk'])} — "
+                f"это больше твоих {usd(risk_money)}")
+    lots = position_size.fmt_lots(res["lots"], step)
+    return f"📐 Под твой счёт: риск {usd(risk_money)} · {lots} лота"
 
 
 def grant(users: dict, uid: str, until_ts: float) -> None:
@@ -1730,9 +1753,11 @@ def poll_signals(users: dict, state: dict) -> None:
         caption = str(rec.get("caption", ""))
         path = str(rec.get("path", "") or "")
         for uid in paid:
+            line = size_line(users, uid, rec)
+            personal = caption + ("\n\n" + line if line else "")
             if store.enqueue_delivery(
                 uid=uid, trade_id=tid, kind="entry", chat_id=uid,
-                caption=caption, symbol=str(rec.get("symbol", "")),
+                caption=personal, symbol=str(rec.get("symbol", "")),
                 side=str(rec.get("side", "")), image_path=path or None,
             ):
                 added += 1

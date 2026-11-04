@@ -24,10 +24,12 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import consensus
+import config as cfg
 import crt
 import feeds
 import mt5_screenshot
 import news_calendar
+import position_size
 import render as card
 import risk_guard
 import sonar
@@ -360,7 +362,8 @@ def trade_id_for(sig: card.Signal, bar_ts: float | None = None) -> str:
     return f"{sig.symbol}_{ts}"
 
 
-def queue_signal(path: str, caption: str, *, trade_id: str, sig: card.Signal) -> None:
+def queue_signal(path: str, caption: str, *, trade_id: str, sig: card.Signal,
+                 size: dict | None = None) -> None:
     """Кладём сигнал в очередь — premium-бот разошлёт его подписчикам сразу."""
     rec = {
         "ts": time.time(), "kind": "entry", "trade_id": trade_id,
@@ -368,9 +371,27 @@ def queue_signal(path: str, caption: str, *, trade_id: str, sig: card.Signal) ->
         "symbol": sig.symbol, "side": sig.side, "tf": sig.tf,
         "entry": sig.entry, "sl": sig.sl,
         "tp1": sig.tp1, "tp2": sig.tp2, "tp3": sig.tp3,
-        "strategy": STRATEGY,
+        "strategy": STRATEGY, "size": size,
     }
     append_jsonl(QUEUE_PATH, rec)
+
+
+def size_reference(size: dict | None) -> str:
+    """Строка для бесплатной группы: объём при дефолтном депозите и риске."""
+    risk_money = float(cfg.PLAN_DEPOSIT) * float(cfg.PLAN_RISK_PCT) / 100.0
+    res = position_size.size_for_risk(risk_money, size)
+    if not res or not size:
+        return ""
+    step = float(size.get("step") or 0.01)
+    deposit = f"{float(cfg.PLAN_DEPOSIT):,.0f}".replace(",", " ")
+    risk = f"{risk_money:,.0f}".replace(",", " ")
+    if res["exceeds"]:
+        minimum = position_size.fmt_lots(float(size.get("min") or step), step)
+        return (f"📐 Депозит {deposit} $ · риск {risk} $: минимальный лот {minimum} "
+                f"даст риск больше лимита")
+    lots = position_size.fmt_lots(res["lots"], step)
+    return (f"📐 Депозит {deposit} $ · риск {risk} $ → {lots} лота "
+            f"(факт. риск {res['risk']:,.0f} $)".replace(",", " "))
 
 
 def queue_result(*, trade_id: str, kind: str, side: str, r: float,
@@ -549,12 +570,18 @@ def post_signal(sig: card.Signal, chart: st.Frame, regime: str | None = None,
     caption = voice.signal_caption(sig, regime=regime, source="MT5")
     if STRATEGY not in ("range", "sonar"):
         caption += "\nстратегия: " + STRATEGY
+    size = position_size.measure(sig.symbol, sig.entry, sig.sl)
     # premium-подписчики получают сигнал сразу, бесплатная группа — с задержкой.
-    # CTA добавляем только в групповую версию: подписчику бота она не нужна.
-    queue_signal(path, caption, trade_id=tid, sig=sig)
+    # CTA и расчёт объёма добавляем только в групповую версию: подписчику бота
+    # объём считается персонально в subbot.py под его депозит и риск.
+    queue_signal(path, caption, trade_id=tid, sig=sig, size=size)
     due = time.time() + max(0, FREE_DELAY_SEC)
+    group_caption = caption
+    ref = size_reference(size)
+    if ref:
+        group_caption += "\n\n" + ref
     store.enqueue_group(trade_id=tid, kind="entry", path=path,
-                        caption=caption + PREMIUM_CTA,
+                        caption=group_caption + PREMIUM_CTA,
                         due_ts=due, entry=sig.entry, side=sig.side, symbol=sig.symbol)
     if FREE_DELAY_SEC > 0:
         print(f"в группу уйдёт через {FREE_DELAY_SEC} с")

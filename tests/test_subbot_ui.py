@@ -55,3 +55,21 @@ def test_welcome_for_paid_user_shows_until_date():
     until = time.time() + 5 * 86400
     text = subbot.welcome_text({"42": {"paid_until": until}}, "42")
     assert "Подписка активна до" in text
+
+
+def test_size_line_for_user_deposit():
+    rec = {"size": {"loss_per_lot": 1300.0, "step": 0.01,
+                    "min": 0.01, "max": 100.0}}
+    line = subbot.size_line({"42": {"deposit": 10000, "risk": 0.5}}, "42", rec)
+    assert "50 $" in line and "0.03 лота" in line
+
+
+def test_size_line_warns_when_min_lot_exceeds_risk():
+    rec = {"size": {"loss_per_lot": 1300.0, "step": 0.01,
+                    "min": 0.01, "max": 100.0}}
+    line = subbot.size_line({"42": {"deposit": 100, "risk": 1}}, "42", rec)
+    assert "Мин. лот" in line and "больше" in line
+
+
+def test_size_line_empty_without_size_specs():
+    assert subbot.size_line({}, "42", {"caption": "x"}) == ""
