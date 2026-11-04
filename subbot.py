@@ -762,6 +762,17 @@ def _num(raw: str, lo: float, hi: float) -> float | None:
     return v if lo <= v <= hi else None
 
 
+def card_status_line(users: dict, uid: str) -> str:
+    """Строка статуса доступа в карточке счёта: срок или следующий шаг."""
+    if is_paid(users, uid):
+        ts = paid_until(users, uid)
+        left = int((ts - time.time()) // 86400) + 1
+        return f"✅ Доступ до <b>{_date(ts)}</b> — осталось {left} дн."
+    if trial_available(users, uid):
+        return f"🎁 Пробный доступ на {cfg.TRIAL_DAYS} дн. ещё не использован — кнопка ниже."
+    return "🔒 Подписка не активна — оформить можно кнопкой ниже."
+
+
 def send_card(uid: str, users: dict, name: str = "") -> None:
     p = user_plan(users, uid)
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -779,6 +790,7 @@ def send_card(uid: str, users: dict, name: str = "") -> None:
     card.render_account_card(plan, path)
     caption = (
         "<b>Твой план счёта</b>\n"
+        f"{card_status_line(users, uid)}\n\n"
         f"Депозит {usd(plan.deposit)} · риск {plan.risk_pct:.2f}% = "
         f"{usd(plan.risk_money)} на сделку\n"
         f"Дневной стоп {plan.daily_pct:.1f}% · общий стоп {plan.total_pct:.1f}%\n"
@@ -790,15 +802,14 @@ def send_card(uid: str, users: dict, name: str = "") -> None:
         reply(uid, "Не удалось отправить карточку. Попробуй позже.")
 
 
-def send_buy(uid: str) -> None:
-    """Оплата подписки: карточка выгод и выбор способа (Stars / крипта)."""
-    if not crypto_pay.enabled() and cfg.SUB_PRICE_STARS_YEAR <= 0:
-        send_stars(uid)
-        return
-    rows: list[list[dict]] = [
-        [{"text": f"⭐ Telegram Stars — {cfg.SUB_PRICE_STARS} ⭐ / мес",
-          "callback_data": "pay:stars"}],
-    ]
+def buy_options(users: dict, uid: str) -> list[list[dict]]:
+    """Способы входа: сначала бесплатный триал, затем оплата."""
+    rows: list[list[dict]] = []
+    if trial_available(users, uid):
+        rows.append([{"text": f"🎁 Попробовать бесплатно — {cfg.TRIAL_DAYS} дн.",
+                      "callback_data": "trial"}])
+    rows.append([{"text": f"⭐ Telegram Stars — {cfg.SUB_PRICE_STARS} ⭐ / мес",
+                  "callback_data": "pay:stars"}])
     if cfg.SUB_PRICE_STARS_YEAR > 0:
         rows.append([{"text": f"⭐ Stars — {cfg.SUB_PRICE_STARS_YEAR} ⭐ / год",
                       "callback_data": "pay:stars:year"}])
@@ -808,12 +819,23 @@ def send_buy(uid: str) -> None:
     if crypto_pay.enabled() and cfg.CRYPTO_PRICE_USDT_YEAR > 0:
         rows.append([{"text": f"💠 Крипта — {cfg.CRYPTO_PRICE_USDT_YEAR:g} {cfg.CRYPTO_ASSET} / год",
                       "callback_data": "pay:crypto:year"}])
+    return rows
+
+
+def send_buy(uid: str, users: dict | None = None) -> None:
+    """Оплата подписки: карточка выгод и выбор способа (Stars / крипта)."""
+    if not crypto_pay.enabled() and cfg.SUB_PRICE_STARS_YEAR <= 0:
+        send_stars(uid)
+        return
+    rows = buy_options(users or {}, uid)
     cb = channel_buttons()
     if cb:
         rows.append(cb)
     markup = {"inline_keyboard": rows}
+    trial_hint = (f"🎁 Сначала можно попробовать бесплатно — {cfg.TRIAL_DAYS} дн.\n\n"
+                  if trial_available(users or {}, uid) else "")
     caption = (
-        f"<b>{cfg.SUB_TITLE}</b>\n\n{cfg.SUB_DESCRIPTION}\n\n"
+        f"<b>{cfg.SUB_TITLE}</b>\n\n{trial_hint}{cfg.SUB_DESCRIPTION}\n\n"
         "Выбери, как удобнее оплатить:\n"
         f"• <b>Stars</b> — {cfg.SUB_PRICE_STARS} ⭐ в месяц, продление автоматическое\n"
     )
@@ -966,11 +988,11 @@ def menu_markup(users: dict, uid: str) -> dict:
         rows.append([{"text": "⚙️ Настроить план", "callback_data": "set:menu"}])
         rows.append([{"text": f"🔄 Продлить — {cfg.SUB_PRICE_STARS} ⭐", "callback_data": "buy"}])
     else:
-        rows.append([{"text": f"⚡ Оформить подписку — {cfg.SUB_PRICE_STARS} ⭐",
-                      "callback_data": "buy"}])
         if trial_available(users, uid):
             rows.append([{"text": f"🎁 Пробный доступ — {cfg.TRIAL_DAYS} дн.",
                           "callback_data": "trial"}])
+        rows.append([{"text": f"⚡ Оформить подписку — {cfg.SUB_PRICE_STARS} ⭐",
+                      "callback_data": "buy"}])
     rows.append([{"text": "📈 Статистика", "callback_data": "stats"},
                  {"text": "❓ FAQ", "callback_data": "faq"}])
     rows.append([{"text": "📚 Методички", "callback_data": "edu:list"}])
@@ -996,13 +1018,15 @@ def welcome_text(users: dict, uid: str, name: str = "") -> str:
         "Это <b>KidzordFX Premium</b> — быстрые сигналы по золоту, форексу и "
         "индексам и расчёт риска под твой счёт.\n\n"
         "• сигнал приходит сразу: вход, стоп и три цели\n"
-        "• бот считает объём под твой депозит\n"
-        "• следит за твоим дневным и общим лимитом\n"
+        "• объём и дневной лимит считаются под твой депозит\n"
         "• бесплатные методички: /lesson или «📚 Методички» внизу\n\n"
     )
     if is_paid(users, uid):
         body += (f"✅ Подписка активна до <b>{_date(paid_until(users, uid))}</b>.\n"
                  "Открой «📊 Мой счёт» внизу.")
+    elif trial_available(users, uid):
+        body += (f"🎁 Пробный доступ — {cfg.TRIAL_DAYS} дн. бесплатно: кнопка под сообщением.\n"
+                 f"Дальше — {cfg.SUB_PRICE_STARS} ⭐ в месяц, отменить можно в любой момент.")
     else:
         body += (f"🔒 Подписка — <b>{cfg.SUB_PRICE_STARS} ⭐ в месяц</b>, "
                  "продление автоматическое, отменить можно в любой момент.\n"
@@ -1025,7 +1049,7 @@ def send_welcome(users: dict, uid: str, name: str = "") -> None:
 def send_premium(uid: str, users: dict) -> None:
     """Статус подписки: активна — кнопка продления, нет — счёт на оплату."""
     if not is_paid(users, uid):
-        send_buy(uid)
+        send_buy(uid, users)
         return
     ts = paid_until(users, uid)
     left = int((ts - time.time()) // 86400) + 1
@@ -1226,7 +1250,7 @@ def handle_callback(users: dict, uid: str, chat_id: str, mid: int, data: str) ->
         return None
 
     if data == "buy":
-        send_buy(uid)
+        send_buy(uid, users)
         return None
 
     if data == "pay:stars":
@@ -1452,7 +1476,7 @@ def handle(users: dict, uid: str, raw: str, name: str = "") -> dict | None:
         return None
 
     if cmd in ("buy", "subscribe"):
-        send_buy(uid)
+        send_buy(uid, users)
         return None
 
     if cmd == "premium":
