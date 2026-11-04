@@ -13,10 +13,34 @@ sys.path.insert(0, ROOT)
 
 import autoposts  # noqa: E402
 import bot  # noqa: E402
+import config as cfg  # noqa: E402
 import heartbeat  # noqa: E402
 import strategy as st  # noqa: E402
 import subbot  # noqa: E402
 import track_record  # noqa: E402
+
+
+def test_mt5_init_pins_terminal_path(monkeypatch):
+    import types
+
+    calls: dict = {}
+    fake = types.SimpleNamespace(initialize=lambda **kw: calls.update(kw) or True)
+    monkeypatch.setitem(sys.modules, "MetaTrader5", fake)
+    monkeypatch.setattr(cfg, "MT5_TERMINAL_PATH", r"C:\MT5\terminal64.exe")
+    assert cfg.mt5_init(timeout=5) is True
+    assert calls["path"] == r"C:\MT5\terminal64.exe"
+    assert calls["timeout"] == 5
+
+
+def test_mt5_init_without_explicit_path(monkeypatch):
+    import types
+
+    calls: dict = {}
+    fake = types.SimpleNamespace(initialize=lambda **kw: calls.update(kw) or True)
+    monkeypatch.setitem(sys.modules, "MetaTrader5", fake)
+    monkeypatch.setattr(cfg, "MT5_TERMINAL_PATH", "")
+    assert cfg.mt5_init() is True
+    assert "path" not in calls
 
 
 def _frame(t, h, l, c) -> st.Frame:

@@ -158,7 +158,7 @@ class MT5Data:
         except ImportError as e:
             raise RuntimeError("пакет MetaTrader5 не установлен") from e
         self.mt5 = mt5
-        if not mt5.initialize(timeout=20000):
+        if not cfg.mt5_init(timeout=20000):
             raise RuntimeError(f"MT5 не отвечает: {mt5.last_error()}")
         self._off: dict[str, int] = {}
         global MT5_DATA_PATH
@@ -1277,6 +1277,15 @@ def scan_sonar(data: MT5Data) -> None:
 
 # --- общий каркас step_*: одинаковые проверки не должны разъезжаться -------
 
+def er_filter_ok(er: float, er_max: float) -> bool:
+    """Пропускает ли Kaufman ER порог режима.
+
+    er_max <= 0 — фильтр выключен, как в range_v2.backtest; иначе «ER ≤ 0»
+    отсекал бы все сделки: на живом рынке ER всегда больше нуля.
+    """
+    return er_max <= 0 or (not np.isnan(er) and er <= er_max)
+
+
 def _bar_ctx(chart: st.Frame) -> tuple[int, float, dt.datetime]:
     """(индекс последнего бара, его время, время закрытия) — одинаково у всех."""
     i = len(chart.c) - 1
@@ -1287,8 +1296,17 @@ def _bar_ctx(chart: st.Frame) -> tuple[int, float, dt.datetime]:
 
 def _step_info(state: dict, bar_ts: float, when, marks: str) -> dict:
     return {"ok": True, "bar": bar_ts, "when": when, "marks": marks,
-            "missing": 0, "side": "-", "posted": False,
+            "missing": 0, "side": "-", "posted": False, "reason": "",
             "trade": bool(state.get("trade"))}
+
+
+def _info_tail(info: dict) -> str:
+    """Хвост строки лога: причина блокировки или чек-лист classic."""
+    marks = info.get("marks") or ""
+    reason = info.get("reason") or ""
+    if reason:
+        return marks if reason in marks else " · ".join(p for p in (marks, reason) if p)
+    return " · ".join([p for p in (marks, f"не хватает {int(info.get('missing', 0))}") if p])
 
 
 def _manage_if_new_bar(state: dict, chart: st.Frame, i: int, bar_ts: float) -> None:
@@ -1305,6 +1323,7 @@ def _already_posted(state: dict, bar_ts: float) -> bool:
 def _daily_limit(info: dict, bar_ts: float) -> bool:
     if MAX_DAILY_STOPS > 0 and risk_stops_today(bar_ts) >= MAX_DAILY_STOPS:
         info["marks"] += " · дневной лимит стопов"
+        info["reason"] = "дневной лимит стопов"
         return True
     return False
 
@@ -1334,6 +1353,7 @@ def _open_trade(state: dict, info: dict, csig: card.Signal, *, tid: str,
     save_state(state)
     info["posted"] = True
     info["trade"] = True
+    info["reason"] = "сигнал отправлен"
     print(f"СИГНАЛ {csig.side} {csig.entry} · SL {csig.sl} · цель {csig.tp1}")
 
 
@@ -1403,17 +1423,22 @@ def step_range(state: dict, chart: st.Frame, htf: dict, smt=None) -> dict:
 
     _manage_if_new_bar(state, chart, i, bar_ts)
     if state.get("trade"):
+        info["reason"] = "сделка уже открыта"
         return info
     if _already_posted(state, bar_ts):
+        info["reason"] = "сигнал на баре уже был"
         return info
 
     # фильтр режима: во флэте преимущество, в тренде его почти нет
     er = ta.efficiency_ratio(chart.c)[i]
-    if np.isnan(er) or er > RANGE_ER_MAX:
+    if not er_filter_ok(er, RANGE_ER_MAX):
+        info["reason"] = ("ER нет данных" if np.isnan(er)
+                          else f"ER {er:.2f} > {RANGE_ER_MAX:.2f}")
         return info
 
     # сессионное окно (killzone): пустое значение — фильтр выключен
     if RANGE_SESSION and not st.in_session(bar_ts, RANGE_SESSION):
+        info["reason"] = "вне торговой сессии"
         return info
 
     # дневной риск-гард: после N стопов на счёте день закрыт, новых входов нет
@@ -1439,25 +1464,33 @@ def step_range(state: dict, chart: st.Frame, htf: dict, smt=None) -> dict:
             sig = ("SHORT", price)
             break
     if not sig:
+        if not levels:
+            info["reason"] = "зон нет"
+        else:
+            near = min(levels, key=lambda lv: abs(float(lv["price"]) - float(chart.c[i])))
+            px_near = float(near["price"])
+            dist = abs(px_near - float(chart.c[i])) / max(float(chart.c[i]), 1e-9) * 100.0
+            info["reason"] = f"нет пересечения · ближайшая зона {px_near:g} ({dist:.2f}%)"
         return info
 
     side, _level_px = sig
     if not range_v2.side_ok(side, RANGE_SIDE):
-        info["marks"] += f" · сторона {side} выключена"
+        info["reason"] = f"сторона {side} выключена"
         return info
     if not range_v2.trend_ok(H, bar_ts, side, RANGE_TREND):
-        info["marks"] += " · против тренда H4"
+        info["reason"] = "против тренда H4"
         return info
     sgn = 1 if side == "LONG" else -1
 
     # SMT-подтверждение: парный инструмент (серебро) не снял тот же экстремум
     if not range_v2.smt_ok(chart, smt, i, side, SMT_LOOK):
-        info["marks"] += " · нет SMT"
+        info["reason"] = "нет SMT"
         return info
 
     if RANGE_STOP_ATR > 0:
         a_c = ta.atr(chart.h, chart.l, chart.c, 14)[i]
         if np.isnan(a_c) or a_c <= 0:
+            info["reason"] = "нет ATR"
             return info
         risk = float(a_c) * RANGE_STOP_ATR
     else:
@@ -1469,6 +1502,7 @@ def step_range(state: dict, chart: st.Frame, htf: dict, smt=None) -> dict:
     stop = entry - sgn * risk
     # стоп мог выбить на баре входа — тогда сделки не было
     if (side == "LONG" and chart.l[i] <= stop) or (side == "SHORT" and chart.h[i] >= stop):
+        info["reason"] = "стоп выбит на баре входа"
         return info
 
     # цель та же, что в бэктесте: тянем до противоположной зоны, если она рядом
@@ -1484,6 +1518,7 @@ def step_range(state: dict, chart: st.Frame, htf: dict, smt=None) -> dict:
     csig_regime = regime
     tid = trade_id_for(csig, bar_ts)
     if not post_signal(csig, chart, regime=csig_regime, trade_id=tid):
+        info["reason"] = "сигнал не отправлен"
         return info
 
     _open_trade(state, info, csig, tid=tid, i=i, bar_ts=bar_ts,
@@ -1624,8 +1659,10 @@ def show(info: dict) -> None:
     if not info.get("ok"):
         print("ошибка:", info.get("reason"))
         return
-    print(f"бар {info['when']:%d.%m %H:%M} · {info['side']} · {info['marks']} · "
-          f"не хватает {info['missing']}" + (" · сделка открыта" if info["trade"] else ""))
+    tail = _info_tail(info)
+    if info.get("trade") and not info.get("reason"):
+        tail += " · сделка открыта"
+    print(f"бар {info['when']:%d.%m %H:%M} · {info['side']} · {tail}")
 
 
 # ------------------------------------------------------------------ запуск
@@ -1692,14 +1729,13 @@ def main() -> None:
                 if info["bar"] != last_bar:
                     last_bar = info["bar"]
                     print(f"новый бар {info['when']:%d.%m %H:%M} · {info['side']} · "
-                          f"{info['marks']} · не хватает {info['missing']}")
+                          f"{_info_tail(info)}")
                     last_beat = now
                 elif info.get("posted"):
                     print("сигнал отправлен")
                     last_beat = now
                 elif now - last_beat > 300:
-                    print(f"жив · бар {info['when']:%d.%m %H:%M} · {info['marks']} · "
-                          f"не хватает {info['missing']}")
+                    print(f"жив · бар {info['when']:%d.%m %H:%M} · {_info_tail(info)}")
                     last_beat = now
             else:
                 last_beat = now

@@ -85,8 +85,22 @@ SYMBOL_FILTER = tuple(
 # --- График ---
 BARS_COUNT = int(os.getenv("BARS_COUNT", "120"))
 MT5_SUFFIX = os.getenv("MT5_SUFFIX", "").strip()      # напр. ".r" для брокеров с суффиксом
+MT5_TERMINAL_PATH = os.getenv("MT5_TERMINAL_PATH", "").strip()
 DATA_CSV = os.getenv("DATA_CSV", "").strip()          # резервный источник, если нет MT5
 CARD_TITLE = os.getenv("CARD_TITLE", "KIDZORDFX").strip()
+
+
+def mt5_init(**kwargs):
+    """Подключение к терминалу MT5.
+
+    С двумя установленными терминалами пакет MetaTrader5 выбирает последний
+    запущенный, поэтому live-путь задаётся явно через MT5_TERMINAL_PATH.
+    """
+    import MetaTrader5 as mt5
+
+    if MT5_TERMINAL_PATH:
+        kwargs.setdefault("path", MT5_TERMINAL_PATH)
+    return mt5.initialize(**kwargs)
 
 # --- Дневной пост ---
 PROMO_ENABLED = _flag("PROMO_ENABLED", "1")

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import math
 
+import config as cfg
+
 
 def _fallback_loss(info, entry: float, stop: float) -> float:
     """Потеря на 1 лот по спецификации контракта, если order_calc_profit недоступен."""
@@ -31,7 +33,7 @@ def measure(symbol: str, entry: float, stop: float) -> dict | None:
     except ImportError:
         return None
     try:
-        if not mt5.initialize():
+        if not cfg.mt5_init():
             return None
         info = mt5.symbol_info(symbol)
         if info is None:

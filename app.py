@@ -471,7 +471,7 @@ def mt5_check() -> None:
         print("пакет не установлен. Выполни:  python -m pip install MetaTrader5")
         return
 
-    if not mt5.initialize(timeout=15000):
+    if not cfg.mt5_init(timeout=15000):
         print("терминал не отвечает:", mt5.last_error())
         print("проверь: MT5 запущен, залогинен, Python и терминал на одной машине")
         return

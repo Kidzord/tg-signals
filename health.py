@@ -109,7 +109,7 @@ def check_mt5() -> HealthCheck:
             extra={"installed": False}
         )
 
-    if not mt5.initialize(timeout=5000):
+    if not cfg.mt5_init(timeout=5000):
         error = mt5.last_error()
         return HealthCheck(
             name="mt5",

@@ -16,6 +16,8 @@ import os
 import shutil
 import time
 
+import config as cfg
+
 try:
     import msvcrt
 except ImportError:  # не Windows — на CI тесты не доходят до lock
@@ -195,7 +197,7 @@ def check(data_path: str | None = None) -> dict:
             import MetaTrader5 as mt5
         except ImportError:
             return {"ok": False, "reason": "пакет MetaTrader5 не установлен"}
-        if not mt5.initialize():
+        if not cfg.mt5_init():
             return {"ok": False, "reason": f"MT5 не отвечает: {mt5.last_error()}"}
         info = mt5.terminal_info()
         data_path = info.data_path if info else ""

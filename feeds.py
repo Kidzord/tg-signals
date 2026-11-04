@@ -83,7 +83,7 @@ def from_mt5(symbol: str, tf: str, count: int) -> list[Bar] | None:
         return None
 
     try:
-        if not mt5.initialize():
+        if not cfg.mt5_init():
             return None
         real = _mt5_resolve(symbol)
         if not real:
