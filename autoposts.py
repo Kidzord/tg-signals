@@ -52,6 +52,7 @@ import revenue
 import social_mix
 import store
 import telegram_editor
+import telegram_posts
 import tg
 import threads_editor
 import tiktok_editor

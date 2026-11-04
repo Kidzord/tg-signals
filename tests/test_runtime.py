@@ -167,6 +167,16 @@ def test_track_record_dedups_trade_journal(tmp_path, monkeypatch):
     assert len(track_record.load_trades()) == 1
 
 
+def test_post_tg_content_uses_telegram_bank(monkeypatch):
+    # Регресс: telegram_posts использовался без импорта, слот 12:00 падал NameError.
+    import telegram_posts
+    monkeypatch.setattr(autoposts, "owner_chat", lambda: "1")
+    monkeypatch.setattr(telegram_posts, "next_unused", lambda: None)
+    monkeypatch.setattr(autoposts.telegram_editor, "publish_next",
+                        lambda *_a, **_k: True)
+    assert autoposts.post_tg_content() is True
+
+
 def test_subbot_import_does_not_require_python_telegram_bot():
     """Мёртвые ui-модули отвязаны: CI не должен ставить python-telegram-bot."""
     assert not hasattr(subbot, "ui_components")
