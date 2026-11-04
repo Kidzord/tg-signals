@@ -90,12 +90,20 @@ $env:RANGE_ER_MAX = "0.20"
 $env:RANGE_TP_R = "3.0"
 $env:RANGE_TREND = "off"
 
-#--- 3. Classic XAUUSD — ПАУЗА с 2026-11-04.
-#    На двухлетней истории native +11.6R / +24.6R (0/0), но на независимом
-#    фиде Exness -37.8R / -25.5R; исключение аномального окна не помогает
-#    (-20.4R). Стратегия не переживает смену фида, live остановлен.
-#    Вернуть после объяснения расхождения и форварда на втором фиде.
-#    Код и параметры остаются; подробности — docs/VALIDATION_2026-11-04.md.
+#--- 3. Classic-стратегия на золоте.
+#    Живёт на native MetaQuotes-Demo: его M15 и брокерские H1/H4/D1/W1
+#    согласованы между собой. 2026-11-04 проверено: на Exness брокерские
+#    старшие ТФ имеют другие границы сессий и дают -28R; пересборка HTF
+#    из M15 возвращает результат к нулю/плюсу. При переезде на другого
+#    брокера HTF нужно пересобирать, иначе classic ломается.
+$env:BOT_SYMBOL = "XAUUSD"
+$env:STRATEGY = "classic"
+if (Test-BotAlive "XAUUSD" "classic") {
+    Write-Host "Classic-бот уже работает — пропускаю" -ForegroundColor DarkGray
+} else {
+    Write-Host "Запуск classic-бота XAUUSD..." -ForegroundColor Yellow
+    Start-Process -FilePath "cmd.exe" -ArgumentList "/c bot.bat classic" -WorkingDirectory $DIR -WindowStyle Minimized
+}
 $env:STRATEGY = "range"
 
 #--- 4. Автопосты + напоминания (лог в logs\autoposts.log)
@@ -168,7 +176,7 @@ Write-Host "=== Все компоненты запущены ===" -ForegroundCol
 Write-Host "Запущено:"
 Write-Host "  - Premium-бот (logs\subbot.log)"
 Write-Host "  - Range-боты: $($symbols -join ', ') (logs\bot_<символ>.log)"
-Write-Host "  - Classic XAUUSD — на паузе с 2026-11-04 (проверка фида, см. docs\VALIDATION_2026-11-04.md)"
+Write-Host "  - Classic-бот XAUUSD (logs\bot_XAUUSD_classic.log)"
 Write-Host "  - Автопосты: план/итоги/промо + напоминания (logs\autoposts.log)"
 Write-Host "  - Heartbeat в Telegram (09:00 МСК; logs\heartbeat.log)"
 Write-Host "  - Мониторинг ботов и доставки (logs\monitor.log)"
