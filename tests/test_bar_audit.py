@@ -34,11 +34,19 @@ def test_best_shift_finds_utc_offset():
 
 def test_compare_flags_only_native_and_close_mismatch():
     native = _m1(0, [10, 11, 12, 13])
-    other = _m1(0, [10, 11, 99])          # один бар пропал, один close не тот
+    other = _m1(0, [10, 11, 99])          # последний бар за общим окном
     res = ba.compare(native, other, point=0.01, tf_min=1)
-    assert len(res["only_native"]) == 1
-    assert len(res["only_other"]) == 0
+    assert len(res["edge_native"]) == 1
+    assert len(res["only_native"]) == 0
     assert res["close_bad"]
+
+
+def test_compare_separates_inner_gap_from_edge():
+    native = _m1(0, [10, 11, 12, 13])
+    other = [native[0], native[1], native[3]]   # пропущен средний бар
+    res = ba.compare(native, other, point=0.01, tf_min=1, shift_hours=0)
+    assert res["only_native"] == [120]
+    assert len(res["edge_native"]) == 0
 
 
 def test_compare_detects_gap_and_zero_range():
