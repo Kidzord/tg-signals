@@ -57,3 +57,6 @@ discord_inbox/
 .ocr_vendor/
 discord_trades.jsonl
 tg_screenshots/
+
+# второй терминал MT5: логин/пароль не коммитим
+.mt5_second.ini
