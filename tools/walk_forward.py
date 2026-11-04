@@ -45,6 +45,33 @@ def slice_frame(chart, a: int, b: int):
                     chart.l[a:b], chart.c[a:b], chart.v[a:b])
 
 
+def _drop_window(frame, start: float, end: float):
+    """Убрать бары из окна [start, end) — для проверки без аномального участка."""
+    keep = ~((frame.t >= start) & (frame.t < end))
+    return st.Frame(frame.t[keep], frame.o[keep], frame.h[keep],
+                    frame.l[keep], frame.c[keep], frame.v[keep])
+
+
+def exclude_window(chart, htf, spec: str | None):
+    """WF_EXCLUDE=2026-10-20:2026-10-26 — исключить дни из всех ТФ."""
+    if not spec:
+        return chart, htf
+    import datetime as dt
+
+    try:
+        a, b = spec.split(":")
+        start = dt.datetime.fromisoformat(a).replace(tzinfo=dt.timezone.utc).timestamp()
+        end = dt.datetime.fromisoformat(b).replace(tzinfo=dt.timezone.utc).timestamp()
+    except ValueError:
+        print(f"WF_EXCLUDE: неверный формат {spec!r}, ожидается ГГГГ-ММ-ДД:ГГГГ-ММ-ДД")
+        return chart, htf
+    before = len(chart.c)
+    out = _drop_window(chart, start, end)
+    out_htf = {k: _drop_window(v, start, end) for k, v in htf.items()}
+    print(f"исключено {before - len(out.c)} баров M15 за {spec}")
+    return out, out_htf
+
+
 # ---------------- runner'ы стратегий ----------------
 
 def run_classic(chart, htf, params):
@@ -258,9 +285,9 @@ def wfa(name: str, cfg: dict, chart, htf) -> dict:
     }
 
 
-def _cli_args(argv: list[str]) -> tuple[str | None, str | None]:
-    """Разбирает «[имя_стратегии] [--json путь]» без argparse-зависимости."""
-    only, json_path = None, None
+def _cli_args(argv: list[str]) -> tuple[str | None, str | None, str | None]:
+    """Разбирает «[имя_стратегии] [--json путь] [--exclude A:B]»."""
+    only, json_path, exclude = None, None, None
     rest = list(argv)
     while rest:
         arg = rest.pop(0)
@@ -268,19 +295,25 @@ def _cli_args(argv: list[str]) -> tuple[str | None, str | None]:
             json_path = rest.pop(0) if rest else None
         elif arg.startswith("--json="):
             json_path = arg.split("=", 1)[1]
+        elif arg == "--exclude":
+            exclude = rest.pop(0) if rest else None
+        elif arg.startswith("--exclude="):
+            exclude = arg.split("=", 1)[1]
         elif not arg.startswith("-") and only is None:
             only = arg
-    return only, json_path
+    return only, json_path, exclude
 
 
 def main() -> int:
-    only, json_path = _cli_args(sys.argv[1:])
+    only, json_path, exclude = _cli_args(sys.argv[1:])
+    exclude = exclude or os.getenv("WF_EXCLUDE", "").strip() or None
     symbol = os.getenv("BOT_SYMBOL", "XAUUSD").strip()
     data = bot.connect()
     if data is None:
         print("нет подключения к MT5: запусти терминал, войди в счёт и повтори")
         return 3
     chart, htf = bot.load_frames(data, symbol, bot.TF, BARS)
+    chart, htf = exclude_window(chart, htf, exclude)
     days = (chart.t[-1] - chart.t[0]) / 86400
     global BARS_PER_DAY
     # у индексов сессии короче суток: считаем фактические бары/день

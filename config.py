@@ -182,7 +182,7 @@ MONITOR_EVERY_MIN = int(_float("MONITOR_EVERY_MIN", 15.0))
 # если пульса нет дольше M минут — алерт владельцу в личку
 MONITOR_STALE_MIN = int(_float("MONITOR_STALE_MIN", 15.0))
 # сколько процессов bot.py должно работать (range AUDUSD+USDCAD+EURUSD + classic XAUUSD)
-EXPECTED_BOTS = int(_float("HEARTBEAT_EXPECT_BOTS", 4.0))
+EXPECTED_BOTS = int(_float("HEARTBEAT_EXPECT_BOTS", 3.0))
 # Внешний dead-man switch: URL healthchecks.io (или аналога). Пока ПК жив,
 # monitor.py раз в цикл пингует его; если ПК упал — сервис шлёт алерт.
 HEALTHCHECK_URL = os.getenv("HEALTHCHECK_URL", "").strip()

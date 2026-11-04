@@ -64,7 +64,7 @@ DIGEST_TIME = os.getenv("DIGEST_TIME", "21:00").strip()
 QUEUE_PATH = Path(__file__).parent / "signals_queue.jsonl"
 TRADES_PATH = Path(__file__).parent / "trades.jsonl"
 STATE_PATH = Path(__file__).parent / "heartbeat_state.json"
-EXPECTED_BOTS = int(os.getenv("HEARTBEAT_EXPECT_BOTS", "4"))  # range AUDUSD+USDCAD+EURUSD + classic XAUUSD
+EXPECTED_BOTS = int(os.getenv("HEARTBEAT_EXPECT_BOTS", "3"))  # range AUDUSD+USDCAD + classic XAUUSD
 
 
 def _num(v, default: float = 0.0) -> float:
