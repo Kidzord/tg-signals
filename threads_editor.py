@@ -16,6 +16,7 @@ API Threads не нужен. Владелец получает в личку д�
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import textwrap
@@ -91,7 +92,10 @@ def _generic_image(n: int, post: dict) -> str:
     """Карточка для постов, под которые ещё нет нарисованной картинки."""
     gen_dir = os.path.join(str(threads_post.IMG_DIR), "generated")
     os.makedirs(gen_dir, exist_ok=True)
-    path = os.path.join(gen_dir, f"{n:02d}.png")
+    # ключ включает текст: иначе обложка «ДЕНЬ 2» переиспользуется на «ДЕНЬ 3»
+    key_src = f"{n}|{post.get('title', '')}|{post.get('text', '')}|{post.get('label', '')}"
+    key = hashlib.sha1(key_src.encode("utf-8")).hexdigest()[:10]
+    path = os.path.join(gen_dir, f"{n:02d}_{key}.png")
     if os.path.exists(path):
         return path
     c = theme.Card(10.8, 13.5)

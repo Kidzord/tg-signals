@@ -13,7 +13,18 @@ sys.path.insert(0, ROOT)
 
 import subbot  # noqa: E402
 import tg  # noqa: E402
+import threads_editor  # noqa: E402
+import threads_post  # noqa: E402
 import tiktok_editor  # noqa: E402
+
+
+def test_generic_image_is_not_reused_when_day_changes(tmp_path, monkeypatch):
+    monkeypatch.setattr(threads_post, "IMG_DIR", tmp_path)
+    day2 = threads_editor._generic_image(320, {"title": "ДЕНЬ 2", "text": "текст"})
+    day3 = threads_editor._generic_image(320, {"title": "ДЕНЬ 3", "text": "текст"})
+    assert day2 != day3
+    # тот же текст — тот же кеш, перерисовки нет
+    assert threads_editor._generic_image(320, {"title": "ДЕНЬ 3", "text": "текст"}) == day3
 
 
 def test_caption_has_cta_and_hashtags():
