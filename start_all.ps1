@@ -54,15 +54,16 @@ if (Test-Running 'subbot\.py') {
 Start-Sleep -Seconds 2
 
 #--- 2. Range-боты: только символы, прошедшие walk-forward.
-#    2026-11-04 EURUSD выведен из live: WFA 50% активных фолдов, последние
-#    2.5 месяца -2.0R на native и -1.65R на Exness, первый live-вход -1R.
-#    Вернуть после порта тренд-фильтра в RangeBotEA и независимой проверки.
+#    2026-11-04 EURUSD возвращён: причина прежнего минуса — другие границы
+#    H4 у Exness. С пересобранным H4 Exness +11.7R, native live +30.4R/15 мес.
+#    См. tools/range_feed_diag.py и docs/EURUSD_DECISION_2026-11-04.md.
 #    AUDUSD/USDCAD — из .env (er=0.20, tp=3.0). Отключены как непрошедшие/шум:
 #    GBPUSD, JPN225, DE40, US500, EUSTX50, XAUUSD-range (на золоте classic).
 #    UK100 — данные невалидны.
-$symbols = @("AUDUSD", "USDCAD")
+$symbols = @("AUDUSD", "USDCAD", "EURUSD")
 $rangeTuning = @{
     "AUDUSD" = @{ ER = "0.10"; TP = "3.0"; TREND = "with" }
+    "EURUSD" = @{ ER = "0.0"; TP = "3.0"; TREND = "with" }
 }
 Write-Host "Запуск range-ботов: $($symbols -join ', ')..." -ForegroundColor Yellow
 foreach ($sym in $symbols) {

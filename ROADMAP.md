@@ -66,13 +66,14 @@ outbox-доставка в SQLite, heartbeat + watchdog + dead-man switch, но�
 
 ## D. Стратегии (постоянный процесс)
 
-- [ ] **D1. Форвард-статистика флота.** Live: **AUDUSD, USDCAD и classic XAUUSD**
-      (classic — только на native: Exness даёт −28R из-за других границ H1/H4/D1/W1,
-      после пересборки HTF из M15 результат возвращается к нулю). **EURUSD выведен**
-      (native +, Exness около нуля). См. `docs/VALIDATION_2026-11-04.md`.
+- [ ] **D1. Форвард-статистика флота.** Live: **AUDUSD, USDCAD, EURUSD и classic
+      XAUUSD**. Classic и EURUSD — только на native: у Exness другие границы
+      H1/H4/D1/W1 (classic −28R, EURUSD −7R); после пересборки HTF из M15
+      classic возвращается к нулю, EURUSD — к +11.7R. См.
+      `docs/VALIDATION_2026-11-04.md` и `docs/EURUSD_DECISION_2026-11-04.md`.
       Копить live-результаты, **квартальный WFA в начале декабря**, ревизия
-      флота по его итогам. Кандидат на теневой форвард — ICT gold3 (+14.6R
-      native, +8.8R Exness). При переезде на другого брокера — пересобирать HTF.
+      флота по его итогам. Кандидат на теневой форвард — ICT gold3.
+      При переезде на другого брокера — пересобирать HTF/H4.
 - [ ] **D2. Шорт-лист новых стратегий** (PDH/PDL sweep, ICT 2022, FVG+OB, ORB,
       RSI(2)) — не более одной в месяц, каждая через полный протокол IS→OOS→WFA.
       PMB и CRT закрыты как невоспроизводимые; ICT 2022 и PDH/PDL — в testing.
