@@ -48,7 +48,6 @@ def signal_caption(sig: card.Signal, *, zone: float | None = None,
     intro = _pick(INTRO_LONG if sig.is_long else INTRO_SHORT, seed).format(sym=sig.symbol)
     close = _pick(CLOSE, seed + "c")
 
-    last_tp = sig.tp3 if sig.tp3 is not None else (sig.tp2 if sig.tp2 is not None else sig.tp1)
     lines = [intro, ""]
 
     arrow = "↑" if sig.is_long else "↓"
@@ -109,13 +108,6 @@ EVENT = {
 }
 
 
-# Эмодзи исхода: подсказка глазу, что произошло, ещё до чтения текста.
-KIND_EMOJI = {
-    "tp1": "🎯", "tp2": "🎯", "tp3": "🏁", "tp": "✅",
-    "sl": "🛑", "be": "➖", "time": "⏱",
-}
-
-
 def event_text(kind: str, symbol: str, side: str, r: float, note: str = "") -> str:
     opts = EVENT.get(kind) or EVENT["sl"]
     line = _pick(opts, f"{symbol}{kind}{r:.2f}")
@@ -123,8 +115,7 @@ def event_text(kind: str, symbol: str, side: str, r: float, note: str = "") -> s
     txt = line.format(r=rtxt)
     if note:
         txt += " " + note[0].upper() + note[1:] + "."
-    emoji = KIND_EMOJI.get(kind, "•")
-    return f"{emoji} <b>{symbol}</b> · {'лонг' if side == 'LONG' else 'шорт'}\n{txt}"
+    return f"<b>{symbol}</b> · {'лонг' if side == 'LONG' else 'шорт'}\n{txt}"
 
 
 def outcome_line(kind: str, r: float, note: str = "") -> str:
@@ -132,7 +123,7 @@ def outcome_line(kind: str, r: float, note: str = "") -> str:
     opts = EVENT.get(kind) or EVENT["sl"]
     line = _pick(opts, f"merge{kind}{r:.2f}")
     rtxt = f"{r:+.2f}R" if abs(r) > 0.001 else "0R"
-    txt = f"{KIND_EMOJI.get(kind, '•')} Итог: " + line.format(r=rtxt)
+    txt = "Итог: " + line.format(r=rtxt)
     if note:
         txt += " " + note[0].upper() + note[1:] + "."
     return txt

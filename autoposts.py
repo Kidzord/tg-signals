@@ -76,18 +76,53 @@ PER_R = cfg.PLAN_DEPOSIT * cfg.PLAN_RISK_PCT / 100.0
 MONTHS_GEN = ("января", "февраля", "марта", "апреля", "мая", "июня",
               "июля", "августа", "сентября", "октября", "ноября", "декабря")
 
-# Что показываем в утреннем плане (ротация по дню года, чтобы дни не повторялись).
+# В live только два инструмента: classic XAUUSD и range EURUSD.
+# Индексы (US500/JPN225/DE40/...) не торгуем — они остаются в research.
 FOCUS = (
     ("золото", "XAUUSD"),
-    ("австралиец", "AUDUSD"),
-    ("канадец", "USDCAD"),
-    ("фунт", "GBPUSD"),
-    ("индекс США", "US500"),
-    ("европейский индекс", "EUSTX50"),
-    ("британский индекс", "UK100"),
-    ("немецкий индекс", "DE40"),
-    ("японец", "JPN225"),
+    ("евро", "EURUSD"),
 )
+
+# Пул фраз: выбор детерминирован датой, чтобы план не был одинаковым каждый день.
+PLAN_OPENERS = (
+    "Вот мой план на сегодня.{pos_note} Бота пилю сам, цифры беру из журнала.",
+    "Утро начинаю не с прогноза, а с плана.{pos_note}",
+    "Коротко, что у меня в работе на сегодня.{pos_note}",
+    "Сегодня без гаданий: есть план и правила.{pos_note}",
+    "Пишу план на день, пока рынок ещё не разошёлся.{pos_note}",
+    "Мой день начинается с чек-листа, а не с мнения о рынке.{pos_note}",
+)
+PLAN_FOCUS = (
+    "В работе золото (classic) и евро (range): смотрю границы диапазона "
+    "и реакцию от уровня.",
+    "Смотрю только два инструмента — золото и евро. Вход от уровня, не по ощущению.",
+    "Золото и евро: если цена у границы и есть отбой, рассматриваю вход; иначе пропуск.",
+    "Два инструмента в фокусе: золото по classic, евро по range. Остальное — вне live.",
+)
+PLAN_RULES = (
+    "Правила на день: риск {risk}% на сделку, не больше {cap} стопов. "
+    "Нет реакции — нет сделки.",
+    "Риск {risk}% на сделку и лимит {cap} стопа в день. Это не обсуждается.",
+    "Держу риск {risk}% и максимум {cap} стопа за день; после лимита день закрыт.",
+)
+PLAN_NOTES = (
+    "Пропущенная сделка не стоит ничего.",
+    "Сделка без причины стоит дорого.",
+    "Сегодня важнее дисциплина, чем количество входов.",
+    "Индексы не торгую: в live только золото и евро.",
+)
+PLAN_CLOSERS = (
+    "Рынок вялый — пропущу день целиком.",
+    "Если реакции нет, я не выдумываю вход.",
+    "Сначала правила, потом сделки.",
+    "Сегодня важнее не угадать, а не наделать лишнего.",
+    "План есть, а рынок пусть сам предложит вход.",
+    "Без сигнала — без сделки. Это тоже результат.",
+)
+PLAN_WEEKDAY = {
+    0: "Понедельник: не гонюсь за движением после выходных.",
+    4: "Пятница: меньше новых рисков, больше дисциплины.",
+}
 
 
 # ------------------------------------------------------------- вспомогательное
@@ -220,31 +255,50 @@ def _send_trade_shot(trade: dict | None,
     _mirror(image, cap)
 
 
-def post_plan(now: dt.datetime | None = None) -> bool:
-    """Утренний план на день — карточкой в группу, в рамке дневника."""
+def build_plan(now: dt.datetime | None = None) -> tuple[str, list[str]]:
+    """Текст утреннего плана: только live-инструменты + дневная вариация фраз."""
     now = now or dt.datetime.now(TZ)
-    y = now.timetuple().tm_yday
-    a, b = FOCUS[y % len(FOCUS)], FOCUS[(y + 4) % len(FOCUS)]
+    day_seed = int(now.strftime("%Y%m%d"))
+
+    def pick(seq, salt: int):
+        # Детерминированный выбор по дате: без random и без одинаковых дней.
+        return seq[(day_seed + salt * 7) % len(seq)]
+
+    a, b = FOCUS if now.toordinal() % 2 == 0 else (FOCUS[1], FOCUS[0])
     cap = os.getenv("MAX_DAILY_STOPS", "3").strip() or "3"
     risk = f"{cfg.PLAN_RISK_PCT:g}".replace(".", ",")
     day_no = devlog.day_number(now.date())
     pos = social_mix.latest_positive()
+    # В плане упоминаем только live-инструменты, иначе можно написать
+    # «в работе золото и евро», а в плюсе — уже выведенный AUDUSD.
+    live_symbols = {sym for _, sym in FOCUS}
+    if pos and str(pos.get("symbol", "")).upper() not in live_symbols:
+        pos = None
     pos_note = (f" Последняя закрытая в плюс — {social_mix.trade_line(pos)}."
                 if pos else "")
+    opener = pick(PLAN_OPENERS, 1).format(pos_note=pos_note)
+    focus = pick(PLAN_FOCUS, 2).format(a=a[0], b=b[0])
+    rules = pick(PLAN_RULES, 3).format(risk=risk, cap=cap)
+    weekday = PLAN_WEEKDAY.get(now.weekday(), "")
     body = [
-        f"Вот мой план на сегодня.{pos_note} Месяц пилю торгового бота, "
-        f"пишу сам; цифры беру из журнала сделок.",
-        f"Сегодня под наблюдением {a[0]} и {b[0]}: смотрю, где цена у границы "
-        f"диапазона и есть ли реакция. Вход — только от уровня.",
-        f"Правила на день без изменений: риск {risk}% на сделку, "
-        f"не больше {cap} стопов в день. Нет реакции — нет сделки.",
-        "Рынок вялый — пропущу день целиком. Пропущенная сделка не стоит ничего, "
-        "а сделка без причины — стоит.",
+        opener,
+        focus,
+        rules,
+        (weekday + " " + pick(PLAN_NOTES, 4)).strip(),
+        pick(PLAN_CLOSERS, 5),
     ]
+    head = f"<b>День {day_no} · план · {now:%d.%m}</b>"
+    return head, body
+
+
+def post_plan(now: dt.datetime | None = None) -> bool:
+    """Утренний план на день — карточкой в группу, в рамке дневника."""
+    now = now or dt.datetime.now(TZ)
+    head, body = build_plan(now)
+    day_no = devlog.day_number(now.date())
     os.makedirs(OUT_DIR, exist_ok=True)
     day = now.strftime("%d.%m")
     path = os.path.join(OUT_DIR, f"plan_{now:%Y%m%d}.png")
-    head = f"🌅 <b>День {day_no} · план · {day}</b>"
     try:
         card.render_plan_card(title=f"День {day_no} · план", subtitle=day, body=body,
                               out_path=path, when=now)
@@ -363,16 +417,132 @@ def post_week_summary(now: dt.datetime | None = None) -> bool:
     return ok
 
 
-def post_promo() -> bool:
-    """Продающий пост с кнопкой на premium-бота."""
-    markup = None
-    if cfg.PREMIUM_URL:
-        markup = {"inline_keyboard": [[{"text": "⚡ Оформить Premium",
-                                        "url": cfg.PREMIUM_URL}]]}
-    ok, info = tg.send_message(cfg.PROMO_TEXT, markup=markup)
-    _mirror(None, cfg.PROMO_TEXT)
-    log.info("промо -> %s (%s)", ok, info)
+def _premium_markup() -> dict | None:
+    if not cfg.PREMIUM_URL:
+        return None
+    return {"inline_keyboard": [[{"text": "⚡ Оформить Premium",
+                                  "url": cfg.PREMIUM_URL}]]}
+
+
+def _send_public(text: str, markup: dict | None = None,
+                 photo: str | None = None) -> bool:
+    """Пост в группу + зеркало владельцу. Без фолбэка на статический PROMO_TEXT."""
+    if photo and os.path.exists(photo):
+        ok = tg.send_photo_result(photo, text, markup=markup).ok
+    else:
+        ok, _ = tg.send_message(text, markup=markup)
+    if ok:
+        _mirror(photo, text)
     return ok
+
+
+def _promo_text(kind: str) -> str:
+    """Продающий текст с РЕАЛЬНОЙ ссылкой; заглушки вроде @your_username не ставим."""
+    link = (f'<a href="{cfg.PREMIUM_URL}">Premium-бот</a>'
+            if cfg.PREMIUM_URL else "Premium-бот — ссылка в закрепе")
+    disc = f"\n\n<i>{cfg.DISCLAIMER}</i>"
+    if kind == "indicator":
+        return (
+            "📊 <b>Публичный журнал, а не «100% сигналы»</b>\n\n"
+            "Здесь каждый вход, стоп и результат в R — включая убыточные недели. "
+            "Так видно, что система делает на дистанции, а не только в удачные дни.\n\n"
+            "Premium — тот же журнал, но сигнал приходит сразу, без задержки "
+            "30 минут, с расчётом объёма под твой депозит и риск. Триал 3 дня.\n\n"
+            + link + disc)
+    return (
+        "⚡ <b>Что даёт Premium</b>\n\n"
+        "• сигнал сразу, без задержки 30 минут\n"
+        "• объём под твой депозит и риск 0.5%\n"
+        "• дневной и общий лимит потерь\n"
+        "• карточка счёта по твоим параметрам\n\n"
+        "Триал 3 дня, без карты. Журнал сделок остаётся публичным.\n\n"
+        + link + disc)
+
+
+def post_promo(now: dt.datetime | None = None) -> bool:
+    """Промо 2 раза в неделю: пн — журнал, чт — возможности Premium."""
+    now = now or dt.datetime.now(TZ)
+    kind = "indicator" if now.weekday() == 0 else "premium"
+    text = _promo_text(kind)
+    ok = _send_public(text, _premium_markup())
+    log.info("промо (%s) -> %s", kind, ok)
+    return ok
+
+
+def _last_trade_record(days: int = 7) -> dict | None:
+    """Последняя закрытая сделка с полями entry/exit/note (tp1/tp2 пропускаем)."""
+    import risk_guard
+
+    cutoff = time.time() - days * 86400
+    last = None
+    for rec in risk_guard.read_closed_trades():
+        try:
+            ts = float(rec.get("ts", 0))
+        except (TypeError, ValueError):
+            continue
+        if ts < cutoff:
+            continue
+        if last is None or ts > float(last.get("ts", 0)):
+            last = rec
+    return last
+
+
+def _fmt_px(px: float) -> str:
+    return f"{px:.5f}" if abs(px) < 10 else f"{px:.2f}"
+
+
+def _post_last_trade(now: dt.datetime | None = None) -> bool:
+    """Разбор последней закрытой сделки; нет сделок — обучающий пост из банка."""
+    tr = _last_trade_record(7)
+    if not tr:
+        return post_tg_content()
+    now = now or dt.datetime.now(TZ)
+    sym = str(tr.get("symbol", ""))
+    side = "LONG" if str(tr.get("side", "")).upper().startswith("L") else "SHORT"
+    r = float(tr.get("total_r", tr.get("r", 0)) or 0)
+    kind = str(tr.get("kind", ""))
+    label = {"sl": "стоп", "tp": "цель", "tp3": "цель",
+             "be": "безубыток", "time": "закрытие по времени"}.get(kind, kind or "выход")
+    when = dt.datetime.fromtimestamp(float(tr.get("ts", 0)), TZ)
+    entry = tr.get("entry")
+    exit_px = tr.get("exit")
+    lines = [
+        f"🧾 <b>Разбор сделки · {html.escape(sym)} {side}</b>",
+        "",
+        f"{when:%d.%m %H:%M} · {label} · <b>{r:+.2f}R</b>",
+    ]
+    if entry is not None and exit_px is not None:
+        lines.append(f"Вход {_fmt_px(float(entry))} → выход {_fmt_px(float(exit_px))}")
+    note = str(tr.get("note") or "").strip()
+    if note:
+        lines += ["", html.escape(note)]
+    lines += ["", "<i>Публикуем и плюсы, и минусы — иначе статистика ничего не стоит.</i>"]
+    return _send_public("\n".join(lines), _premium_markup())
+
+
+def _post_stats(days: int, title: str) -> bool:
+    if not track_record.load_trades(days):
+        return post_tg_content()
+    return _send_public(track_record.text_report(days, title), _premium_markup())
+
+
+def post_noon(now: dt.datetime | None = None) -> bool:
+    """Дневной контент по дням недели, а не один и тот же банк ежедневно.
+
+    пн — неделя в цифрах, вт — разбор сделки, ср — обучающий пост,
+    чт — 30 дней в цифрах, пт — обучающий пост; выходные — тишина.
+    """
+    now = now or dt.datetime.now(TZ)
+    wd = now.weekday()
+    if wd >= 5:
+        return True
+    if wd == 0:
+        return _post_stats(7, "📊 <b>Неделя в цифрах</b>")
+    if wd == 1:
+        return _post_last_trade(now)
+    if wd == 3:
+        return _post_stats(30, "📈 <b>30 дней в цифрах</b>")
+    return post_tg_content()
 
 
 def _top_counts(counts: dict[str, int], limit: int = 4) -> str:
@@ -488,6 +658,31 @@ def remind_threads(mix: bool = False) -> bool:
     return ok
 
 
+def _maybe_warn_bank() -> None:
+    """Один алерт владельцу, когда в банке осталось ≤5 постов.
+
+    Флаг живёт в autoposts_state.json и сбрасывается после пополнения банка,
+    поэтому это не ежедневный спам, а предупреждение «пора писать новые».
+    """
+    left = telegram_posts.remaining()
+    state = load_json(STATE_PATH)
+    if left > 5:
+        if state.pop("bank_low", None) is not None:
+            save_json(STATE_PATH, state)
+        return
+    if state.get("bank_low") is not None:
+        return
+    chat = owner_chat()
+    if chat:
+        tg.send_plain(
+            f"📝 В банке Telegram-постов осталось {left}. "
+            "Пополни, иначе слоты 12:00 скоро замолчат.",
+            token=cfg.SUB_BOT_TOKEN or cfg.BOT_TOKEN, chat_id=chat)
+        log.warning("банк постов: осталось %s", left)
+    state["bank_low"] = left
+    save_json(STATE_PATH, state)
+
+
 def post_tg_content() -> bool:
     """Опубликовать следующий Telegram-пост в группу; копию — владельцу в личку."""
     chat = owner_chat()
@@ -499,6 +694,8 @@ def post_tg_content() -> bool:
     if n:
         _mirror(image or None, telegram_posts.POSTS[n - 1]["text"])
     log.info("Telegram-пост опубликован: %s", ok)
+    if ok:
+        _maybe_warn_bank()
     return ok
 
 
@@ -669,9 +866,12 @@ def daily_plan() -> list[tuple[str, str, str, object]]:
         plan.append(("restore_drill", cfg.RESTORE_DRILL_TIME, "sun",
                      restore_drill_job))
     if cfg.PROMO_ENABLED:
-        plan.append(("promo", cfg.PROMO_TIME, "*", post_promo))
+        # 2 раза в неделю вместо ежедневного одинакового промо.
+        plan.append(("promo_mon", cfg.PROMO_TIME, "mon", post_promo))
+        plan.append(("promo_thu", cfg.PROMO_TIME, "thu", post_promo))
     if cfg.TG_CONTENT_ENABLED:
-        plan.append(("tgcontent", cfg.TG_CONTENT_TIME, "*", post_tg_content))
+        # 12:00 — контент по дням недели, а не банк каждый день.
+        plan.append(("noon", cfg.TG_CONTENT_TIME, "mon-fri", post_noon))
     if cfg.LANDING_ENABLED:
         plan.append(("landing", cfg.LANDING_TIME, "*", build_landing_job))
     return plan
@@ -845,7 +1045,8 @@ def main() -> None:
                 "promo": post_promo, "threads": remind_threads,
                 "threads_mix": lambda: remind_threads(True), "x": remind_x,
                 "revenue": revenue.send_report, "backup": backup.snapshot,
-                "tgcontent": post_tg_content, "tiktok": remind_tiktok,
+                "tgcontent": post_tg_content, "noon": post_noon,
+                "tiktok": remind_tiktok,
                 "tiktok_shipped": lambda: remind_tiktok("shipped"),
                 "threads_result": remind_threads_result,
                 "threads_week": remind_threads_week,
@@ -855,7 +1056,7 @@ def main() -> None:
         job = jobs.get(what)
         if not job:
             print("Формат: python autoposts.py now "
-                  "plan|day|week|promo|threads|threads_mix|x|tiktok|"
+                  "plan|day|week|promo|noon|tgcontent|threads|threads_mix|x|tiktok|"
                   "tiktok_shipped|forward|drill")
             return
         print(f"{what}: {'ок' if job() else 'не отправлено'}")

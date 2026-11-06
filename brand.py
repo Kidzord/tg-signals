@@ -36,8 +36,8 @@ def _star_price() -> str:
 
 
 def _header(c: theme.Card, subtitle: str, right: str = "") -> None:
-    c.text(0.04, 0.945, cfg.CARD_TITLE, size=20, weight="bold", display=True)
-    c.text(0.04, 0.893, theme.spaced(subtitle), size=8.5, color=theme.LABEL3)
+    c.text(0.04, 0.945, cfg.CARD_TITLE, size=18, weight="semibold", display=True)
+    c.text(0.04, 0.893, subtitle, size=10.5, color=theme.LABEL3)
     if right:
         c.text(0.96, 0.945, right, size=17, weight="bold", display=True, ha="right")
     c.hairline(0.04, 0.96, 0.862)
@@ -89,14 +89,14 @@ def _signal_mock(c: theme.Card, x: float, y: float, w: float, h: float) -> None:
 def render_hero(path: str) -> str:
     """Приветствие: что это и что даёт подписка."""
     c = theme.Card(W, H)
-    _header(c, "PREMIUM SIGNALS")
-    c.text(0.04, 0.775, "Золото · форекс · индексы", size=33, weight="bold", display=True)
+    _header(c, "Сигналы")
+    c.text(0.04, 0.775, "Золото · форекс", size=33, weight="bold", display=True)
     c.text(0.04, 0.695, "в реальном времени", size=33, weight="bold", display=True,
            color=theme.ACCENT)
     _bullet(c, 0.042, 0.560, "Сигнал приходит сразу",
             "вход, стоп и три цели — без задержки", "bolt")
     _bullet(c, 0.042, 0.452, "Объём — под твой депозит",
-            "бот сам считает размер сделки", "bars", theme.PURPLE)
+            "бот сам считает размер сделки", "bars", theme.INDIGO)
     _bullet(c, 0.042, 0.344, "Лимиты под контролем",
             "дневной и общий стоп не превысишь", "shield", theme.GREEN)
     _signal_mock(c, 0.57, 0.30, 0.39, 0.50)
@@ -108,7 +108,7 @@ def render_hero(path: str) -> str:
 def render_offer(path: str) -> str:
     """Промо-карточка выгод подписки."""
     c = theme.Card(W, H)
-    _header(c, "WHAT YOU GET", "Premium")
+    _header(c, "Что вы получаете", "Premium")
     c.text(0.04, 0.800, "Что даёт подписка", size=25, weight="bold", display=True)
 
     items = [
@@ -142,7 +142,7 @@ def render_offer(path: str) -> str:
 def render_gate(path: str) -> str:
     """Экран «нужна подписка»."""
     c = theme.Card(W, H)
-    _header(c, "ACCESS LOCKED")
+    _header(c, "Доступ")
     c.glass(0.29, 0.30, 0.42, 0.45, rad=c.r_in(0.50), z=2)
     c.tile(0.5 - 0.040, 0.578, 0.080, "lock", color=theme.ORANGE, z=5)
     c.text(0.5, 0.545, "Доступ по подписке", size=21, weight="bold",
@@ -165,7 +165,7 @@ def render_cover(path: str) -> str:
     c.box(0.03, 0.05, 0.94, 0.90, c.r_in(0.50), fc=theme.PANEL,
           ec=theme.GRID, lw=1.2, z=2)
     c.text(0.07, 0.700, cfg.CARD_TITLE, size=42, weight="bold", display=True)
-    c.text(0.07, 0.600, "ЗОЛОТО · ФОРЕКС · ИНДЕКСЫ", size=30, weight="bold",
+    c.text(0.07, 0.600, "Золото · форекс", size=30, weight="semibold",
            display=True, color=theme.LABEL2)
     c.box(0.07, 0.545, 0.10, 0.011, c.r_in(0.06), fc=theme.ACCENT, z=6)
     c.text(0.07, 0.450, "Вход · стоп · три цели — в каждом сигнале",
@@ -182,7 +182,7 @@ def render_avatar(path: str) -> str:
     c = theme.Card(10.0, 10.0)
     c.glass(0.14, 0.14, 0.72, 0.72, rad=c.r_in(2.40), z=3)
     c.text(0.5, 0.545, "KFX", size=118, weight="bold", display=True, ha="center")
-    c.text(0.5, 0.315, theme.spaced("KIDZORDFX"), size=15, color=theme.LABEL3, ha="center")
+    c.text(0.5, 0.315, "KidzordFX", size=15, color=theme.LABEL3, ha="center")
     return c.save(path)
 
 

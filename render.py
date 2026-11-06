@@ -81,8 +81,8 @@ def render_card(sig: Signal, bars: list[Bar], source: str, is_demo: bool, out_pa
     c = theme.Card(12.8, 7.2)
 
     # ---------------- шапка ----------------
-    c.text(0.035, 0.945, cfg.CARD_TITLE, size=20, weight="bold", display=True)
-    c.text(0.035, 0.893, theme.spaced("SIGNAL CARD"), size=8.5, color=theme.LABEL3)
+    c.text(0.035, 0.945, cfg.CARD_TITLE, size=18, weight="semibold", display=True)
+    c.text(0.035, 0.893, "Сигнал", size=10.5, color=theme.LABEL3)
 
     c.text(0.965, 0.945, f"{sig.symbol} · {feeds.tf_label(sig.tf)}", size=22,
            weight="bold", display=True, ha="right")
@@ -255,8 +255,8 @@ def render_account_card(plan: AccountPlan, out_path: str) -> str:
     c = theme.Card(12.8, 7.2)
 
     # ---------------- шапка ----------------
-    c.text(0.035, 0.945, cfg.CARD_TITLE, size=20, weight="bold", display=True)
-    c.text(0.035, 0.893, theme.spaced("ACCOUNT PLAN"), size=8.5, color=theme.LABEL3)
+    c.text(0.035, 0.945, cfg.CARD_TITLE, size=18, weight="semibold", display=True)
+    c.text(0.035, 0.893, "План счёта", size=10.5, color=theme.LABEL3)
     c.text(0.965, 0.945, plan.title, size=19, weight="bold", display=True, ha="right")
     c.hairline(0.035, 0.965, 0.855)
 
@@ -356,8 +356,8 @@ def render_result_card(*, symbol: str, side: str, kind: str, r: float, out_path:
 
     c = theme.Card(12.8, 7.2)
 
-    c.text(0.035, 0.945, cfg.CARD_TITLE, size=20, weight="bold", display=True)
-    c.text(0.035, 0.893, theme.spaced("TRADE RESULT"), size=8.5, color=theme.LABEL3)
+    c.text(0.035, 0.945, cfg.CARD_TITLE, size=18, weight="semibold", display=True)
+    c.text(0.035, 0.893, "Результат", size=10.5, color=theme.LABEL3)
 
     c.text(0.965, 0.945, f"{symbol} · {feeds.tf_label(tf)}", size=22,
            weight="bold", display=True, ha="right")
@@ -454,8 +454,8 @@ def render_trade_chart(*, symbol: str, side: str, kind: str, r: float,
     c = theme.Card(12.8, 7.2)
 
     # ---------------- шапка ----------------
-    c.text(0.035, 0.945, cfg.CARD_TITLE, size=20, weight="bold", display=True)
-    c.text(0.035, 0.893, theme.spaced("TRADE RESULT"), size=8.5, color=theme.LABEL3)
+    c.text(0.035, 0.945, cfg.CARD_TITLE, size=18, weight="semibold", display=True)
+    c.text(0.035, 0.893, "Результат", size=10.5, color=theme.LABEL3)
     c.text(0.965, 0.945, f"{symbol} · {feeds.tf_label(tf)}", size=22,
            weight="bold", display=True, ha="right")
     c.chip(0.858, 0.8615, 0.107, 0.045, "LONG" if is_long else "SHORT",
@@ -583,8 +583,8 @@ def render_summary_card(plan: SummaryPlan, out_path: str) -> str:
     color = theme.GREEN if plan.sum_r > 0.001 else (
         theme.LABEL2 if abs(plan.sum_r) <= 0.001 else theme.RED)
 
-    c.text(0.035, 0.945, cfg.CARD_TITLE, size=20, weight="bold", display=True)
-    c.text(0.035, 0.893, theme.spaced("REPORT"), size=8.5, color=theme.LABEL3)
+    c.text(0.035, 0.945, cfg.CARD_TITLE, size=18, weight="semibold", display=True)
+    c.text(0.035, 0.893, "Отчёт", size=10.5, color=theme.LABEL3)
     c.text(0.965, 0.945, plan.title, size=19, weight="bold", display=True, ha="right")
     if plan.period:
         c.text(0.965, 0.893, plan.period, size=10.5, color=theme.LABEL3, ha="right")
@@ -624,21 +624,21 @@ def render_plan_card(*, title: str, subtitle: str, body: list[str], out_path: st
     """Карточка-заметка на день: заголовок и абзацы плана."""
     c = theme.Card(12.8, 7.2)
 
-    c.text(0.035, 0.945, cfg.CARD_TITLE, size=20, weight="bold", display=True)
-    c.text(0.035, 0.893, theme.spaced("PLAN"), size=8.5, color=theme.LABEL3)
+    c.text(0.035, 0.945, cfg.CARD_TITLE, size=18, weight="semibold", display=True)
+    c.text(0.035, 0.893, "План", size=10.5, color=theme.LABEL3)
     c.text(0.965, 0.945, title, size=19, weight="bold", display=True, ha="right")
     if subtitle:
         c.text(0.965, 0.893, subtitle, size=10.5, color=theme.LABEL3, ha="right")
     c.hairline(0.035, 0.965, 0.855)
 
-    size, lh, width, y = 12.5, 0.042, _chars(12.5), 0.80
+    size, lh, width, y = 13.5, 0.045, _chars(13.5), 0.735
     for para in body:
         for line in _wrap(plain(para).strip(), width):
             if y < 0.20:
                 break
             c.text(0.035, y, line, size=size, color=theme.LABEL2, va="top")
             y -= lh
-        y -= 0.024
+        y -= 0.028
 
     c.hairline(0.035, 0.965, 0.128)
     c.text(0.035, 0.095, "сигналы будут здесь, по одному, как войду", size=10.5)
