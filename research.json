@@ -32,14 +32,31 @@
         "XAUUSD"
       ],
       "tf": "60",
-      "status": "rejected",
+      "status": "tested",
       "created": "2026-11-03 13:10 UTC",
-      "updated": "2026-11-03 13:10 UTC",
-      "wfa": null,
+      "updated": "2026-11-04 20:57 UTC",
+      "wfa": {
+        "strategy": "crt",
+        "symbol": "XAUUSD",
+        "trades": 234,
+        "net_r": -18.26,
+        "avg_r": -0.078,
+        "folds_total": 27,
+        "folds_positive": 10,
+        "folds_active": 27,
+        "folds_active_positive": 10,
+        "folds_active_share": 0.3704,
+        "verdict": "НЕ ПРОХОДИТ",
+        "ran_at": "2026-11-04 20:57 UTC"
+      },
       "notes": [
         {
           "ts": "2026-11-03 13:10 UTC",
           "text": "[rejected] после спреда устойчивый плюс только USDCAD H1/M5 failed (+7.2%); в live не включена, см. docs/CRT_METHOD.md"
+        },
+        {
+          "ts": "2026-11-04 20:57 UTC",
+          "text": "WFA crt/XAUUSD: НЕ ПРОХОДИТ, 234 сделок, net -18.26R, активных фолдов 10/27 (всего 27)"
         }
       ]
     },
@@ -75,14 +92,339 @@
         "USDCAD"
       ],
       "tf": "15",
-      "status": "testing",
+      "status": "tested",
       "created": "2026-11-03 13:10 UTC",
-      "updated": "2026-11-03 13:10 UTC",
-      "wfa": null,
+      "updated": "2026-11-04 20:57 UTC",
+      "wfa": {
+        "strategy": "pdl",
+        "symbol": "XAUUSD",
+        "trades": 130,
+        "net_r": -11.51,
+        "avg_r": -0.089,
+        "folds_total": 27,
+        "folds_positive": 10,
+        "folds_active": 27,
+        "folds_active_positive": 10,
+        "folds_active_share": 0.3704,
+        "verdict": "НЕ ПРОХОДИТ",
+        "ran_at": "2026-11-04 20:57 UTC"
+      },
       "notes": [
         {
           "ts": "2026-11-03 13:10 UTC",
           "text": "[testing] модуль pdl_sweep.py реализован; WFA в реестре не зафиксирован"
+        },
+        {
+          "ts": "2026-11-04 20:57 UTC",
+          "text": "WFA pdl/XAUUSD: НЕ ПРОХОДИТ, 130 сделок, net -11.51R, активных фолдов 10/27 (всего 27)"
+        }
+      ]
+    },
+    {
+      "id": "classic-osi-parametrov-na-xauusd",
+      "title": "classic: оси параметров на XAUUSD",
+      "source": "внутренний план §2.1",
+      "url": "",
+      "hypothesis": "ER/chop, стопы, max_bars, сессии, HTF, TP, индикаторы, ADX; значения и правило — docs/STAGE1_PREREG.md",
+      "symbols": [
+        "XAUUSD"
+      ],
+      "tf": "15",
+      "status": "tested",
+      "created": "2026-11-04 21:28 UTC",
+      "updated": "2026-11-04 22:05 UTC",
+      "wfa": null,
+      "notes": [
+        {
+          "ts": "2026-11-04 22:05 UTC",
+          "text": "Этап 1: 15 осей, 30k баров, фикс. OOS. Закрыты: er_min hard (сделки схлопываются), vwap/stack/macd, adx 20/25, htf 1D (58% фолдов), touch M15 (0R), swing_len 20/30 (минус). Кандидаты: tp3_r=4.5 (+36.57 native, +34.58 stress, +4.52 Exness — не хватает 0.5R до порога), sess both (+17.86/+16.39/+6.02, но ниже native v16), chop_len=50 с er_hard (+15.40/+14.50/+9.43). Live не меняли."
+        }
+      ]
+    },
+    {
+      "id": "range-osi-parametrov-flota",
+      "title": "range: оси параметров флота",
+      "source": "внутренний план §2.2",
+      "url": "",
+      "hypothesis": "stop_atr, свинг-стоп, зоны tol/frac, max_r, max_stops, ADX; значения — docs/STAGE1_PREREG.md",
+      "symbols": [
+        "AUDUSD",
+        "USDCAD",
+        "EURUSD"
+      ],
+      "tf": "15",
+      "status": "tested",
+      "created": "2026-11-04 21:28 UTC",
+      "updated": "2026-11-04 22:05 UTC",
+      "wfa": null,
+      "notes": [
+        {
+          "ts": "2026-11-04 22:05 UTC",
+          "text": "Этап 1: 9 осей x 3 символа. Кандидат: USDCAD stop_atr 1.2 (+29.87 native, +28.05 stress, +13.10 Exness против базы +3.10). EURUSD tol_mult 0.15: +52.16/+52.41 native, Exness 4/6 фолдов — мало данных. adx_max 25 даёт плюс на всех трёх фидах, но на Exness <8 активных фолдов. Закрыты: swing-стоп, stop_buf, max_r, frac, max_stops>0. Live не меняли."
+        }
+      ]
+    },
+    {
+      "id": "ict2022-osi-i-filtry",
+      "title": "ict2022: оси и фильтры",
+      "source": "внутренний план §2.3",
+      "url": "",
+      "hypothesis": "retest_look, atr_len, max_bars, ER/ADX/сессия/HTF-тренд; значения — docs/STAGE1_PREREG.md",
+      "symbols": [
+        "XAUUSD"
+      ],
+      "tf": "15",
+      "status": "tested",
+      "created": "2026-11-04 21:28 UTC",
+      "updated": "2026-11-04 22:05 UTC",
+      "wfa": null,
+      "notes": [
+        {
+          "ts": "2026-11-04 22:05 UTC",
+          "text": "Этап 1: max_bars 180 — +27.04 native, +26.96 stress, +16.13 Exness (14/26=54%, ниже 60%) — лучший кандидат, не promoted. trend=with +26.61, но 15/27=56%. ER/ADX/сессия/retest_look ухудшают. Остаётся теневым кандидатом."
+        }
+      ]
+    },
+    {
+      "id": "pdl-sweep-osi-i-filtry-na-fx",
+      "title": "pdl_sweep: оси и фильтры на FX",
+      "source": "внутренний план §2.4",
+      "url": "",
+      "hypothesis": "tp_r, stop_buf_atr, max_bars, ER/ADX/сессия на AUDUSD/USDCAD; значения — docs/STAGE1_PREREG.md",
+      "symbols": [
+        "AUDUSD",
+        "USDCAD"
+      ],
+      "tf": "15",
+      "status": "rejected",
+      "created": "2026-11-04 21:28 UTC",
+      "updated": "2026-11-04 22:05 UTC",
+      "wfa": null,
+      "notes": [
+        {
+          "ts": "2026-11-04 22:05 UTC",
+          "text": "Этап 1: PDL на AUDUSD -12.30R, USDCAD -10.13R; ни одна ось не вывела в плюс (USDCAD tp3 +4.45, 10/25 — всё равно НЕ ПРОХОДИТ). Вместе с XAUUSD -11.51R этап 0 — стратегия отклонена."
+        },
+        {
+          "ts": "2026-11-04 22:05 UTC",
+          "text": "[rejected] Этап 1: минус на AUDUSD, USDCAD и XAUUSD; оси и фильтры не спасают"
+        }
+      ]
+    },
+    {
+      "id": "tsmom-12m-na-d1",
+      "title": "TSMOM 12M на D1",
+      "source": "Moskowitz–Ooi–Pedersen, JFE 2012",
+      "url": "https://doi.org/10.1016/j.jfineco.2011.11.003",
+      "hypothesis": "знак 12М доходности, месячный ребаланс, vol-target; без подбора",
+      "symbols": [
+        "7 МАЖОРОВ + 4 ИНДЕКСА"
+      ],
+      "tf": "1D",
+      "status": "tested",
+      "created": "2026-11-05 04:09 UTC",
+      "updated": "2026-11-05 04:55 UTC",
+      "wfa": null,
+      "notes": [
+        {
+          "ts": "2026-11-05 04:09 UTC",
+          "text": "Этап 3: FX-портфель ann -0.05%, Sharpe -0.01 (2011-2026); индексный long-only native +5.10%/Sharpe 0.55/9-14 лет, Exness +11.46% но всего 50 мес. Только paper, нужна длинная независимая история."
+        },
+        {
+          "ts": "2026-11-05 04:55 UTC",
+          "text": "Внешние данные 2000-2026: FX-портфель ann +1.22% Sharpe 0.22 t 1.11 (6 из 7 пар минус); индексный long-only +5.02% Sharpe 0.65 maxDD 22% t 3.30, 18/26 лет. Индексный TSMOM — paper-кандидат, FX momentum закрыт."
+        }
+      ]
+    },
+    {
+      "id": "turn-of-month-us500",
+      "title": "Turn-of-month US500",
+      "source": "McConnell–Xu, FAJ 2008",
+      "url": "https://doi.org/10.2469/faj.v64.n2.11",
+      "hypothesis": "покупка на закрытии последнего дня месяца, выход на 3-й день следующего",
+      "symbols": [
+        "US500"
+      ],
+      "tf": "1D",
+      "status": "rejected",
+      "created": "2026-11-05 04:09 UTC",
+      "updated": "2026-11-05 04:55 UTC",
+      "wfa": null,
+      "notes": [
+        {
+          "ts": "2026-11-05 04:09 UTC",
+          "text": "Этап 3: native 136 событий +1.59% ann, Sharpe 0.28, t 0.95, 8/14 лет; Exness -0.19%. Эффект размылся, не внедрять."
+        },
+        {
+          "ts": "2026-11-05 04:55 UTC",
+          "text": "Внешние данные 2000-2026: 227 событий, ann +2.55%, Sharpe 0.48, t 2.11, но 12/24 лет в минусе и после 2015 эффект размыт. Остаётся rejected для live."
+        }
+      ]
+    },
+    {
+      "id": "overnight-drift-us500",
+      "title": "Overnight drift US500",
+      "source": "Lou–Polk–Skouras, JFE 2019",
+      "url": "https://doi.org/10.1016/j.jfineco.2018.12.003",
+      "hypothesis": "закрытие -> следующее открытие, фильтр SMA200 и низкой realized vol",
+      "symbols": [
+        "US500"
+      ],
+      "tf": "1D",
+      "status": "rejected",
+      "created": "2026-11-05 04:09 UTC",
+      "updated": "2026-11-05 04:55 UTC",
+      "wfa": null,
+      "notes": [
+        {
+          "ts": "2026-11-05 04:09 UTC",
+          "text": "Этап 3: native -0.03% ann (t -0.75), Exness -0.03%; после одного спреда эффект исчезает."
+        },
+        {
+          "ts": "2026-11-05 04:55 UTC",
+          "text": "Внешние данные 2000-2026: 4218 событий, ann -0.04%, t -0.74, 7/24 лет. Отклонён окончательно."
+        }
+      ]
+    },
+    {
+      "id": "dual-momentum-indeksov",
+      "title": "Dual momentum индексов",
+      "source": "GEM/dual momentum, публичные разборы",
+      "url": "",
+      "hypothesis": "rank 12М среди US500/USTEC/DE40/JPN225, top-1 при 12М>0",
+      "symbols": [
+        "US500",
+        "USTEC",
+        "DE40",
+        "JPN225"
+      ],
+      "tf": "1D",
+      "status": "tested",
+      "created": "2026-11-05 04:09 UTC",
+      "updated": "2026-11-05 04:55 UTC",
+      "wfa": null,
+      "notes": [
+        {
+          "ts": "2026-11-05 04:09 UTC",
+          "text": "Этап 3: 2022-2026 (50 мес) ann +14.71%, Sharpe 0.89, maxDD 11.7%, t 1.82. Выборка короткая (история USTEC), только paper/watch."
+        },
+        {
+          "ts": "2026-11-05 04:55 UTC",
+          "text": "Внешние данные 2000-2026: 321 месяц, ann +10.82%, Sharpe 0.71, maxDD 25.8%, t 3.67, 20/27 лет; выдерживает 2008 и 2022. Сильнейший кандидат этапа 3, paper."
+        }
+      ]
+    },
+    {
+      "id": "dxy-rezhim-dlya-aud-long",
+      "title": "DXY-режим для AUD long",
+      "source": "Lustig–Roussanov–Verdelhan, NBER 14082",
+      "url": "https://www.nber.org/papers/w14082",
+      "hypothesis": "запрет long AUDUSD при DXY>SMA200 и 20d return>0",
+      "symbols": [
+        "AUDUSD"
+      ],
+      "tf": "15",
+      "status": "rejected",
+      "created": "2026-11-05 04:09 UTC",
+      "updated": "2026-11-05 04:55 UTC",
+      "wfa": null,
+      "notes": [
+        {
+          "ts": "2026-11-05 04:09 UTC",
+          "text": "Этап 4: фильтр заблокировал 17 сделок на +11R, итог упал с +9.00R до -2.00R. На этих данных вреден."
+        },
+        {
+          "ts": "2026-11-05 04:55 UTC",
+          "text": "Внешние данные: broad dollar (DTWEXBGS) вместо DXY блокирует 8 сделок на 0R — бесполезен; обычный DXY на 30k/60k вреден (9.00->-2.00R, 17.80->3.00R). Отклонён."
+        }
+      ]
+    },
+    {
+      "id": "neft-cad-filtr",
+      "title": "Нефть–CAD фильтр",
+      "source": "Chen–Rogoff–Rossi, QJE 2010",
+      "url": "https://www.nber.org/papers/w13901",
+      "hypothesis": "USDCAD short только при oil_mom60>0 и corr60<-0.2",
+      "symbols": [
+        "USDCAD"
+      ],
+      "tf": "15",
+      "status": "rejected",
+      "created": "2026-11-05 04:09 UTC",
+      "updated": "2026-11-05 04:09 UTC",
+      "wfa": null,
+      "notes": [
+        {
+          "ts": "2026-11-05 04:09 UTC",
+          "text": "Этап 4: фильтр заблокировал 55 сделок на +29R, итог упал с +21.51R до -7.49R. Отклонён."
+        }
+      ]
+    },
+    {
+      "id": "pre-fomc-drift",
+      "title": "Pre-FOMC drift",
+      "source": "Lucca–Moench, JF 2015",
+      "url": "https://doi.org/10.1111/jofi.12196",
+      "hypothesis": "вход перед заседанием FOMC, выход до объявления; high-VIX версия",
+      "symbols": [
+        "SPX"
+      ],
+      "tf": "1D",
+      "status": "tested",
+      "created": "2026-11-05 04:55 UTC",
+      "updated": "2026-11-05 05:17 UTC",
+      "wfa": null,
+      "notes": [
+        {
+          "ts": "2026-11-05 04:55 UTC",
+          "text": "Внешние данные: FOMC 2010-2026 + VIX. Дневные бары: day все +0.86% ann (t 0.71), overnight +0.59% (t 2.16), overnight при VIX выше медианы +1.28% (Sharpe 1.12, t 2.35, 53 события). Точное правило требует 1h-ряда; paper/watch, не live."
+        },
+        {
+          "ts": "2026-11-05 05:17 UTC",
+          "text": "Внутридневная проверка: Yahoo 60m 730 дней, 25 заседаний, выход 13:00 ET +1.98% (t 1.36), 14:00 ET +1.92% (t 1.15); при VIX выше медианы значимости нет. Dukascopy блокирует автоматические запросы (429), 2010+ intraday без ключа недоступен. Точное правило остаётся paper/watch."
+        }
+      ]
+    },
+    {
+      "id": "zoloto-realnye-stavki",
+      "title": "Золото–реальные ставки",
+      "source": "Erb–Harvey, NBER 18706",
+      "url": "https://www.nber.org/papers/w18706",
+      "hypothesis": "XAU long только если 20-дневное изменение real yield <= 0",
+      "symbols": [
+        "XAUUSD"
+      ],
+      "tf": "15",
+      "status": "tested",
+      "created": "2026-11-05 04:55 UTC",
+      "updated": "2026-11-05 04:55 UTC",
+      "wfa": null,
+      "notes": [
+        {
+          "ts": "2026-11-05 04:55 UTC",
+          "text": "Внешние данные DFII10, сделки classic XAUUSD: 30k баров +12.40R -> +15.94R (блок 69 сделок на -3.55R); 60k +22.42R -> +25.79R (блок 153 на -3.36R). Единственный устойчивый внешний фильтр, watch/soft."
+        }
+      ]
+    },
+    {
+      "id": "vix-rezhim",
+      "title": "VIX-режим",
+      "source": "Bollerslev–Tauchen–Zhou, RFS 2009",
+      "url": "",
+      "hypothesis": "при VIX выше 80-го перцентиля или спайке >20% урезать/выключать mean-reversion",
+      "symbols": [
+        "AUDUSD",
+        "USDCAD"
+      ],
+      "tf": "15",
+      "status": "rejected",
+      "created": "2026-11-05 04:55 UTC",
+      "updated": "2026-11-05 04:55 UTC",
+      "wfa": null,
+      "notes": [
+        {
+          "ts": "2026-11-05 04:55 UTC",
+          "text": "Внешние данные VIXCLS, запрет входов: 30k AUD 9.00->9.00R (блок 0), USDCAD 21.51->17.51R (блок +4R); 60k AUD 17.80->16.80R, USDCAD 17.32->8.51R. На intraday mean-reversion не помогает."
         }
       ]
     }

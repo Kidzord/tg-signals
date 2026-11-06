@@ -27,25 +27,24 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
-import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config as cfg
+import wfa_verdict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 STORE_PATH = os.path.join(HERE, "research.json")
 LOG_PATH = os.path.join(HERE, "docs", "RESEARCH_LOG.md")
 
 STATUSES = ("idea", "testing", "tested", "promoted", "rejected")
-PASS_VERDICT = "ПРОХОДИТ"
+PASS_VERDICT = wfa_verdict.PASS
 
 _TRANSLIT = {
     "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
@@ -172,13 +171,28 @@ def set_status(idea_id: str, status: str, text: str = "") -> dict:
 
 def record_wfa(idea_id: str, *, strategy: str, symbol: str, trades: int,
                net_r: float, folds: str = "0/0", avg_r: float = 0.0,
+               folds_active: int | None = None,
+               folds_active_positive: int | None = None,
                verdict: str = "") -> dict:
-    """Сохраняет результат WFA. Вердикт можно не передавать — он выводится."""
+    """Сохраняет результат WFA. Вердикт можно не передавать — он выводится.
+
+    folds — «в плюсе/всего» (исторический формат), folds_active — сколько
+    фолдов вообще имели сделки. Ворота считают долю АКТИВНЫХ фолдов, как
+    tools/walk_forward.py, поэтому старые записи без folds_active трактуются
+    как «все фолды активны».
+    """
     data = _load()
     idea = _find(data, idea_id)
     folds_total, folds_positive = _parse_folds(folds)
+    if folds_active is None:
+        folds_active = folds_total
+    if folds_active_positive is None:
+        folds_active_positive = folds_positive if folds_active == folds_total else 0
+    folds_active = max(0, min(int(folds_active), max(folds_total, int(folds_active))))
+    folds_active_positive = max(0, min(int(folds_active_positive), folds_active))
     if not verdict:
-        verdict = PASS_VERDICT if _passes(trades, net_r, folds_total, folds_positive) \
+        verdict = PASS_VERDICT if _passes(trades, net_r, avg_r, folds_active,
+                                          folds_active_positive) \
             else "НЕ ПРОХОДИТ"
     idea["wfa"] = {
         "strategy": str(strategy).strip(),
@@ -188,6 +202,10 @@ def record_wfa(idea_id: str, *, strategy: str, symbol: str, trades: int,
         "avg_r": round(float(avg_r), 4),
         "folds_total": folds_total,
         "folds_positive": folds_positive,
+        "folds_active": folds_active,
+        "folds_active_positive": folds_active_positive,
+        "folds_active_share": round(wfa_verdict.active_share(
+            folds_active, folds_active_positive), 4),
         "verdict": verdict,
         "ran_at": _now(),
     }
@@ -196,7 +214,8 @@ def record_wfa(idea_id: str, *, strategy: str, symbol: str, trades: int,
     idea["notes"].append({
         "ts": _now(),
         "text": f"WFA {strategy}/{symbol}: {verdict}, {trades} сделок, "
-                f"net {net_r:+.2f}R, фолды {folds_positive}/{folds_total}",
+                f"net {net_r:+.2f}R, активных фолдов "
+                f"{folds_active_positive}/{folds_active} (всего {folds_total})",
     })
     _save(data)
     render_log()
@@ -213,14 +232,32 @@ def _parse_folds(folds: str) -> tuple[int, int]:
     return max(0, total), max(0, min(pos, total))
 
 
-def _passes(trades: int, net_r: float, folds_total: int, folds_positive: int) -> bool:
+def _passes(trades: int, net_r: float, avg_r: float, folds_active: int,
+            folds_active_positive: int) -> bool:
+    """Ворота и вердикт по одной нормализованной метрике активных фолдов."""
     min_trades = int(getattr(cfg, "RESEARCH_MIN_TRADES", 20))
-    min_share = float(getattr(cfg, "RESEARCH_MIN_POS_FOLDS", 0.6))
-    if trades < min_trades or net_r <= 0:
+    min_net = float(getattr(cfg, "RESEARCH_MIN_NET_R", wfa_verdict.MIN_NET_R))
+    min_active = int(getattr(cfg, "RESEARCH_MIN_ACTIVE_FOLDS",
+                             wfa_verdict.MIN_ACTIVE_FOLDS))
+    min_share = float(getattr(cfg, "RESEARCH_MIN_POS_FOLDS",
+                              wfa_verdict.MIN_ACTIVE_POS_SHARE))
+    min_avg = float(getattr(cfg, "RESEARCH_MIN_AVG_R", wfa_verdict.MIN_AVG_R))
+    if trades < min_trades or net_r <= min_net:
         return False
-    if folds_total <= 0:
+    if folds_active < min_active:
         return False
-    return (folds_positive / folds_total) >= min_share
+    if wfa_verdict.active_share(folds_active, folds_active_positive) < min_share:
+        return False
+    return avg_r > min_avg
+
+
+def _wfa_metrics(wfa: dict) -> tuple[int, int]:
+    """Активные фолды записи; старые записи без поля — все фолды активны."""
+    total = int(wfa.get("folds_active") or wfa.get("folds_total") or 0)
+    pos = wfa.get("folds_active_positive")
+    if pos is None:
+        pos = wfa.get("folds_positive") or 0
+    return total, max(0, min(int(pos), total))
 
 
 def gate(idea_id: str) -> tuple[bool, list[str]]:
@@ -234,14 +271,19 @@ def gate(idea_id: str) -> tuple[bool, list[str]]:
         reasons.append(f"вердикт WFA: {wfa.get('verdict')}")
     if idea["status"] == "rejected":
         reasons.append("идея отклонена")
+    active, active_pos = _wfa_metrics(wfa)
     if not _passes(int(wfa.get("trades", 0)), float(wfa.get("net_r", 0.0)),
-                   int(wfa.get("folds_total", 0)), int(wfa.get("folds_positive", 0))):
+                   float(wfa.get("avg_r", 0.0)), active, active_pos):
         reasons.append(
             f"порог не пройден: сделок {wfa.get('trades')} "
             f"(нужно ≥{cfg.RESEARCH_MIN_TRADES}), "
-            f"net {float(wfa.get('net_r', 0.0)):+.2f}R (нужно >0), "
-            f"фолды {wfa.get('folds_positive')}/{wfa.get('folds_total')} "
-            f"(нужно ≥{cfg.RESEARCH_MIN_POS_FOLDS:.0%})"
+            f"net {float(wfa.get('net_r', 0.0)):+.2f}R "
+            f"(нужно >{getattr(cfg, 'RESEARCH_MIN_NET_R', 5.0):g}), "
+            f"активных фолдов {active_pos}/{active} "
+            f"(нужно ≥{cfg.RESEARCH_MIN_POS_FOLDS:.0%} при "
+            f"≥{getattr(cfg, 'RESEARCH_MIN_ACTIVE_FOLDS', 8)} активных), "
+            f"средняя {float(wfa.get('avg_r', 0.0)):+.3f}R "
+            f"(нужно >{getattr(cfg, 'RESEARCH_MIN_AVG_R', 0.05):g})"
         )
     return (not reasons), reasons
 
@@ -279,11 +321,16 @@ def run_wfa(idea_id: str, strategy: str, symbol: str) -> dict:
     match = next((r for r in results if r.get("name") == strategy), None)
     if match is None:
         raise RuntimeError(f"в отчёте нет стратегии {strategy!r}")
+    active = int(match.get("folds_active", match.get("folds_positive", 0)))
+    active_pos = int(match.get("folds_active_positive",
+                               match.get("folds_positive", 0)))
     return record_wfa(
         idea_id, strategy=strategy, symbol=symbol,
         trades=int(match.get("trades", 0)), net_r=float(match.get("net_r", 0.0)),
         folds=f"{match.get('folds_positive', 0)}/{match.get('folds', 0)}",
-        avg_r=float(match.get("avg_r", 0.0)), verdict=str(match.get("verdict", "")),
+        avg_r=float(match.get("avg_r", 0.0)),
+        folds_active=active, folds_active_positive=active_pos,
+        verdict=str(match.get("verdict", "")),
     )
 
 
@@ -306,7 +353,8 @@ def render_log() -> str:
         if wfa:
             wfa_txt = (f"{wfa.get('verdict', '?')}: {wfa.get('trades')} сдел., "
                        f"net {float(wfa.get('net_r', 0)):+.2f}R, "
-                       f"фолды {wfa.get('folds_positive')}/{wfa.get('folds_total')}")
+                       f"активных фолдов {wfa.get('folds_active_positive', wfa.get('folds_positive'))}"
+                       f"/{wfa.get('folds_active', wfa.get('folds_total'))}")
         source = idea.get("source", "")
         if idea.get("url"):
             source = f"[{source}]({idea['url']})"
@@ -331,9 +379,11 @@ def _print_idea(idea: dict) -> None:
         print(f"  гипотеза: {idea['hypothesis']}")
     if idea.get("wfa"):
         w = idea["wfa"]
+        active, active_pos = _wfa_metrics(w)
         print(f"  WFA: {w['strategy']}/{w['symbol']} → {w['verdict']} · "
               f"{w['trades']} сделок · net {w['net_r']:+.2f}R · "
-              f"фолды {w['folds_positive']}/{w['folds_total']} · {w['ran_at']}")
+              f"активных фолдов {active_pos}/{active} "
+              f"(всего {w.get('folds_total', active)}) · {w['ran_at']}")
     for note_row in idea.get("notes", []):
         print(f"  · {note_row['ts']}: {note_row['text']}")
 
@@ -367,6 +417,10 @@ def main() -> int:
     p_rec.add_argument("--trades", type=int, required=True)
     p_rec.add_argument("--net-r", type=float, required=True)
     p_rec.add_argument("--folds", default="0/0", help="в плюсе/всего, например 5/7")
+    p_rec.add_argument("--folds-active", type=int, default=None,
+                       help="сколько фолдов имели сделки (метрика вердикта)")
+    p_rec.add_argument("--folds-active-pos", type=int, default=None,
+                       help="из активных фолдов в плюсе")
     p_rec.add_argument("--avg-r", type=float, default=0.0)
     p_rec.add_argument("--verdict", default="")
 
@@ -403,6 +457,8 @@ def main() -> int:
             _print_idea(record_wfa(args.id, strategy=args.strategy, symbol=args.symbol,
                                    trades=args.trades, net_r=args.net_r,
                                    folds=args.folds, avg_r=args.avg_r,
+                                   folds_active=args.folds_active,
+                                   folds_active_positive=args.folds_active_pos,
                                    verdict=args.verdict))
         elif args.cmd == "wfa":
             _print_idea(run_wfa(args.id, args.strategy, args.symbol))

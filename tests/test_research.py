@@ -64,16 +64,41 @@ def test_registry_persists(reg):
 def test_record_wfa_marks_tested_and_verdict(reg):
     created = idea()
     updated = research.record_wfa(created["id"], strategy="range", symbol="AUDUSD",
-                                  trades=42, net_r=18.5, folds="5/7")
+                                  trades=42, net_r=18.5, folds="8/12",
+                                  folds_active=10, folds_active_positive=7,
+                                  avg_r=0.5)
     assert updated["status"] == "tested"
     assert updated["wfa"]["verdict"] == "ПРОХОДИТ"
-    assert updated["wfa"]["folds_total"] == 7
+    assert updated["wfa"]["folds_total"] == 12
+    assert updated["wfa"]["folds_active"] == 10
+    assert updated["wfa"]["folds_active_positive"] == 7
+
+
+def test_record_wfa_uses_active_folds_not_all(reg):
+    """8 из 12 всего, но все 8 активных в плюсе — это ПРОХОДИТ."""
+    created = idea()
+    updated = research.record_wfa(created["id"], strategy="range", symbol="AUDUSD",
+                                  trades=42, net_r=18.5, folds="8/12",
+                                  folds_active=8, folds_active_positive=8,
+                                  avg_r=0.4)
+    assert updated["wfa"]["verdict"] == "ПРОХОДИТ"
+    assert updated["wfa"]["folds_active_share"] == 1.0
 
 
 def test_record_wfa_fails_below_thresholds(reg):
     created = idea()
     updated = research.record_wfa(created["id"], strategy="range", symbol="AUDUSD",
-                                  trades=5, net_r=2.0, folds="1/7")
+                                  trades=5, net_r=2.0, folds="1/7",
+                                  avg_r=-0.1)
+    assert updated["wfa"]["verdict"] == "НЕ ПРОХОДИТ"
+
+
+def test_record_wfa_fails_when_too_few_active_folds(reg):
+    created = idea()
+    updated = research.record_wfa(created["id"], strategy="range", symbol="AUDUSD",
+                                  trades=42, net_r=18.5, folds="5/7",
+                                  folds_active=7, folds_active_positive=5,
+                                  avg_r=0.4)
     assert updated["wfa"]["verdict"] == "НЕ ПРОХОДИТ"
 
 
@@ -96,7 +121,8 @@ def test_gate_rejects_too_few_trades(reg):
 def test_promote_passes_on_good_wfa(reg):
     created = idea()
     research.record_wfa(created["id"], strategy="range", symbol="AUDUSD",
-                        trades=42, net_r=18.5, folds="5/7")
+                        trades=42, net_r=18.5, folds="8/12",
+                        folds_active=10, folds_active_positive=7, avg_r=0.5)
     ok, reasons = research.promote(created["id"])
     assert ok is True, reasons
     assert research._find(research._load(), created["id"])["status"] == "promoted"
@@ -114,7 +140,8 @@ def test_promote_refuses_failed_verdict(reg):
 def test_rejected_idea_cannot_be_promoted(reg):
     created = idea()
     research.record_wfa(created["id"], strategy="range", symbol="AUDUSD",
-                        trades=42, net_r=18.5, folds="5/7")
+                        trades=42, net_r=18.5, folds="8/12",
+                        folds_active=10, folds_active_positive=7, avg_r=0.5)
     research.set_status(created["id"], "rejected", "выборка подобрана")
     ok, reasons = research.promote(created["id"])
     assert ok is False
@@ -132,10 +159,12 @@ def test_parse_folds_clamps_values():
 def test_log_written_with_source_and_verdict(reg):
     created = idea()
     research.record_wfa(created["id"], strategy="range", symbol="AUDUSD",
-                        trades=42, net_r=18.5, folds="5/7")
+                        trades=42, net_r=18.5, folds="8/12",
+                        folds_active=10, folds_active_positive=7, avg_r=0.5)
     text = Path(research.LOG_PATH).read_text(encoding="utf-8")
     assert "@chan" in text
     assert "https://t.me/chan/1" in text
     assert "Sweep PDH/PDL" in text
     assert "ПРОХОДИТ" in text
     assert "tested" in text
+    assert "7/10" in text
