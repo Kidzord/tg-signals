@@ -6,7 +6,6 @@ import sys
 import threading
 import time
 
-import pytest
 from PIL import Image
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

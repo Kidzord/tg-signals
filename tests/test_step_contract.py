@@ -17,7 +17,6 @@ sys.path.insert(0, str(ROOT))
 import bot  # noqa: E402
 import crt  # noqa: E402
 import ict2022  # noqa: E402
-import range_v2  # noqa: E402
 import sonar  # noqa: E402
 import strategy as st  # noqa: E402
 import ta_core as ta  # noqa: E402

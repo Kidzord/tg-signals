@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from typing import List
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-import config as cfg
 
 
 # ------------------------------------------------------------------ Inline кнопки

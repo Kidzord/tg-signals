@@ -8,10 +8,15 @@ if not defined PY goto nopython
 
 rem Мониторинг ботов и внешний dead-man switch.
 if not exist logs mkdir logs
+set "BOTS_LOG=logs\monitor.log"
+call "%~dp0rotate_log.bat" "%BOTS_LOG%"
 set "PYTHONIOENCODING=utf-8"
-echo === start %date% %time% === >> logs\monitor.log
-"%PY%" -u monitor.py %* >> logs\monitor.log 2>&1
-exit /b 0
+echo === start %date% %time% === >> "%BOTS_LOG%"
+rem Add-Content открывает/закрывает файл на каждой строке: rotate_log может
+rem переместить лог, даже пока процесс жив (раньше >> держал handle).
+powershell -NoProfile -Command "[Console]::OutputEncoding=[Text.Encoding]::UTF8; & '%PY%' -u monitor.py %* 2>&1 | ForEach-Object { Write-Host $_; Add-Content -Path '%BOTS_LOG%' -Value $_ -Encoding UTF8 }; exit $LASTEXITCODE"
+set "RC=%errorlevel%"
+exit /b %RC%
 
 :nopython
 echo Python with MetaTrader5 not found (see bot.bat).

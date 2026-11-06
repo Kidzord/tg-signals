@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-import config as cfg
 import logger_config
 
 TRADES_PATH = os.path.join(os.path.dirname(__file__), "trades.jsonl")

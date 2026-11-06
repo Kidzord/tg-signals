@@ -10,15 +10,13 @@ from __future__ import annotations
 
 import json
 import os
-import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request, Header
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import FileResponse
 
-import config as cfg
 import logger_config
 import health
 import gallery
@@ -503,6 +501,6 @@ with open("admin_templates/dashboard.html", "w", encoding="utf-8") as f:
 if __name__ == "__main__":
     import uvicorn
     admin = AdminPanel()
-    print(f"Админ-панель запущена на http://localhost:8081")
+    print("Админ-панель запущена на http://localhost:8081")
     print(f"Токен: {ADMIN_TOKEN}")
     uvicorn.run(admin.app, host="0.0.0.0", port=8081)

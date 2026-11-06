@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
-import math
 import random
 from dataclasses import dataclass
 

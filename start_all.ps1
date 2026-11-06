@@ -1,24 +1,46 @@
 ﻿# Запуск всех компонентов бота. Повторный запуск безопасен: уже работающие
 # компоненты не перезапускаются (защита от дублей при логоне и вручную).
 $PY   = "C:\Users\admin\AppData\Local\Programs\AutoClaw2\resources\vendor\python\python.exe"
-$DIR  = "C:\Users\admin\Downloads\tg-signals"
+$DIR  = Split-Path -Parent $MyInvocation.MyCommand.Path
 # userbase с numpy/MetaTrader5/dotenv — без него у python-запусков нет пакетов
 $env:PYTHONUSERBASE = "C:\Users\admin\AppData\Roaming\AutoClaw-oversea-official\toolchain\python"
+# Не оставлять окна на "Press any key" при падении фоновых ботов.
+$env:BOT_NO_PAUSE = "1"
 
 Write-Host "=== Запуск всех компонентов ===" -ForegroundColor Green
 
 if (-not (Test-Path "$DIR\logs")) { New-Item -ItemType Directory -Path "$DIR\logs" | Out-Null }
 
 # Защита от гонки: watchdog может вызвать start_all, пока ручной запуск ещё идёт.
+# CreateNew атомарен (в отличие от Test-Path + Set-Content), внутри — PID владельца.
 $LOCK = "$DIR\logs\start_all.lock"
-if (Test-Path $LOCK) {
-    $age = (Get-Date) - (Get-Item $LOCK).LastWriteTime
-    if ($age.TotalSeconds -lt 120) {
-        Write-Host "start_all уже выполняется — выхожу" -ForegroundColor DarkGray
-        exit 0
+$lockOwned = $false
+function New-StartLock {
+    try {
+        $fs = [System.IO.File]::Open($LOCK, 'CreateNew', 'Write', 'None')
+        $body = "$PID`n$(Get-Date -Format o)"
+        $bytes = [Text.Encoding]::UTF8.GetBytes($body)
+        $fs.Write($bytes, 0, $bytes.Length)
+        $fs.Close()
+        return $true
+    } catch { return $false }
+}
+$lockOwned = New-StartLock
+if (-not $lockOwned) {
+    $item = Get-Item $LOCK -ErrorAction SilentlyContinue
+    if ($item) {
+        $age = (Get-Date) - $item.LastWriteTime
+        # Отрицательный возраст = часы съехали; такой lock тоже считаем протухшим.
+        if ($age.TotalSeconds -ge 120 -or $age.TotalSeconds -lt 0) {
+            Remove-Item $LOCK -Force -ErrorAction SilentlyContinue
+            $lockOwned = New-StartLock
+        }
     }
 }
-Set-Content -Path $LOCK -Value (Get-Date -Format o) -Encoding UTF8
+if (-not $lockOwned) {
+    Write-Host "start_all уже выполняется — выхожу" -ForegroundColor DarkGray
+    exit 0
+}
 
 #--- что уже работает (по командным строкам python.exe)
 $cmdlines = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
@@ -57,12 +79,12 @@ Start-Sleep -Seconds 2
 #    2026-11-04 EURUSD возвращён: причина прежнего минуса — другие границы
 #    H4 у Exness. С пересобранным H4 Exness +11.7R, native live +30.4R/15 мес.
 #    См. tools/range_feed_diag.py и docs/EURUSD_DECISION_2026-11-04.md.
-#    AUDUSD/USDCAD — из .env (er=0.20, tp=3.0). Отключены как непрошедшие/шум:
-#    GBPUSD, JPN225, DE40, US500, EUSTX50, XAUUSD-range (на золоте classic).
-#    UK100 — данные невалидны.
-$symbols = @("AUDUSD", "USDCAD", "EURUSD")
+#    2026-11-05: AUDUSD и USDCAD выведены из live по WFA после фикса range-ключей
+#    (net −0.17R и −0.50R, 45–46% фолдов в плюсе). EURUSD проходит (+53.13R,
+#    stress +41.10R, delay +49.07R). GBPUSD/JPN225/DE40/US500/EUSTX50/UK100/
+#    XAUUSD-range — отключены ранее (шум/невалидные данные/золото на classic).
+$symbols = @("EURUSD")
 $rangeTuning = @{
-    "AUDUSD" = @{ ER = "0.10"; TP = "3.0"; TREND = "with" }
     "EURUSD" = @{ ER = "0.0"; TP = "3.0"; TREND = "with" }
 }
 Write-Host "Запуск range-ботов: $($symbols -join ', ')..." -ForegroundColor Yellow
@@ -106,6 +128,29 @@ if (Test-BotAlive "XAUUSD" "classic") {
     Start-Process -FilePath "cmd.exe" -ArgumentList "/c bot.bat classic" -WorkingDirectory $DIR -WindowStyle Minimized
 }
 $env:STRATEGY = "range"
+
+#--- 3.4 Внешние ряды для paper-трекинга: не чаще раза в 7 дней.
+#    Скрипт сам проверяет штамп, но дешёвая проверка здесь не даёт спавнить
+#    PowerShell каждые 5 минут.
+$refreshStamp = Join-Path $DIR "data\external\.last_refresh"
+$needRefresh = (-not (Test-Path $refreshStamp)) -or (((Get-Date) - (Get-Item $refreshStamp).LastWriteTime).TotalDays -ge 7)
+if ($needRefresh) {
+    Write-Host "Обновление внешних рядов (Yahoo/FRED)..." -ForegroundColor DarkGray
+    $refresh = Join-Path $DIR "refresh_external.ps1"
+    Start-Process -FilePath "powershell.exe" `
+        -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$refresh`"" `
+        -WindowStyle Hidden
+}
+
+#--- 3.5 Paper-трекинг кандидатов (shadow.py, лог в logs\shadow.log).
+#    Ничего не торгует и не шлёт сигналы: пересчитывает кандидатов и пишет
+#    shadow.db. Запускается циклом по 5 минут, watchdog поднимет при падении.
+if (Test-Running 'shadow\.py') {
+    Write-Host "Paper-трекинг уже работает — пропускаю" -ForegroundColor DarkGray
+} else {
+    Write-Host "Запуск paper-трекинга кандидатов..." -ForegroundColor Yellow
+    Start-Process -FilePath "cmd.exe" -ArgumentList "/c shadow.bat loop" -WorkingDirectory $DIR -WindowStyle Minimized
+}
 
 #--- 4. Автопосты + напоминания (лог в logs\autoposts.log)
 #    Заменяет reminder_scheduler.py: раньше в нём был захардкожен токен,
@@ -170,7 +215,12 @@ if ($wd.Count -gt 0) {
         -WorkingDirectory $DIR -WindowStyle Hidden
 }
 
-Remove-Item $LOCK -Force -ErrorAction SilentlyContinue
+if ($lockOwned -and (Test-Path $LOCK)) {
+    $owner = (Get-Content $LOCK -TotalCount 1)
+    if ($owner -eq "$PID") {
+        Remove-Item $LOCK -Force -ErrorAction SilentlyContinue
+    }
+}
 
 Write-Host ""
 Write-Host "=== Все компоненты запущены ===" -ForegroundColor Green

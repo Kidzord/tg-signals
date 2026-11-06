@@ -2,6 +2,10 @@
 __pycache__/
 *.pyc
 renders/
+# внешние ряды скачиваются заново (см. docs/EXTERNAL_DATA_2026-11-05.md)
+data/external/
+# состояние paper-трекинга
+shadow.db
 bin/
 tunnel*.log
 # состояние бота и локальные артефакты
@@ -60,3 +64,7 @@ tg_screenshots/
 
 # второй терминал MT5: логин/пароль не коммитим
 .mt5_second.ini
+
+# локальное состояние: сканы Mimosa и bot-lock флота
+.mimosa/
+bot_lock_*.json

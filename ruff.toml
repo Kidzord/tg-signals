@@ -1,0 +1,8 @@
+target-version = "py312"
+
+exclude = [".ocr_vendor", ".mimosa", "mt5_ea", "logs", "renders", "backups"]
+
+[lint]
+# Только ошибки, не стиль: F — pyflakes (undefined names, unused imports),
+# E9 — синтаксис/IO. Стилевые правила намеренно не включаем.
+select = ["F", "E9"]

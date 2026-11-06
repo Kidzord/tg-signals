@@ -12,8 +12,6 @@ import json
 import os
 import time
 from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta
-from typing import Any
 
 GAMIFICATION_PATH = os.path.join(os.path.dirname(__file__), "gamification.json")
 

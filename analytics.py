@@ -18,9 +18,6 @@ from typing import Any
 
 import numpy as np
 
-import config as cfg
-import gallery
-import logger_config
 
 TRADES_PATH = os.path.join(os.path.dirname(__file__), "trades.jsonl")
 USERS_PATH = os.path.join(os.path.dirname(__file__), "users.json")

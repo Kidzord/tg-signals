@@ -13,6 +13,10 @@ $interval = 300
 Start-Sleep -Seconds 60
 
 while ($true) {
+    # Ротация своего лога: watchdog живёт месяцами, файл иначе растёт без предела.
+    if ((Test-Path $LOG) -and ((Get-Item $LOG).Length -gt 20MB)) {
+        Move-Item -Path $LOG -Destination "$LOG.1" -Force -ErrorAction SilentlyContinue
+    }
     $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     Add-Content -Path $LOG -Value "=== watchdog $stamp ===" -Encoding UTF8
     try {
