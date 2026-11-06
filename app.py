@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, Header, HTTPException, Request, status
 from starlette.concurrency import run_in_threadpool
 
 # Скрипт может запускаться из произвольной папки: добавляем свою в путь импорта,
@@ -225,15 +225,22 @@ app = FastAPI(title="KidzordFX signals", lifespan=lifespan)
 
 
 @app.get("/health")
-async def health():
-    """Базовый health check для совместимости."""
+async def health_check():
+    """Базовый health check для совместимости.
+
+    Имя не `health`: иначе функция-роут перекрывает импортированный модуль
+    health, и `health.monitor.run_all()` в /health/detailed падает.
+    """
     return {"ok": True, "symbols": cfg.SYMBOL_FILTER or "all",
             "promo": cfg.PROMO_ENABLED, "tg": bool(cfg.BOT_TOKEN and cfg.CHAT_ID)}
 
 
 @app.get("/health/detailed")
-async def health_detailed():
-    """Детальный health check с информацией о всех компонентах."""
+async def health_detailed(token: str = "",
+                          x_health_token: str | None = Header(default=None)):
+    """Детальный health check. Если задан HEALTH_TOKEN — нужен он."""
+    if cfg.HEALTH_TOKEN and token != cfg.HEALTH_TOKEN and x_health_token != cfg.HEALTH_TOKEN:
+        raise HTTPException(status_code=403, detail="forbidden")
     summary = health.monitor.run_all()
     return summary
 
@@ -246,7 +253,7 @@ async def metrics():
 
 @app.post("/tv/{secret}")
 async def tradingview(secret: str, request: Request):
-    if secret != cfg.WEBHOOK_SECRET:
+    if not cfg.webhook_enabled() or secret != cfg.WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="forbidden")
 
     # Rate limiting по IP. За cloudflared request.client.host — это 127.0.0.1,
@@ -309,7 +316,7 @@ async def consensus_feed(secret: str, request: Request):
     их только как голоса «за/против» своего входа. Нужен тот же WEBHOOK_SECRET,
     что и у /tv. Присылать сюда можно лишь источники, на которые есть право.
     """
-    if secret != cfg.WEBHOOK_SECRET:
+    if not cfg.webhook_enabled() or secret != cfg.WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="forbidden")
 
     client_ip = (

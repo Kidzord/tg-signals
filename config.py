@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 from dotenv import load_dotenv
 
@@ -68,9 +69,33 @@ CRYPTO_ASSET = os.getenv("CRYPTO_ASSET", "USDT").strip().upper() or "USDT"
 
 # --- Вебхук ---
 # Алерт шлётся на /tv/<WEBHOOK_SECRET> — секрет в пути, чтобы URL нельзя было угадать.
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip() or "change-me"
+# Пустое значение ИЛИ дефолтная заглушка = приём вебхуков выключен (fail closed):
+# иначе после копирования .env.example любой мог бы слать сигналы.
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+_DEFAULT_WEBHOOK_SECRETS = {"change-me", "change-me-to-long-random-string"}
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8080"))
+# Необязательный токен для /health/detailed. Пусто — эндпоинт открыт,
+# но все ошибки уже редактируются (см. redact).
+HEALTH_TOKEN = os.getenv("HEALTH_TOKEN", "").strip()
+
+
+def webhook_enabled() -> bool:
+    return bool(WEBHOOK_SECRET) and WEBHOOK_SECRET not in _DEFAULT_WEBHOOK_SECRETS
+
+
+def redact(value: object) -> str:
+    """Убрать токены ботов из текста ошибок/логов.
+
+    requests кладёт в str(e) полный URL вида
+    https://api.telegram.org/bot<TOKEN>/getMe — без этого токен попадает
+    в логи и в /health/detailed.
+    """
+    text = str(value)
+    for token in (BOT_TOKEN, SUB_BOT_TOKEN, CRYPTO_PAY_TOKEN):
+        if token:
+            text = text.replace(token, "***")
+    return re.sub(r"bot\d+:[A-Za-z0-9_-]+", "bot***", text)
 
 # --- Фильтр символов ---
 # Пусто = принимать всё. Иначе подстрока в тикере: "XAU" ловит XAUUSD, GOLD, XAUUSD.r и т.п.
@@ -87,7 +112,7 @@ BARS_COUNT = int(os.getenv("BARS_COUNT", "120"))
 MT5_SUFFIX = os.getenv("MT5_SUFFIX", "").strip()      # напр. ".r" для брокеров с суффиксом
 MT5_TERMINAL_PATH = os.getenv("MT5_TERMINAL_PATH", "").strip()
 DATA_CSV = os.getenv("DATA_CSV", "").strip()          # резервный источник, если нет MT5
-CARD_TITLE = os.getenv("CARD_TITLE", "KIDZORDFX").strip()
+CARD_TITLE = os.getenv("CARD_TITLE", "KidzordFX").strip()
 
 
 def mt5_init(**kwargs):
@@ -181,8 +206,8 @@ MONITOR_ENABLED = _flag("MONITOR_ENABLED", "1")
 MONITOR_EVERY_MIN = int(_float("MONITOR_EVERY_MIN", 15.0))
 # если пульса нет дольше M минут — алерт владельцу в личку
 MONITOR_STALE_MIN = int(_float("MONITOR_STALE_MIN", 15.0))
-# сколько процессов bot.py должно работать (range AUDUSD+USDCAD+EURUSD + classic XAUUSD)
-EXPECTED_BOTS = int(_float("HEARTBEAT_EXPECT_BOTS", 4.0))
+# сколько процессов bot.py должно работать (range EURUSD + classic XAUUSD)
+EXPECTED_BOTS = int(_float("HEARTBEAT_EXPECT_BOTS", 2.0))
 # Внешний dead-man switch: URL healthchecks.io (или аналога). Пока ПК жив,
 # monitor.py раз в цикл пингует его; если ПК упал — сервис шлёт алерт.
 HEALTHCHECK_URL = os.getenv("HEALTHCHECK_URL", "").strip()
@@ -231,8 +256,12 @@ CONSENSUS_PATH = os.getenv("CONSENSUS_PATH", "").strip()
 
 # --- Research-гейт для идей из внешних источников ---
 # Порог, ниже которого WFA-результат не считается основанием для включения.
+# Те же числа, что в wfa_verdict.py: одна метрика для консоли, docs и реестра.
 RESEARCH_MIN_TRADES = int(_float("RESEARCH_MIN_TRADES", 20.0))
 RESEARCH_MIN_POS_FOLDS = _float("RESEARCH_MIN_POS_FOLDS", 0.6)
+RESEARCH_MIN_NET_R = _float("RESEARCH_MIN_NET_R", 5.0)
+RESEARCH_MIN_ACTIVE_FOLDS = int(_float("RESEARCH_MIN_ACTIVE_FOLDS", 8.0))
+RESEARCH_MIN_AVG_R = _float("RESEARCH_MIN_AVG_R", 0.05)
 RESEARCH_PATH = os.getenv("RESEARCH_PATH", "").strip()
 
 # --- Discord-приём (официальный Bot API, см. discord_intake.py) ---

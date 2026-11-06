@@ -1,6 +1,7 @@
 """Интеграционные тесты доставки: outbox → «Telegram» (заглушка)."""
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -28,12 +29,18 @@ def _user(until: float | None = None) -> dict:
     return {"1": {"paid_until": until or time.time() + 86400}}
 
 
-def test_entry_then_result_edits_caption(db, monkeypatch):
+def test_result_sends_notification_and_edits_caption(db, monkeypatch):
     users = _user()
     assert store.enqueue_delivery(uid="1", trade_id="t1", kind="entry", chat_id="1",
                                   caption="Вход LONG", symbol="XAUUSD", side="LONG")
-    monkeypatch.setattr(subbot.tg, "send_message_result",
-                        lambda *a, **kw: tg.ApiResult(True, result={"message_id": 100}))
+    sent: list = []
+
+    def fake_send(text, **kw):
+        sent.append(kw.get("reply_to"))
+        mid = 100 if kw.get("reply_to") is None else 101
+        return tg.ApiResult(True, result={"message_id": mid})
+
+    monkeypatch.setattr(subbot.tg, "send_message_result", fake_send)
     subbot.process_deliveries(users)
     assert store.entry_message_id("t1", "1") == 100
 
@@ -47,6 +54,8 @@ def test_entry_then_result_edits_caption(db, monkeypatch):
 
     monkeypatch.setattr(subbot.tg, "edit_caption_result", fake_edit)
     subbot.process_deliveries(users)
+    # вход без reply, тейк — отдельным сообщением-ответом на карточку
+    assert sent == [None, 100]
     assert edited["mid"] == 100
     assert "TP1" in edited["caption"]
     stats = store.delivery_stats()
@@ -65,8 +74,34 @@ def test_result_waits_for_pending_entry(db, monkeypatch):
     monkeypatch.setattr(subbot.tg, "edit_caption_result",
                         lambda *a, **kw: sent.append("edit") or tg.ApiResult(True))
     subbot.process_deliveries(users)
-    # entry ушёл первым, result отредактировал его, а не отправился отдельно
-    assert sent == ["msg", "edit"]
+    # entry, затем отдельное сообщение-результат и обновление подписи карточки
+    assert sent == ["msg", "msg", "edit"]
+
+
+def test_send_message_uses_reply_to(monkeypatch):
+    captured: dict = {}
+
+    def fake_api(method, data, **kw):
+        captured.update(data)
+        return tg.ApiResult(True, result={"message_id": 5})
+
+    monkeypatch.setattr(tg, "api_call", fake_api)
+    res = tg.send_message_result("Тейк", chat_id="1", reply_to=100)
+    assert res.ok
+    assert captured["reply_to_message_id"] == "100"
+    assert captured["allow_sending_without_reply"] == "true"
+
+
+def test_waiting_for_entry_does_not_consume_attempts(db):
+    store.enqueue_delivery(uid="1", trade_id="t5", kind="tp", chat_id="1",
+                           caption="Тейк")
+    row = store.claim_deliveries()[0]
+    store.mark_delivery_retry(row["id"], "ждём карточку входа", 60,
+                              count_attempt=False)
+    with store.connect() as con:
+        attempts = con.execute("SELECT attempts FROM deliveries WHERE id=?",
+                               (row["id"],)).fetchone()[0]
+    assert attempts == 0
 
 
 def test_429_requeues_without_losing_message(db, monkeypatch):
@@ -98,6 +133,7 @@ def test_blocked_user_is_excluded(db, monkeypatch):
 # ------------------------------------------------- склейка итога с входом в группе
 
 import bot  # noqa: E402
+import risk_guard  # noqa: E402
 
 
 def _group_entry(trade_id: str, due: float) -> bool:
@@ -130,6 +166,31 @@ def test_group_result_glues_into_pending_entry(db, monkeypatch):
     assert "Итог:" in cap and "отдельный итог" not in cap
     assert cap.index("Итог:") < cap.index("M15 ·"), "итог перед подвалом карточки"
     assert "⚡ Premium" in cap, "CTA остаётся в конце"
+
+
+def test_partial_tp_is_not_glued_as_final_result(db, monkeypatch):
+    monkeypatch.setattr(bot, "SYMBOL", "AUDUSD")
+    assert _group_entry("g3", time.time() - 10)
+    sent = _capture_group_sends(monkeypatch)
+    bot.deliver_group_result(trade_id="g3", kind="tp1", r=1.0, note="",
+                             text="✅ TP1 отдельно", path="",
+                             entry=0.70042, side="SHORT")
+    bot.flush_pending()
+    assert "Итог:" not in sent[0]          # карточка входа осталась входом
+    assert any("TP1 отдельно" in m for m in sent)
+
+
+def test_append_outcome_does_not_touch_sending_entry(db):
+    assert _group_entry("g4", time.time() - 10)
+    row = store.claim_group()[0]           # pending -> sending (уже в полёте)
+    assert not store.append_group_outcome("g4", "Итог: x")
+    con = store.connect()
+    try:
+        cap = con.execute("SELECT caption FROM group_outbox WHERE id=?",
+                          (row["id"],)).fetchone()[0]
+    finally:
+        con.close()
+    assert "Итог:" not in cap
 
 
 def test_group_result_separate_after_entry_sent(db, monkeypatch):
@@ -177,3 +238,25 @@ def test_append_group_outcome_false_after_entry_sent(db):
     rows = store.claim_group()
     store.mark_group_sent(rows[0]["id"])
     assert store.append_group_outcome("g5", "🛑 Итог: Минус, -1.00R.") is False
+
+
+def test_entry_cancelled_when_trade_already_closed(db, monkeypatch, tmp_path):
+    """Сделка закрылась до отправки входа — устаревшую карточку не публикуем."""
+    monkeypatch.setattr(bot, "SYMBOL", "AUDUSD")
+    path = tmp_path / "trades.jsonl"
+    path.write_text(json.dumps({"trade_id": "g6", "kind": "sl", "r": -1.0,
+                                "ts": time.time()}) + "\n", encoding="utf-8")
+    monkeypatch.setattr(risk_guard, "TRADES_PATH", str(path))
+    assert _group_entry("g6", time.time() - 10)
+    sent = _capture_group_sends(monkeypatch)
+    bot.flush_pending()
+    assert sent == []
+    assert store.group_pending_entry("g6") is None
+
+
+def test_group_caption_returns_glued_text(db):
+    assert _group_entry("g7", time.time() + 600)
+    row = store.group_pending_entry("g7")
+    assert store.append_group_outcome("g7", "✅ Итог: Цель взята, +3.00R.")
+    cap = store.group_caption(row["id"])
+    assert cap and "Итог:" in cap

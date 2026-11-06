@@ -83,11 +83,11 @@ def api_call(method: str, data: dict | None = None,
             handle = requests.post(f"https://api.telegram.org/bot{tok}/{method}",
                                    data=payload, files=fh or None, timeout=timeout)
         except requests.RequestException as e:
-            last = ApiResult(False, error=f"сеть: {e}")
+            last = ApiResult(False, error=cfg.redact(f"сеть: {e}"))
             if attempt < retries:
                 time.sleep(1.5 * (attempt + 1))
                 continue
-            log.error("сеть %s: %s", method, e)
+            log.error("сеть %s: %s", method, cfg.redact(e))
             return last
         except OSError as e:
             log.error("файл %s: %s", method, e)
@@ -207,7 +207,8 @@ def send_media_group(paths: list[str], caption: str = "",
 
 def send_message_result(text: str, token: str | None = None,
                         chat_id: str | int | None = None,
-                        markup: dict | None = None) -> ApiResult:
+                        markup: dict | None = None,
+                        reply_to: int | str | None = None) -> ApiResult:
     chat = cfg.CHAT_ID if chat_id is None else str(chat_id)
     if not chat:
         return ApiResult(False, error="no chat_id")
@@ -215,6 +216,9 @@ def send_message_result(text: str, token: str | None = None,
             "disable_web_page_preview": "true"}
     if markup:
         data["reply_markup"] = json.dumps(markup, ensure_ascii=False)
+    if reply_to is not None:
+        data["reply_to_message_id"] = str(reply_to)
+        data["allow_sending_without_reply"] = "true"
     res = api_call("sendMessage", data, token=token)
     if res.parse_error:
         data.pop("parse_mode", None)

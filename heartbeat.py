@@ -265,10 +265,15 @@ def seconds_until(hhmm: str) -> float:
 
 
 def main() -> None:
-    if len(sys.argv) > 1 and sys.argv[1] == "once":
-        send_report()
-        if "--digest" in sys.argv:
-            send_digest()
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "once":
+            send_report()
+            if "--digest" in sys.argv:
+                send_digest()
+            return
+        # Любой другой аргумент раньше молча поднимал второй демон
+        # (дубли отчётов и гонка heartbeat_state.tmp).
+        print("использование: python heartbeat.py [once [--digest]]")
         return
     say(f"heartbeat: отчёт владельцу в {HEARTBEAT_TIME}, дайджест в канал в {DIGEST_TIME} "
           f"({cfg.DISPLAY_TZ}); проверка — python heartbeat.py once")

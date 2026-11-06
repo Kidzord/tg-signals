@@ -363,19 +363,16 @@ def result_status(rec: dict) -> str:
     event = str(rec.get("event", "")).lower()
     total = float(rec.get("total_r", rec.get("r", 0)) or 0)
     add = float(rec.get("r", 0) or 0)
-    icons = {"tp1": "✅", "tp2": "✅", "tp3": "🏁", "tp": "🎯",
-             "sl": "🛑", "be": "⚪", "time": "⏱"}
-    icon = icons.get(event, "📌")
     if event in ("tp1", "tp2"):
-        text = f"{icon} {event.upper()} взят · +{add:.1f}R · всего {total:+.1f}R"
+        text = f"{event.upper()} взят · +{add:.1f}R · всего {total:+.1f}R"
     elif event == "sl":
-        text = f"{icon} Стоп · итог {total:+.1f}R"
+        text = f"Стоп · итог {total:+.1f}R"
     elif event == "be":
-        text = f"{icon} Безубыток · итог {total:+.1f}R"
+        text = f"Безубыток · итог {total:+.1f}R"
     elif event == "time":
-        text = f"{icon} Закрыто по времени · итог {total:+.1f}R"
+        text = f"Закрыто по времени · итог {total:+.1f}R"
     else:
-        text = f"{icon} Сделка закрыта · итог {total:+.1f}R"
+        text = f"Сделка закрыта · итог {total:+.1f}R"
     note = str(rec.get("note", "") or "").strip()
     if note:
         text += f"\n{note}"
@@ -396,6 +393,32 @@ def _symbol_allowed(user: dict, symbol: str) -> bool:
     if isinstance(flt, str):
         flt = [x.strip().upper() for x in flt.split(",") if x.strip()]
     return not flt or symbol.upper() in [str(x).upper() for x in flt]
+
+
+def _notify_result(row, uid: str, mid: int) -> "tg.ApiResult":
+    """Результат — отдельным сообщением-ответом, чтобы Telegram дал пуш.
+
+    Редактирование подписи карточки уведомления не вызывает: подписчик видел
+    «тихий» тейк, только если сам открывал сообщение. Поэтому сначала шлём
+    короткое сообщение ответом на карточку, затем best-effort обновляем
+    подпись. Если отправить ответ нельзя (429/блок), отдаём ошибку наверх —
+    outbox повторит; карточку в этом случае не трогаем.
+    """
+    res = tg.send_message_result(row["caption"], token=TOKEN,
+                                 chat_id=row["chat_id"], reply_to=mid)
+    if not res.ok and not res.blocked and not res.retry_after:
+        # reply мог не пройти (например, карточку удалили) — шлём без reply,
+        # чтобы уведомление всё равно дошло.
+        res = tg.send_message_result(row["caption"], token=TOKEN,
+                                     chat_id=row["chat_id"])
+    if res.ok:
+        caption = _with_status(
+            store.entry_caption(str(row["trade_id"]), uid), row["caption"])
+        try:
+            tg.edit_caption_result(row["chat_id"], mid, caption, token=TOKEN)
+        except Exception:
+            pass
+    return res
 
 
 def process_deliveries(users: dict) -> None:
@@ -440,21 +463,13 @@ def process_deliveries(users: dict) -> None:
                         store.mark_delivery_terminal(row["id"], "failed",
                                                      "карточка входа так и не доставлена")
                     else:
-                        store.mark_delivery_retry(row["id"], "ждём карточку входа", 60)
+                        store.mark_delivery_retry(row["id"], "ждём карточку входа", 60,
+                                                  count_attempt=False)
                     continue
                 res = tg.send_message_result(row["caption"], token=TOKEN,
                                              chat_id=row["chat_id"])
             else:
-                caption = _with_status(
-                    store.entry_caption(str(row["trade_id"]), uid), row["caption"])
-                res = tg.edit_caption_result(row["chat_id"], mid, caption, token=TOKEN)
-                if not res.ok and "not modified" in str(res.error or "").lower():
-                    # сообщение уже в нужном виде — это успех, а не повод дублировать
-                    store.mark_delivery_sent(row["id"])
-                    continue
-                if not res.ok and not res.blocked and not res.retry_after:
-                    res = tg.send_message_result(row["caption"], token=TOKEN,
-                                                 chat_id=row["chat_id"])
+                res = _notify_result(row, uid, mid)
 
         if res.ok:
             sent_mid = None
@@ -1732,7 +1747,9 @@ def _read_queue(path: str, last_ts: float) -> list[dict]:
                     ts = float(rec.get("ts", 0) or 0)
                 except (ValueError, TypeError):
                     continue
-                if ts > last_ts:
+                # >=, а не >: два процесса могут записать в одну и ту же
+                # секунду, и запись с ts == last_ts иначе теряется навсегда.
+                if ts >= last_ts:
                     rows.append(rec)
     except OSError as e:
         print("очередь недоступна:", e)
@@ -1772,11 +1789,20 @@ def poll_results(users: dict, state: dict) -> None:
     if not fresh:
         return
     added = 0
+    processed: list[float] = []
     for rec in fresh:
         tid = str(rec.get("trade_id") or "")
+        rec_ts = float(rec.get("ts", 0) or 0)
         if not tid:
+            processed.append(rec_ts)
             continue
         targets = store.entry_targets(tid)
+        if not targets:
+            # вход мог ещё не дойти до poll_signals; не теряем результат.
+            if time.time() - rec_ts < 3600:
+                break
+            processed.append(rec_ts)   # старый результат без входов — пропускаем
+            continue
         status = result_status(rec)
         event = str(rec.get("event", "result")).lower()
         for uid in targets:
@@ -1785,7 +1811,10 @@ def poll_results(users: dict, state: dict) -> None:
                 symbol=str(rec.get("symbol", "")), side=str(rec.get("side", "")),
             ):
                 added += 1
-    state["last_result_ts"] = max(float(r.get("ts", 0) or 0) for r in fresh)
+        processed.append(rec_ts)
+    if processed:
+        state["last_result_ts"] = max(float(state.get("last_result_ts", 0) or 0),
+                                      max(processed))
     save_json(STATE_PATH, state)
     print(f"outbox: +{added} результатов")
 

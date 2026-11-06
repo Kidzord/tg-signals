@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import time
 from typing import Any
@@ -217,12 +218,15 @@ def mark_delivery_sent(delivery_id: int, message_id: int | None = None) -> None:
         con.close()
 
 
-def mark_delivery_retry(delivery_id: int, error: str, delay: float) -> None:
+def mark_delivery_retry(delivery_id: int, error: str, delay: float,
+                        count_attempt: bool = True) -> None:
+    """Вернуть в очередь. count_attempt=False — ожидание, а не попытка отправки."""
     now = time.time()
+    inc = "attempts=attempts+1, " if count_attempt else ""
     con = connect()
     try:
         con.execute(
-            "UPDATE deliveries SET status='pending', attempts=attempts+1, "
+            f"UPDATE deliveries SET status='pending', {inc}"
             "next_try=?, last_error=?, updated_at=? WHERE id=?",
             (now + max(1.0, delay), str(error)[:500], now, delivery_id),
         )
@@ -593,6 +597,18 @@ def group_entry_due(trade_id: str) -> float | None:
         con.close()
 
 
+def group_caption(row_id: int) -> str | None:
+    """Актуальный текст строки очереди: мог склеиться с итогом после claim."""
+    con = connect()
+    try:
+        row = con.execute(
+            "SELECT caption FROM group_outbox WHERE id=?", (row_id,)
+        ).fetchone()
+        return str(row["caption"] or "") if row else None
+    finally:
+        con.close()
+
+
 def group_pending_count() -> int:
     con = connect()
     try:
@@ -628,20 +644,21 @@ def append_group_outcome(trade_id: str, note: str) -> bool:
         con.execute("BEGIN IMMEDIATE")
         row = con.execute(
             "SELECT id, caption FROM group_outbox WHERE trade_id=? AND kind='entry' "
-            "AND status IN ('pending','sending') LIMIT 1", (trade_id,),
+            "AND status='pending' LIMIT 1", (trade_id,),
         ).fetchone()
         if not row:
             con.execute("ROLLBACK")
             return False
         cap = str(row["caption"] or "")
-        marker = "\n\nM15 ·"
-        if marker in cap:
-            cap = cap.replace(marker, "\n\n" + note + marker, 1)
+        # Не хардкодим M15: итог встаёт перед строкой ТФ (M15/H1/H4/1D/1W).
+        m = re.search(r"\n\n(?:M\d+|H\d+|1D|1W) ·", cap)
+        if m:
+            cap = cap[:m.start()] + "\n\n" + note + cap[m.start():]
         else:
             cap = cap.rstrip() + "\n\n" + note
         cur = con.execute(
             "UPDATE group_outbox SET caption=?, updated_at=? "
-            "WHERE id=? AND status IN ('pending','sending')",
+            "WHERE id=? AND status='pending'",
             (cap, time.time(), row["id"]),
         )
         con.execute("COMMIT")

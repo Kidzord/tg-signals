@@ -1,7 +1,9 @@
 """Тесты монитора: отсутствие компонентов дольше порога."""
 from __future__ import annotations
 
+import os
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +23,18 @@ ALL = [
 
 def without(pattern: str) -> list[str]:
     return [line for line in ALL if pattern not in line]
+
+
+def test_ancient_heartbeat_file_is_ignored(tmp_path, monkeypatch):
+    hb = tmp_path / "hb_OLD_range.json"
+    hb.write_text('{"pid": 1, "ok": true}', encoding="utf-8")
+    old = time.time() - 8 * 86400
+    os.utime(hb, (old, old))
+    monkeypatch.setattr(monitor, "HERE", str(tmp_path))
+    monkeypatch.setattr(cfg, "EXPECTED_BOTS", 4)
+    lines = [r"C:\Python\python.exe bot.py"] * 4
+    ok, text = monitor.check_heartbeats(lines)
+    assert ok, text
 
 
 def test_all_components_present():
@@ -64,3 +78,9 @@ def test_process_list_unavailable_is_a_problem(monkeypatch):
     ok, text = monitor.check_components({}, None, now=1000.0)
     assert ok is False
     assert "список процессов" in text
+
+
+def test_unknown_cli_argument_does_not_start_monitor(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["monitor.py", "check"])
+    monitor.main()
+    assert "использование" in capsys.readouterr().out

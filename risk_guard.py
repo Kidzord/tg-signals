@@ -86,14 +86,21 @@ def read_closed_trades(path: str | None = None) -> list[dict]:
     return out
 
 
+def _num(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def weekly_stats(now_ts: float | None = None,
                  rows: list[dict] | None = None) -> dict:
     start, end, key = week_bounds(now_ts)
     rows = read_closed_trades() if rows is None else rows
-    week = [t for t in rows if start <= float(t.get("ts", 0)) < end]
+    week = [t for t in rows if start <= _num(t.get("ts")) < end]
     return {
         "n": len(week),
-        "r": sum(float(t.get("r", 0)) for t in week),
+        "r": sum(_num(t.get("r")) for t in week),
         "start": start,
         "end": end,
         "week_key": key,

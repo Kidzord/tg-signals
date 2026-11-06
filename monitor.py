@@ -67,7 +67,10 @@ def _save_state(state: dict) -> None:
 
 def _alert(text: str) -> bool:
     if not cfg.OWNER_CHAT_ID:
-        return True   # некого уведомлять — считаем доставленным
+        # Не считаем доставленным: иначе авария «запомнится» и после
+        # настройки OWNER_CHAT_ID уже не будет отправлена.
+        print("алерт не отправлен: не задан OWNER_CHAT_ID")
+        return False
     try:
         ok, _ = tg.send_message(text, token=cfg.SUB_BOT_TOKEN or cfg.BOT_TOKEN,
                                 chat_id=cfg.OWNER_CHAT_ID)
@@ -88,9 +91,11 @@ def _transition(key: str, bad: bool, bad_text: str, ok_text: str, state: dict) -
 
 def _process_cmdlines() -> list[str] | None:
     """Командные строки python.exe/powershell.exe одним запросом."""
+    # Имя процесса в начале строки: powershell-обёртка bot.bat тоже содержит
+    # текст "bot.py", из-за чего старый счёт удваивал число ботов.
     script = ("@(Get-CimInstance Win32_Process -Filter "
               "\"Name='python.exe' OR Name='powershell.exe'\" | "
-              "ForEach-Object { $_.CommandLine })")
+              "ForEach-Object { \"$($_.Name)|$($_.CommandLine)\" })")
     try:
         ps = subprocess.run(["powershell", "-NoProfile", "-Command", script],
                             capture_output=True, timeout=30)
@@ -114,6 +119,10 @@ def check_heartbeats(cmdlines: list[str] | None = None) -> tuple[bool, str]:
         except OSError:
             continue
         name = os.path.basename(path)
+        # Файлы выключенных символов остаются навсегда и иначе вечно алертят.
+        # Очень старые (7+ дней) не считаем живыми кандидатами.
+        if age_min > 7 * 24 * 60:
+            continue
         if age_min > cfg.MONITOR_STALE_MIN:
             stale.append(f"{name} ({age_min:.0f} мин)")
             continue
@@ -129,7 +138,12 @@ def check_heartbeats(cmdlines: list[str] | None = None) -> tuple[bool, str]:
         cmdlines = _process_cmdlines()
     procs = -1
     if cmdlines is not None:
-        procs = sum(1 for line in cmdlines if _BOT_RE.search(line))
+        labelled = any("|" in line for line in cmdlines)
+        if labelled:
+            procs = sum(1 for line in cmdlines
+                        if line.lower().startswith("python.exe|") and _BOT_RE.search(line))
+        else:
+            procs = sum(1 for line in cmdlines if _BOT_RE.search(line))
     problems: list[str] = []
     if stale:
         problems.append("нет пульса: " + ", ".join(stale))
@@ -272,8 +286,10 @@ def set_healthcheck(url: str) -> bool:
             out.append(line)
     if not found:
         out.append(f"HEALTHCHECK_URL={url}")
-    with open(env_path, "w", encoding="utf-8") as f:
+    tmp = env_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         f.write("\n".join(out).rstrip() + "\n")
+    os.replace(tmp, env_path)
     try:
         r = requests.get(url, timeout=10)
         print("проверка URL:", r.status_code, r.text[:80])
@@ -320,7 +336,15 @@ def run_once(send_alerts: bool = True) -> dict:
 
 
 def main() -> None:
-    if len(sys.argv) > 2 and sys.argv[1] == "set-healthcheck":
+    # Неизвестный аргумент раньше уводил в бесконечный цикл и поднимал второй
+    # monitor с дублями алертов (поймано на `monitor.py check`).
+    if len(sys.argv) > 1 and sys.argv[1] not in ("once", "set-healthcheck"):
+        print("использование: python monitor.py [once | set-healthcheck URL]")
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "set-healthcheck":
+        if len(sys.argv) <= 2:
+            print("использование: python monitor.py set-healthcheck URL")
+            return
         set_healthcheck(sys.argv[2])
         return
     if len(sys.argv) > 1 and sys.argv[1] == "once":

@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import glob
 import json
 import os
 import time
@@ -12,7 +13,6 @@ from datetime import datetime
 from typing import Any, Callable
 
 import config as cfg
-import logger_config
 
 
 @dataclass
@@ -186,7 +186,7 @@ def check_telegram() -> HealthCheck:
         return HealthCheck(
             name="telegram",
             status="unhealthy",
-            message=f"Connection failed: {str(e)}",
+            message=f"Connection failed: {cfg.redact(e)}",
             duration_ms=(time.time() - start) * 1000,
         )
 
@@ -275,24 +275,25 @@ def check_state_files() -> HealthCheck:
     start = time.time()
     issues = []
 
-    # Проверяем bot_state файлы
-    state_files = [
-        "bot_state_XAUUSD.json",
-        "bot_state_GOLD.json",
-        "users.json",
-        "sub_state.json",
-    ]
+    # Реальные state-файлы ботов: bot_state_<SYMBOL>_<strategy>.json.
+    # Раньше здесь были несуществующие имена (XAUUSD/GOLD), поэтому живые
+    # состояния не проверялись вовсе.
+    base = os.path.dirname(__file__)
+    paths = sorted(glob.glob(os.path.join(base, "bot_state_*.json")))
+    paths += [os.path.join(base, n) for n in ("users.json", "sub_state.json")
+              if os.path.exists(os.path.join(base, n))]
+    if not paths:
+        issues.append("bot_state_*.json: файлы состояния не найдены")
 
-    for filename in state_files:
-        path = os.path.join(os.path.dirname(__file__), filename)
-        if os.path.exists(path):
-            try:
-                with open(path, encoding="utf-8") as f:
-                    json.load(f)
-            except json.JSONDecodeError as e:
-                issues.append(f"{filename}: invalid JSON - {str(e)}")
-            except Exception as e:
-                issues.append(f"{filename}: {str(e)}")
+    for path in paths:
+        filename = os.path.basename(path)
+        try:
+            with open(path, encoding="utf-8") as f:
+                json.load(f)
+        except json.JSONDecodeError as e:
+            issues.append(f"{filename}: invalid JSON - {str(e)}")
+        except Exception as e:
+            issues.append(f"{filename}: {str(e)}")
 
     status = "healthy"
     if issues:

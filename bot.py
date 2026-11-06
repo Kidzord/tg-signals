@@ -13,11 +13,13 @@
 """
 from __future__ import annotations
 
+import atexit
 import datetime as dt
 import json
 import os
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 
@@ -25,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import consensus
 import config as cfg
+import costs
 import crt
 import feeds
 import mt5_screenshot
@@ -81,6 +84,11 @@ ICT_SWING = int(os.getenv("ICT_SWING", "20"))
 ICT_FVG_WINDOW = int(os.getenv("ICT_FVG_WINDOW", "20"))
 ICT_RETEST_LOOK = int(os.getenv("ICT_RETEST_LOOK", "40"))
 ICT_STOP_BUF = float(os.getenv("ICT_STOP_BUF", "0.25"))
+# PDH/PDL sweep (pdl_sweep.py): параметры в env, чтобы WFA и live гоняли
+# одно и то же правило, а не дефолты модуля.
+PDL_TP_R = float(os.getenv("PDL_TP_R", "2.0"))
+PDL_STOP_BUF_ATR = float(os.getenv("PDL_STOP_BUF_ATR", "0.25"))
+PDL_MAX_BARS = int(os.getenv("PDL_MAX_BARS", "96"))
 # CRT (Candle Range Theory): диапазон C1 и свип C2 на старшем ТФ, вход на
 # рабочем (crt.py). H4/M15 — «народный» дефолт методички.
 CRT_RANGE_TF = os.getenv("CRT_RANGE_TF", "240").strip() or "240"
@@ -130,6 +138,10 @@ PREMIUM_CTA = (f'\n\n⚡ Без задержки и под твой депози
 # «Пульс» бота: monitor.py следит, что файл свежий (иначе алерт владельцу).
 HEARTBEAT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               f"hb_{SYMBOL.replace('.', '_')}_{STRATEGY}.json")
+# Замок одного экземпляра: heartbeat появляется только после первого шага,
+# поэтому watchdog мог успеть запустить второй бот на медленном старте MT5.
+INSTANCE_LOCK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  f"bot_lock_{SYMBOL.replace('.', '_')}_{STRATEGY}.json")
 
 PARAMS = st.Params(
     use_ib=False,
@@ -179,8 +191,17 @@ class MT5Data:
         return 0
 
     def frame(self, symbol: str, tf: str, count: int) -> st.Frame:
+        # Терминал сразу после старта иногда отдаёт 0 баров, пока история
+        # догружается: 3 попытки с паузой вместо падения шага (было у EURUSD).
         self.mt5.symbol_select(symbol, True)
-        rates = self.mt5.copy_rates_from_pos(symbol, feeds._mt5_timeframe(tf), 0, count)
+        rates = None
+        for attempt in range(3):
+            rates = self.mt5.copy_rates_from_pos(
+                symbol, feeds._mt5_timeframe(tf), 0, count)
+            if rates is not None and len(rates) >= 50:
+                break
+            if attempt < 2:
+                time.sleep(0.5)
         if rates is None or len(rates) < 50:
             raise RuntimeError(f"{symbol} {tf}: баров {0 if rates is None else len(rates)}")
         off = self.offset(symbol)
@@ -267,14 +288,68 @@ def save_state(state: dict) -> None:
     os.replace(tmp, STATE_PATH)
 
 
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def _project_file(name: str) -> Path:
+    """Файл строго внутри каталога проекта (без ../ и переходов наружу)."""
+    p = (BASE_DIR / name).resolve()
+    if not p.is_relative_to(BASE_DIR):
+        raise ValueError(f"path escapes project: {name}")
+    return p
+
+
 def write_heartbeat(info: dict) -> None:
     """Отметка «бот жив»: monitor.py сравнивает mtime и шлёт алерт при простое."""
+    payload = {"ts": time.time(), "pid": os.getpid(),
+               "symbol": SYMBOL, "strategy": STRATEGY,
+               "bar": info.get("bar"), "ok": bool(info.get("ok"))}
+    if info.get("error"):
+        payload["error"] = str(info["error"])[:300]
     try:
-        with open(HEARTBEAT_PATH, "w", encoding="utf-8") as f:
-            json.dump({"ts": time.time(), "pid": os.getpid(),
-                       "symbol": SYMBOL, "strategy": STRATEGY,
-                       "bar": info.get("bar"), "ok": bool(info.get("ok"))}, f)
-    except OSError:
+        _project_file(Path(HEARTBEAT_PATH).name).write_text(
+            json.dumps(payload), encoding="utf-8")
+    except (OSError, ValueError):
+        pass
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        import psutil
+        return psutil.pid_exists(int(pid))
+    except Exception:
+        return False
+
+
+def acquire_instance_lock() -> bool:
+    """Не дать второму bot.py на тот же символ/стратегию стартовать."""
+    me = os.getpid()
+    lock = _project_file(Path(INSTANCE_LOCK_PATH).name)
+    try:
+        old = int(json.loads(lock.read_text(encoding="utf-8")).get("pid") or 0)
+        if old and old != me and _pid_alive(old):
+            print(f"уже работает pid {old} — второй экземпляр не нужен")
+            return False
+    except (FileNotFoundError, json.JSONDecodeError, ValueError, OSError):
+        pass
+    tmp = lock.with_name(lock.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps({"pid": me, "ts": time.time(),
+                                   "symbol": SYMBOL, "strategy": STRATEGY}),
+                       encoding="utf-8")
+        os.replace(tmp, lock)
+    except OSError as e:
+        print("не удалось создать lock:", e)
+        return False
+    return True
+
+
+def release_instance_lock() -> None:
+    try:
+        lock = _project_file(Path(INSTANCE_LOCK_PATH).name)
+        if int(json.loads(lock.read_text(encoding="utf-8")).get("pid") or 0) == os.getpid():
+            lock.unlink(missing_ok=True)
+    except (FileNotFoundError, json.JSONDecodeError, ValueError, OSError):
         pass
 
 
@@ -432,6 +507,14 @@ def _late_note(row, data: "MT5Data | None") -> str:
     return "\n⚠️ Цена ушла от входа — входить по текущей, не по карточке."
 
 
+def _trade_closed(trade_id: str) -> bool:
+    """Сделка уже в trades.jsonl — её отложенный вход публиковать поздно."""
+    if not trade_id:
+        return False
+    return any(str(t.get("trade_id")) == trade_id
+               for t in risk_guard.read_closed_trades())
+
+
 def flush_pending(data: "MT5Data | None" = None) -> None:
     """Доставить посты в бесплатную группу, у которых вышла задержка.
 
@@ -439,8 +522,21 @@ def flush_pending(data: "MT5Data | None" = None) -> None:
     429 уважаем, сетевые ошибки повторяем с нарастающей паузой.
     """
     for row in store.claim_group():
-        cap = str(row["caption"] or "")
+        # Перечитываем текст: итог мог приклеиться уже после claim.
+        cap = store.group_caption(row["id"])
+        if cap is None:
+            cap = str(row["caption"] or "")
         if row["kind"] == "entry" and "Итог:" not in cap:
+            # Между claim и этой проверкой итог мог приклеиться к строке:
+            # перечитываем, иначе отменим вход вместе с уже вписанным итогом.
+            fresh_cap = store.group_caption(row["id"])
+            if fresh_cap is not None:
+                cap = fresh_cap
+            if "Итог:" not in cap and _trade_closed(row["trade_id"]):
+                store.mark_group_terminal(row["id"], "cancelled",
+                                          "trade closed before delivery")
+                print("группа: вход отменён, сделка уже закрыта", row["trade_id"])
+                continue
             cap += _late_note(row, data)
         path = str(row["path"] or "")
         if path and os.path.exists(path):
@@ -451,8 +547,12 @@ def flush_pending(data: "MT5Data | None" = None) -> None:
             store.mark_group_sent(row["id"])
             print("группа:", "ок", row["trade_id"], row["kind"])
         elif res.retry_after:
-            store.mark_group_retry(row["id"], res.error, res.retry_after)
-            print(f"группа: 429, повтор через {res.retry_after:.0f} с")
+            if int(row["attempts"]) + 1 >= 6:
+                store.mark_group_terminal(row["id"], "failed", res.error)
+                print("группа: 429 так и не прошёл — сдаюсь", row["trade_id"])
+            else:
+                store.mark_group_retry(row["id"], res.error, res.retry_after)
+                print(f"группа: 429, повтор через {res.retry_after:.0f} с")
         elif int(row["attempts"]) + 1 >= 6:
             store.mark_group_terminal(row["id"], "failed", res.error)
             print("группа: не доставлено", row["trade_id"], res.error)
@@ -604,10 +704,17 @@ def note_trade(kind: str, side: str, r: float, *, trade_id: str = "",
     """
     if kind in ("tp1", "tp2"):
         return
+    # Журнал и risk_guard должны видеть net-R, как и все бэктесты/WFA.
+    risk = (abs(float(entry) - float(stop))
+            if entry is not None and stop is not None else 0.0)
+    try:
+        cost = costs.cost_r(costs.symbol_spread(SYMBOL), risk)
+    except Exception:
+        cost = costs.MIN_COST_R
     rec = {"ts": time.time(), "symbol": SYMBOL, "side": side, "kind": kind,
-           "r": round(float(r), 4), "strategy": STRATEGY,
+           "r": round(float(r) - cost, 4), "strategy": STRATEGY,
            "trade_id": trade_id, "tf": TF,
-           "total_r": round(float(total_r if total_r is not None else r), 4),
+           "total_r": round(float(total_r if total_r is not None else r) - cost, 4),
            "entry": entry, "stop": stop, "exit": exit_px, "note": note,
            "image": image}
     append_jsonl(TRADES_PATH, rec)
@@ -699,7 +806,10 @@ def deliver_group_result(*, trade_id: str, kind: str, r: float, note: str,
     карточке — подписчик видит одну карточку «вход + итог» вместо сигнала
     и результата подряд.
     """
-    if store.append_group_outcome(trade_id, voice.outcome_line(kind, r, note)):
+    # Частичный TP1/TP2 не финал: не пишем его в карточку как «Итог»,
+    # иначе группа видит закрытую сделку, которая ещё жива.
+    if kind not in ("tp1", "tp2") and store.append_group_outcome(
+            trade_id, voice.outcome_line(kind, r, note)):
         print("группа: итог в карточке входа", trade_id, kind)
         return
     # Результат не должен обгонять отложенный вход.
@@ -728,6 +838,7 @@ def manage_trade(state: dict, chart: st.Frame, i: int) -> None:
         return
     tr["last_mgd_ts"] = bar_ts
     hi, lo = float(chart.h[i]), float(chart.l[i])
+    o = float(chart.o[i])
     is_long = tr["dir"] == 1
     side = "LONG" if is_long else "SHORT"
     p1 = float(tr.get("p1", PARAMS.p1_pct / 100.0))
@@ -788,7 +899,9 @@ def manage_trade(state: dict, chart: st.Frame, i: int) -> None:
     stop = tr["stop"]
     if (lo <= stop if is_long else hi >= stop):
         sgn_t = 1.0 if is_long else -1.0
-        stop_r = sgn_t * (float(stop) - float(tr["entry"])) / float(tr["risk"])
+        # Гэп через стоп: фактическое исполнение по открытию, не по уровню.
+        sl_px = min(float(stop), o) if is_long else max(float(stop), o)
+        stop_r = sgn_t * (sl_px - float(tr["entry"])) / float(tr["risk"])
         # безубыток — это stop_r ≈ 0; отдельная ветка «be» обнуляла прибыль трейлинга
         if PARAMS.use_trail and tr.get("hit1"):
             r = rp + (1.0 - done) * stop_r
@@ -800,7 +913,7 @@ def manage_trade(state: dict, chart: st.Frame, i: int) -> None:
         stops = state.setdefault("stops", {})
         stops[key] = stops.get(key, 0) + 1
         risk_note_stop(float(chart.t[i]))
-        close(r, "be" if tr["be"] else "sl", exit_px=tr["stop"])
+        close(r, "be" if tr["be"] else "sl", exit_px=sl_px)
         return
 
     tp1, tp2, tp3 = tr["tp1"], tr["tp2"], tr["tp3"]
@@ -835,8 +948,10 @@ def manage_trade(state: dict, chart: st.Frame, i: int) -> None:
         done += p2
         tr["r_partial"], tr["done"] = rp, done
         if p3 <= 0:
-            # у сделки всего две цели (CRT): остаток закрываем на второй
-            close(rp, "tp2", exit_px=tp2)
+            # у сделки всего две цели (CRT): остаток закрываем на второй.
+            # kind="tp" — это финальное закрытие, иначе note_trade пропускает
+            # tp2 и сделка не попадает в журнал/трек-рекорд.
+            close(rp, "tp", exit_px=tp2)
             return
         if p2 > 0:
             t1, t2, t3 = chart_tps()
@@ -1013,6 +1128,13 @@ def cl_gate(res: dict, i: int, m: dict, p: "st.Params") -> tuple[bool, dict]:
         m["state"], m["side"] = 0, side
     r = res["r"]
     setup_now = bool(r[0][i] and r[1][i] and r[2][i] and r[4][i] and r[11][i])
+    # research-фильтры: по умолчанию выключены, live-поведение не меняется
+    if getattr(p, "er_hard", False) and not bool(res["er_ok"][i]):
+        setup_now = False
+    if p.adx_min > 0 and not bool(res["adx_ok"][i]):
+        setup_now = False
+    if getattr(p, "filters_hard", False) and not bool(res["filters_ok"][i]):
+        setup_now = False
     trig_now = bool(r[5][i] and r[6][i] and r[7][i])
     if not setup_now:
         m["state"] = 0
@@ -1029,9 +1151,15 @@ def cl_gate(res: dict, i: int, m: dict, p: "st.Params") -> tuple[bool, dict]:
     return entry, m
 
 
-def simulate(res: dict, chart: st.Frame, p: st.Params) -> list[dict]:
-    """Прогон по истории теми же правилами, что ведёт живой бот."""
+def simulate(res: dict, chart: st.Frame, p: st.Params,
+             entry_delay: int = 0) -> list[dict]:
+    """Прогон по истории теми же правилами, что ведёт живой бот.
+
+    entry_delay > 0 — execution stress: вход не по закрытию бара сигнала, а
+    на N баров позже. Стоп/цели привязываются к фактической цене входа.
+    """
     n = len(chart.c)
+    delay = max(0, int(entry_delay))
     p1 = p.p1_pct / 100.0
     p2 = p.p2_pct / 100.0
     trades: list[dict] = []
@@ -1041,7 +1169,13 @@ def simulate(res: dict, chart: st.Frame, p: st.Params) -> list[dict]:
 
     for i in range(n):
         if tr:
+            if i <= tr["i"]:
+                # entry_delay: вход по close бара tr["i"]; high/low этого бара
+                # были до входа и не должны его останавливать/закрывать.
+                m["in_trade"] = True
+                continue
             hi, lo = float(chart.h[i]), float(chart.l[i])
+            o = float(chart.o[i])
             is_long = tr["dir"] == 1
             # трейлинг UT Bot: подтяжка стопа по закрытию ПРЕДЫДУЩЕГО бара
             # (эффектен с текущего бара, стоп никогда не отдаляется)
@@ -1050,6 +1184,49 @@ def simulate(res: dict, chart: st.Frame, p: st.Params) -> list[dict]:
                     tr["stop"] = max(tr["stop"], float(chart.c[i - 1]) - p.trail_k * float(atr[i - 1]))
                 else:
                     tr["stop"] = min(tr["stop"], float(chart.c[i - 1]) + p.trail_k * float(atr[i - 1]))
+            # Открытие уже за целью: цель — первое событие бара, а не стоп.
+            # R фиксируем по цели (консервативно, без бонуса за гэп).
+            if is_long:
+                if o >= tr["tp1"] and not tr["h1"]:
+                    tr["h1"] = True
+                    tr["r"] += p1 * p.tp1_r
+                    tr["done"] += p1
+                    if p.be_after == 1:
+                        tr["stop"], tr["be"] = tr["entry"], True
+                if o >= tr["tp2"] and tr["h1"] and not tr["h2"]:
+                    tr["h2"] = True
+                    tr["r"] += p2 * p.tp2_r
+                    tr["done"] += p2
+                    if p.be_after == 2:
+                        tr["stop"], tr["be"] = tr["entry"], True
+                if o >= tr["tp3"] and tr["h2"] and not tr["h3"]:
+                    tr["r"] += (1.0 - tr["done"]) * p.tp3_r
+                    trades.append({**tr, "exit": "TP3", "ei": i,
+                                   "exit_price": tr["tp3"]})
+                    m["last_exit"] = i
+                    tr = None
+                    continue
+            else:
+                if o <= tr["tp1"] and not tr["h1"]:
+                    tr["h1"] = True
+                    tr["r"] += p1 * p.tp1_r
+                    tr["done"] += p1
+                    if p.be_after == 1:
+                        tr["stop"], tr["be"] = tr["entry"], True
+                if o <= tr["tp2"] and tr["h1"] and not tr["h2"]:
+                    tr["h2"] = True
+                    tr["r"] += p2 * p.tp2_r
+                    tr["done"] += p2
+                    if p.be_after == 2:
+                        tr["stop"], tr["be"] = tr["entry"], True
+                if o <= tr["tp3"] and tr["h2"] and not tr["h3"]:
+                    tr["r"] += (1.0 - tr["done"]) * p.tp3_r
+                    trades.append({**tr, "exit": "TP3", "ei": i,
+                                   "exit_price": tr["tp3"]})
+                    m["last_exit"] = i
+                    tr = None
+                    continue
+
             hit_sl = lo <= tr["stop"] if is_long else hi >= tr["stop"]
             hit1 = hi >= tr["tp1"] if is_long else lo <= tr["tp1"]
             hit2 = hi >= tr["tp2"] if is_long else lo <= tr["tp2"]
@@ -1057,12 +1234,14 @@ def simulate(res: dict, chart: st.Frame, p: st.Params) -> list[dict]:
 
             if hit_sl:
                 sgn_t = 1.0 if is_long else -1.0
-                stop_r = sgn_t * (tr["stop"] - tr["entry"]) / tr["risk"]
+                # Гэп через стоп исполняется по открытию, а не по уровню стопа.
+                sl_px = min(tr["stop"], o) if is_long else max(tr["stop"], o)
+                stop_r = sgn_t * (sl_px - tr["entry"]) / tr["risk"]
                 if p.use_trail and tr.get("h1"):
                     total = tr["r"] + (1.0 - tr["done"]) * stop_r
                 else:
                     total = tr["r"] - (1.0 - tr["done"])
-                trades.append({**tr, "r": total, "exit": "SL", "ei": i, "exit_price": tr["stop"]})
+                trades.append({**tr, "r": total, "exit": "SL", "ei": i, "exit_price": sl_px})
                 m["last_exit"] = i
                 tr = None
                 continue
@@ -1096,25 +1275,45 @@ def simulate(res: dict, chart: st.Frame, p: st.Params) -> list[dict]:
         m["in_trade"] = tr is not None
         entry, m = cl_gate(res, i, m, p)
         if entry and not tr:
+            j = i + delay
+            if j >= n - 1:
+                continue
             is_long = bool(res["is_long"][i])
-            c = float(chart.c[i])
+            c = float(chart.c[j])
             stop = float(res["stop_l"][i] if is_long else res["stop_s"][i])
             risk = abs(c - stop)
             if risk <= 0:
                 continue
             sgn = 1 if is_long else -1
+            # delayed вход не должен открываться, если цена уже прошла стоп:
+            # иначе stop_r = +1 и убыток превращается в прибыль.
+            if (is_long and c <= stop) or (not is_long and c >= stop):
+                continue
             tr = {
                 "dir": sgn, "entry": c, "stop": stop, "risk": risk,
                 "tp1": c + sgn * risk * p.tp1_r, "tp2": c + sgn * risk * p.tp2_r,
                 "tp3": c + sgn * risk * p.tp3_r,
-                "i": i, "h1": False, "h2": False, "h3": False, "be": False,
+                "i": j, "h1": False, "h2": False, "h3": False, "be": False,
                 "r": 0.0, "done": 0.0,
             }
+    if tr:
+        # окно кончилось, а сделка ещё открыта: фиксируем MTM, иначе она
+        # молча выпадает из WFA/портфеля (вместе с уже взятыми TP1/TP2).
+        c = float(chart.c[-1])
+        mtm = ((c - tr["entry"]) if tr["dir"] > 0 else
+               (tr["entry"] - c)) / tr["risk"]
+        tr["r"] += (1.0 - tr["done"]) * mtm
+        trades.append({**tr, "exit": "TIME_END", "ei": n - 1, "exit_price": c})
     return trades
 
 
-def print_trades_stats(trades: list[dict], chart: st.Frame, key: str = "i") -> None:
-    """Общая печать итогов бэктеста для scan_classic/scan_range/scan_sonar."""
+def print_trades_stats(trades: list[dict], chart: st.Frame, key: str = "i",
+                       spread: float | None = None,
+                       stress: float = 1.0) -> None:
+    """Общая печать итогов бэктеста для scan_classic/scan_range/scan_sonar.
+
+    spread задан — печатается и итог после единой модели издержек (costs.py).
+    """
     bar_sec = feeds.TF_MINUTES.get(TF.upper(), 15) * 60
     rs = [t["r"] for t in trades]
     wins = sum(1 for r in rs if r > 0)
@@ -1123,6 +1322,11 @@ def print_trades_stats(trades: list[dict], chart: st.Frame, key: str = "i") -> N
           f"прибыльных {wins} ({wins / len(trades) * 100:.0f}%)")
     print(f"сумма {sum(rs):+.2f}R · средняя {sum(rs) / len(rs):+.2f}R · "
           f"лучшая {max(rs):+.2f}R · худшая {min(rs):+.2f}R")
+    if spread is not None:
+        s = costs.summary(trades, spread, stress=stress)
+        print(f"после издержек (спред {s['spread']:.5f} ×{s['stress']:g}): "
+              f"net {s['net_r']:+.2f}R · средняя {s['avg_r']:+.3f}R · "
+              f"прибыльных {s['wins']}")
     by_exit: dict[str, list[float]] = {}
     for t in trades:
         by_exit.setdefault(t["exit"], []).append(t["r"])
@@ -1157,14 +1361,15 @@ def scan(data: MT5Data) -> None:
     return scan_classic(data)
 
 
-def scan_generic(title: str, trades: list[dict], chart: st.Frame) -> None:
+def scan_generic(title: str, trades: list[dict], chart: st.Frame,
+                 spread: float | None = None) -> None:
     """Общая шапка и печать для простых стратегий (pdl/ict)."""
     span_days = (chart.t[-1] - chart.t[0]) / 86400.0
     print(f"{SYMBOL} {feeds.tf_label(TF)} · баров {len(chart.c)} · период {span_days:.1f} дн. · {title}")
     if not trades:
         print("сделок нет")
         return
-    print_trades_stats(trades, chart, key="entry_i")
+    print_trades_stats(trades, chart, key="entry_i", spread=spread)
 
 
 def scan_pdl(data: MT5Data) -> None:
@@ -1172,7 +1377,11 @@ def scan_pdl(data: MT5Data) -> None:
     import pdl_sweep
     chart, _htf = load_frames(data, SYMBOL, TF, BARS)
     scan_generic("стратегия pdl (снятие экстремума предыдущего дня)",
-                 pdl_sweep.backtest(chart), chart)
+                 pdl_sweep.backtest(chart, tp_r=PDL_TP_R,
+                                    stop_buf_atr=PDL_STOP_BUF_ATR,
+                                    max_bars=PDL_MAX_BARS,
+                                    entry_delay=costs.entry_delay_from_env()),
+                 chart, spread=costs.symbol_spread(SYMBOL))
 
 
 def scan_ict(data: MT5Data) -> None:
@@ -1180,7 +1389,8 @@ def scan_ict(data: MT5Data) -> None:
     import ict2022
     chart, _htf = load_frames(data, SYMBOL, TF, BARS)
     scan_generic("стратегия ict (свип -> FVG -> ретест)",
-                 ict2022.backtest(chart), chart)
+                 ict2022.backtest(chart, entry_delay=costs.entry_delay_from_env()),
+                 chart, spread=costs.symbol_spread(SYMBOL))
 
 
 def _crt_range_frame(data: MT5Data, chart: st.Frame) -> st.Frame:
@@ -1198,7 +1408,9 @@ def scan_crt(data: MT5Data) -> None:
     H = htf.get(CRT_RANGE_TF) or _crt_range_frame(data, chart)
     scan_generic(f"стратегия crt ({CRT_PARAMS.variant}, диапазон "
                  f"{feeds.tf_label(CRT_RANGE_TF)})",
-                 crt.backtest(chart, H, CRT_PARAMS), chart)
+                 crt.backtest(chart, H, CRT_PARAMS,
+                              entry_delay=costs.entry_delay_from_env()),
+                 chart, spread=costs.symbol_spread(SYMBOL))
 
 
 def scan_classic(data: MT5Data) -> None:
@@ -1215,9 +1427,9 @@ def scan_classic(data: MT5Data) -> None:
     print(f"{SYMBOL} {feeds.tf_label(TF)} · баров {len(chart.c)} · период {span_days:.1f} дн.")
     print(f"событий входа: {n_evt}")
 
-    trades = simulate(res, chart, PARAMS)
+    trades = simulate(res, chart, PARAMS, entry_delay=costs.entry_delay_from_env())
     if trades:
-        print_trades_stats(trades, chart)
+        print_trades_stats(trades, chart, spread=costs.symbol_spread(SYMBOL))
     else:
         print("сделок нет")
 
@@ -1253,9 +1465,12 @@ def scan_range(data: MT5Data) -> None:
                                tp_r=RANGE_TP_R, max_r=RANGE_TP_R + 2.0,
                                session=RANGE_SESSION, smt=smt, smt_look=SMT_LOOK,
                                max_bars=PARAMS.max_bars, er_max=RANGE_ER_MAX,
-                               side_allow=RANGE_SIDE, trend_filter=RANGE_TREND)
+                               side_allow=RANGE_SIDE, trend_filter=RANGE_TREND,
+                               max_stops=RANGE_MAX_STOPS,
+                               entry_delay=costs.entry_delay_from_env())
     if trades:
-        print_trades_stats(trades, chart, key=_trades_bar_key(trades))
+        print_trades_stats(trades, chart, key=_trades_bar_key(trades),
+                           spread=costs.symbol_spread(SYMBOL))
     else:
         print("сделок нет")
 
@@ -1268,9 +1483,11 @@ def scan_sonar(data: MT5Data) -> None:
           f"стратегия sonar")
     atr = sonar.build_atr(chart)
     levels = sonar.find_levels(chart, atr)
-    trades = sonar.backtest(chart, atr, levels)
+    trades = sonar.backtest(chart, atr, levels,
+                            entry_delay=costs.entry_delay_from_env())
     if trades:
-        print_trades_stats(trades, chart, key=_trades_bar_key(trades))
+        print_trades_stats(trades, chart, key=_trades_bar_key(trades),
+                           spread=costs.symbol_spread(SYMBOL))
     else:
         print("сделок нет")
 
@@ -1681,11 +1898,23 @@ def main() -> None:
     news_calendar.start_background_refresh()
     state = load_state()
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    # scan — разовый бэктест, once — разовая проверка; остальные режимы
+    # (включая `bot.py classic`) — долгоживущий демон и требуют lock/heartbeat.
+    daemon = cmd not in ("scan", "once")
+    if daemon:
+        if not acquire_instance_lock():
+            return
+        atexit.register(release_instance_lock)
+        # Пишем пульс сразу, не дожидаясь первого (возможно, долгого) шага:
+        # иначе watchdog видит «нет heartbeat» и поднимает дубль.
+        write_heartbeat({"ok": True, "bar": None, "note": "starting"})
 
     data = connect()
     if data is None:
         print("проверь: терминал MT5 запущен и залогинен, Python и терминал на одном ПК")
         print("диагностика: python app.py mt5test")
+        if daemon:
+            write_heartbeat({"ok": False, "error": "mt5 connect"})
         return
 
     try:
@@ -1722,7 +1951,8 @@ def main() -> None:
                 except Exception:
                     pass
                 data = None
-                info = {"ok": False}
+                info = {"ok": False, "error": repr(e)}
+                write_heartbeat(info)
 
             now = time.time()
             if info.get("ok"):
