@@ -18,18 +18,17 @@ from __future__ import annotations
 import os
 import sys
 from collections import Counter
-from pathlib import Path
 
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import bot  # noqa: E402
+import costs  # noqa: E402
 import strategy as st  # noqa: E402
 
 NATIVE = r"C:\Program Files\MetaTrader 5\terminal64.exe"
 EXNESS = r"C:\MT5-Exness\terminal64.exe"
-COST_R = 0.05
 M15_BARS = 30000
 
 
@@ -90,13 +89,15 @@ def rebuild(m15: st.Frame) -> dict[str, st.Frame]:
             "1D": aggregate(m15, 86400), "1W": aggregate(m15, 7 * 86400, week=True)}
 
 
-def run(chart: st.Frame, htf: dict[str, st.Frame], lo: float, hi: float) -> dict:
+def run(chart: st.Frame, htf: dict[str, st.Frame], lo: float, hi: float,
+        spread: float = 0.0) -> dict:
     res = st.evaluate(chart, htf, bot.PARAMS)
     if not res.get("ok"):
         return {"n": 0, "r": 0.0, "exits": {}}
     trades = [t for t in bot.simulate(res, chart, bot.PARAMS)
               if lo <= chart.t[t["i"]] < hi]
-    return {"n": len(trades), "r": sum(float(t["r"]) for t in trades) - COST_R * len(trades),
+    return {"n": len(trades),
+            "r": sum(costs.net_rs(trades, spread)),
             "exits": Counter(t["exit"] for t in trades)}
 
 
@@ -131,19 +132,21 @@ def main() -> int:
     hi = min(float(n_chart.t[-1]), float(e_chart2.t[-1]))
     print(f"общее окно: {np.datetime64(int(lo), 's')} – {np.datetime64(int(hi), 's')}")
 
+    n_spread = costs.symbol_spread("XAUUSD")
+    e_spread = costs.symbol_spread("XAUUSDm")
     variants = [
-        ("N", n_chart, n_htf),
-        ("N/rebuild", n_chart, rebuild(n_chart)),
-        ("E", e_chart, e_htf),
-        ("E+2h", e_chart2, e_htf2),
-        ("E+2h/rebuild", e_chart2, e_rebuild),
-        ("E+2h/nogap", e_nogap, e_nogap_htf),
-        ("E+2h/Nhtf", e_chart2, n_htf),
-        ("N/Ehtf", n_chart, e_rebuild),
+        ("N", n_chart, n_htf, n_spread),
+        ("N/rebuild", n_chart, rebuild(n_chart), n_spread),
+        ("E", e_chart, e_htf, e_spread),
+        ("E+2h", e_chart2, e_htf2, e_spread),
+        ("E+2h/rebuild", e_chart2, e_rebuild, e_spread),
+        ("E+2h/nogap", e_nogap, e_nogap_htf, e_spread),
+        ("E+2h/Nhtf", e_chart2, n_htf, e_spread),
+        ("N/Ehtf", n_chart, e_rebuild, n_spread),
     ]
     print(f"{'вариант':<16} {'сделок':>7} {'net R':>9}  выходы")
-    for name, chart, htf in variants:
-        r = run(chart, htf, lo, hi)
+    for name, chart, htf, spread in variants:
+        r = run(chart, htf, lo, hi, spread)
         print(f"{name:<16} {r['n']:>7} {r['r']:>+9.2f}  {dict(r['exits'])}")
     return 0
 

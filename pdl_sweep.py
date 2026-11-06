@@ -27,12 +27,21 @@ def _day_key(ts: float) -> str:
 
 
 def backtest(chart: st.Frame, tp_r: float = 2.0, stop_buf_atr: float = 0.25,
-             max_bars: int = 96, atr_len: int = 14) -> list[dict]:
-    """Прогон по истории. Сделки помечены exit: TP / SL / EOD (конец дня)."""
+             max_bars: int = 96, atr_len: int = 14,
+             entry_delay: int = 0, er_min: float = 0.0,
+             adx_min: float = 0.0, session: str = "") -> list[dict]:
+    """Прогон по истории. Сделки помечены exit: TP / SL / EOD (конец дня).
+
+    entry_delay > 0 — execution stress: вход на N баров позже обычного.
+    er_min/adx_min > 0 и session — жёсткие фильтры входа.
+    """
     n = len(chart.c)
+    delay = max(0, int(entry_delay))
     if n < 100:
         return []
     atr = ta.atr(chart.h, chart.l, chart.c, atr_len)
+    er = ta.efficiency_ratio(chart.c) if er_min > 0 else None
+    adx = ta.dmi(chart.h, chart.l, chart.c)[2] if adx_min > 0 else None
 
     # уровни прошлого дня на каждый бар: сначала статистика по дням, потом
     # разметка баров предыдущим днём
@@ -75,6 +84,15 @@ def backtest(chart: st.Frame, tp_r: float = 2.0, stop_buf_atr: float = 0.25,
         if not sig:
             i += 1
             continue
+        if session and not st.in_session(float(chart.t[i]), session):
+            i += 1
+            continue
+        if er is not None and (np.isnan(er[i]) or er[i] < er_min):
+            i += 1
+            continue
+        if adx is not None and (np.isnan(adx[i]) or adx[i] < adx_min):
+            i += 1
+            continue
 
         side, level = sig
         sgn = 1 if side == "LONG" else -1
@@ -90,9 +108,10 @@ def backtest(chart: st.Frame, tp_r: float = 2.0, stop_buf_atr: float = 0.25,
             sweep_ext = float(np.max(chart.h[j0:i + 1]))
             stop_raw = sweep_ext + float(atr[i]) * stop_buf_atr
 
-        if i + 1 >= n - 1:
+        if i + 1 + delay >= n - 1:
             break
-        entry = float(chart.o[i + 1])
+        fill_i = i + 1 + delay
+        entry = float(chart.o[fill_i])
         risk = abs(entry - stop_raw)
         if risk <= 0:
             i += 1
@@ -101,28 +120,28 @@ def backtest(chart: st.Frame, tp_r: float = 2.0, stop_buf_atr: float = 0.25,
         target = entry + sgn * risk * tp_r
 
         exit_i = exit_price = why = None
-        for j in range(i + 1, min(i + 1 + max_bars, n)):
+        for j in range(fill_i, min(fill_i + max_bars, n)):
             # конец дня: первый бар следующего дня закрываем по его открытию
             if _day_key(chart.t[j]) != day:
                 exit_i, exit_price, why = j, float(chart.o[j]), "EOD"
                 break
             hit_sl = chart.l[j] <= stop if side == "LONG" else chart.h[j] >= stop
             hit_tp = chart.h[j] >= target if side == "LONG" else chart.l[j] <= target
-            if j == i + 1:
-                if side == "LONG":
-                    if chart.o[j] <= stop:
-                        exit_i, exit_price, why = j, stop, "SL"
-                        break
-                    if chart.o[j] >= target:
-                        exit_i, exit_price, why = j, target, "TP"
-                        break
-                else:
-                    if chart.o[j] >= stop:
-                        exit_i, exit_price, why = j, stop, "SL"
-                        break
-                    if chart.o[j] <= target:
-                        exit_i, exit_price, why = j, target, "TP"
-                        break
+            o = float(chart.o[j])
+            if side == "LONG":
+                if o <= stop:
+                    exit_i, exit_price, why = j, o, "SL"
+                    break
+                if o >= target:
+                    exit_i, exit_price, why = j, o, "TP"
+                    break
+            else:
+                if o >= stop:
+                    exit_i, exit_price, why = j, o, "SL"
+                    break
+                if o <= target:
+                    exit_i, exit_price, why = j, o, "TP"
+                    break
             if hit_sl:
                 exit_i, exit_price, why = j, stop, "SL"
                 break
@@ -130,7 +149,7 @@ def backtest(chart: st.Frame, tp_r: float = 2.0, stop_buf_atr: float = 0.25,
                 exit_i, exit_price, why = j, target, "TP"
                 break
         if exit_i is None:
-            j = min(i + max_bars, n - 1)
+            j = min(fill_i + max_bars, n - 1)
             exit_i, exit_price, why = j, float(chart.c[j]), "EOD"
 
         r = (exit_price - entry) * sgn / risk

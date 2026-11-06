@@ -177,7 +177,7 @@ def prepare(d, p):
 
 def core_gates(g, p, i, variant, lv):
     """Один бар: считает r1..r12 и состояние сетапа. Меняет lv и sticky-состояния."""
-    c, h, l, t = g["c"], g["h"], g["l"], g["t"]
+    c, h, l, _ = g["c"], g["h"], g["l"], g["t"]
     atr, ema_t = g["atr_c"][i], g["ema_t"][i]
 
     # уровни: касание и отбой
@@ -353,7 +353,6 @@ def audit(d, g, variant, p):
                  all12=0, level_touch_bars=0, touch_events=0)
     obs = []
     prev_touch = [[False, False] for _ in range(4)]
-    last_touch_bar = [None] * 4
 
     for i in range(220, g["n"] - 1):
         if np.isnan(g["atr_c"][i]) or g["atr_c"][i] <= 0:
@@ -478,11 +477,11 @@ def main():
     print(f"{'входов после всех 12':34s}{v12['all12']:>10d}{v13['all12']:>10d}")
     print(f"{'проходят новый гейт':34s}{pct(v12['all12'], v12['core']):>10s}"
           f"{pct(v13['all12'], v13['core']):>10s}")
-    print(f"\nиз входов V1.2 таблица говорила «ЖДЁМ» (доля от core-8):")
+    print("\nиз входов V1.2 таблица говорила «ЖДЁМ» (доля от core-8):")
     print(f"  наклон r4        {v12['miss_r4']:6d}  {pct(v12['miss_r4'], v12['core'])}")
     print(f"  ER/диапазон r9   {v12['miss_r9']:6d}  {pct(v12['miss_r9'], v12['core'])}")
     print(f"  SMC-факторы r10  {v12['miss_r10']:6d}  {pct(v12['miss_r10'], v12['core'])}")
-    print(f"\nвходы в полосу уровня (визитов):")
+    print("\nвходы в полосу уровня (визитов):")
     print(f"  V1.2 (касание обновляется каждый бар) {v12['touch_events']}")
     print(f"  V1.3 (один визит = одно касание)      {v13['touch_events']}")
     mt5.shutdown()

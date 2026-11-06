@@ -11,8 +11,6 @@ import datetime as dt
 import os
 import sys
 
-import numpy as np
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import bot
@@ -47,7 +45,7 @@ def main() -> None:
     trades = r2.backtest(chart, zones, H, stop_pts=bot.RANGE_STOP_PTS,
                          smt=smt, smt_look=bot.SMT_LOOK)
     er = ta.efficiency_ratio(chart.c)
-    trades = [t for t in trades if not np.isnan(er[t["entry_i"]]) and er[t["entry_i"]] <= bot.RANGE_ER_MAX]
+    trades = [t for t in trades if bot.er_filter_ok(er[t["entry_i"]], bot.RANGE_ER_MAX)]
 
     cutoff = chart.t[-1] - DAYS * 86400
     sel = [t for t in trades if chart.t[t["entry_i"]] >= cutoff]
@@ -68,7 +66,6 @@ def main() -> None:
     for t in sel:
         i = t["entry_i"]
         when = dt.datetime.fromtimestamp(float(chart.t[i]), dt.timezone.utc)
-        sgn = 1 if t["side"] == "LONG" else -1
         entry = float(t["entry"])
         stop = float(t["stop"])
         tp = float(t["target"])

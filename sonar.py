@@ -105,8 +105,10 @@ def backtest(
     target_r: float = 2.0,
     max_bars: int = 96,
     tol_mult: float = 0.25,
+    entry_delay: int = 0,
 ) -> list[dict]:
     n = len(frame.c)
+    delay = max(0, int(entry_delay))
     trades: list[dict] = []
     i = 1
     while i < n - 1:
@@ -114,7 +116,6 @@ def backtest(
         if a <= 0:
             i += 1
             continue
-        tol = a * tol_mult
         sig = detect_at(frame, atr, levels_by_bar, i, sweep_max, stop_buf)
 
         if not sig:
@@ -122,7 +123,10 @@ def backtest(
             continue
 
         side, stop = sig
-        entry = float(frame.c[i])
+        fill_i = i + delay
+        if fill_i >= n - 1:
+            break
+        entry = float(frame.c[fill_i])
         risk = abs(entry - stop)
         if risk <= 0:
             i += 1
@@ -143,7 +147,22 @@ def backtest(
 
         rr = abs(target - entry) / risk
         exit_i, exit_price, why = None, None, None
-        for j in range(i + 1, min(i + 1 + max_bars, n)):
+        for j in range(fill_i + 1, min(fill_i + 1 + max_bars, n)):
+            o = float(frame.o[j])
+            if side == "LONG":
+                if o <= stop:
+                    exit_i, exit_price, why = j, o, "SL"
+                    break
+                if o >= target:
+                    exit_i, exit_price, why = j, o, "TP"
+                    break
+            else:
+                if o >= stop:
+                    exit_i, exit_price, why = j, o, "SL"
+                    break
+                if o <= target:
+                    exit_i, exit_price, why = j, o, "TP"
+                    break
             hit_sl = frame.l[j] <= stop if side == "LONG" else frame.h[j] >= stop
             hit_tp = frame.h[j] >= target if side == "LONG" else frame.l[j] <= target
             if hit_sl:
@@ -153,7 +172,7 @@ def backtest(
                 exit_i, exit_price, why = j, target, "TP"
                 break
         if exit_i is None:
-            j = min(i + max_bars, n - 1)
+            j = min(fill_i + max_bars, n - 1)
             exit_i, exit_price, why = j, float(frame.c[j]), "TIME"
 
         r = (exit_price - entry) * sgn / risk

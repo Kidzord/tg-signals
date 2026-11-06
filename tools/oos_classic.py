@@ -7,10 +7,7 @@ import sys
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import numpy as np
 import bot
-import strategy as st
-import ta_core as ta
 from datetime import timezone
 
 SPLIT = datetime(2026, 7, 28, tzinfo=timezone.utc).timestamp()

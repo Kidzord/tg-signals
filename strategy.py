@@ -120,6 +120,14 @@ class Params:
     trail_after: int = 1
     trail_k: float = 2.0
     use_sess: bool = True
+    # окно сессии: v16 (как в индикаторе), london, ny, both, none (24ч)
+    sess_mode: str = "v16"
+    # ADX(14) как жёсткий фильтр входа: 0 — выключен
+    adx_min: float = 0.0
+    # Жёсткие фильтры входа (для research): live по умолчанию их не требует.
+    # er_hard — ER-антифлэт должен выполняться; filters_hard — vwap/stack/macd/rsi.
+    er_hard: bool = False
+    filters_hard: bool = False
     tz_name: str = "Europe/Moscow"
 
 
@@ -253,6 +261,38 @@ def _v16_sessions(epoch_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return in_sess, ~blocked
 
 
+def session_mask(epoch_arr: np.ndarray, mode: str = "v16") -> tuple[np.ndarray, np.ndarray]:
+    """Окна сессий для оси `sess_mode`.
+
+    v16 — как в индикаторе (Лондон + НЙ, минус ролловер и новостные окна);
+    london — только 08:00–17:00 Лондона; ny — только 09:30–16:00 НЙ;
+    both — объединение Лондона и НЙ; none — 24 часа без блокировок.
+    Ролловер 16:55–17:05 НЙ блокируется везде, кроме none.
+    """
+    mode = (mode or "v16").strip().lower()
+    if mode == "v16":
+        return _v16_sessions(epoch_arr)
+    utc = _server_to_utc(epoch_arr)
+    in_sess = np.ones(len(epoch_arr), dtype=bool) if mode == "none" \
+        else np.zeros(len(epoch_arr), dtype=bool)
+    blocked = np.zeros(len(epoch_arr), dtype=bool)
+    for i, u in enumerate(utc):
+        if mode == "none":
+            continue
+        m_ldn = _local_minutes(u, _TZ_LDN)
+        m_ny = _local_minutes(u, _TZ_NY)
+        if mode == "london":
+            in_sess[i] = 480 <= m_ldn < 1020
+        elif mode == "ny":
+            in_sess[i] = 570 <= m_ny < 960
+        elif mode == "both":
+            in_sess[i] = (480 <= m_ldn < 1020) or (570 <= m_ny < 960)
+        else:                                # неизвестный режим — как 24ч
+            in_sess[i] = True
+        blocked[i] = 1015 <= m_ny < 1025    # ролловер
+    return in_sess, ~blocked
+
+
 def evaluate(frame: Frame, htf: dict[str, Frame], p: Params) -> dict:
     """Возвращает массивы условий и значений. Последний элемент — текущий бар."""
     t, o, h, l, c = frame.t, frame.o, frame.h, frame.l, frame.c
@@ -278,7 +318,6 @@ def evaluate(frame: Frame, htf: dict[str, Frame], p: Params) -> dict:
     ctx_s = ctx_known & (htf_close < htf_ema)
     slope_l = slope_val >= p.min_slope
     slope_s = slope_val <= -p.min_slope
-    flat_mkt = np.abs(slope_val) < p.min_slope
 
     # ---------------- касание EMA200 на ТФ касания ----------------
     T = htf.get(p.touch_tf)
@@ -306,7 +345,6 @@ def evaluate(frame: Frame, htf: dict[str, Frame], p: Params) -> dict:
     no_chop = er_val >= p.er_min
 
     # ---------------- тест EMA200: та же линия ТФ касания, что и касание (V1.6) ----
-    ema_ltf = ta.ema(c, p.ltf_ema_len)
     atr_chart = ta.atr(h, l, c, 14)
     test_band = _nz(atr_touch) * p.tol_ltf
     test_l = (l <= ema_touch + test_band) & (c > ema_touch)
@@ -344,12 +382,8 @@ def evaluate(frame: Frame, htf: dict[str, Frame], p: Params) -> dict:
     lv_test_s = false_arr.copy()
     lv_touch_l = false_arr.copy()
     lv_test_l = false_arr.copy()
-    best_s_ago = np.full(n, BIG)
-    best_l_ago = np.full(n, BIG)
     lv_price_s = nan_arr.copy()
     lv_price_l = nan_arr.copy()
-    lv_name_s = np.array([""] * n, dtype=object)
-    lv_name_l = np.array([""] * n, dtype=object)
 
     # сетап уровня: касание И отбой ОДНОГО уровня (V1.6 lvSetupOk), выбор по
     # свежайшему отбою; касания/отбои сбрасываются при смене цены уровня
@@ -399,8 +433,6 @@ def evaluate(frame: Frame, htf: dict[str, Frame], p: Params) -> dict:
     lv_touch_l = lv_touch_l_ago <= p.lv_look
     lv_test_s = setup_s_ago < BIG
     lv_test_l = setup_l_ago < BIG
-    best_s_ago = setup_s_ago
-    best_l_ago = setup_l_ago
     lv_price_s = setup_s_px
     lv_price_l = setup_l_px
 
@@ -410,8 +442,6 @@ def evaluate(frame: Frame, htf: dict[str, Frame], p: Params) -> dict:
     # цели по уровням: для лонга только сопротивления (kind >= 0) выше цены,
     # для шорта только поддержки (kind <= 0) ниже; V1.6 берёт ближайший уровень,
     # ПРОШЕДШИЙ фильтры (tgt_min/max, RR) — ближайший может провалить RR
-    tgt_lv_s = np.full(n, NAN)
-    tgt_lv_l = np.full(n, NAN)
 
     ema_setup_l = ema_src_on & touch_l_recent & test_l_recent
     ema_setup_s = ema_src_on & touch_s_recent & test_s_recent
@@ -622,10 +652,7 @@ def evaluate(frame: Frame, htf: dict[str, Frame], p: Params) -> dict:
     rng_lo = ta.rolling_min(l, p.range_len)
     with np.errstate(divide="ignore", invalid="ignore"):
         rng_atr_v = (rng_hi - rng_lo) / atr_chart
-        rng_pos = np.where(rng_hi > rng_lo, (c - rng_lo) / (rng_hi - rng_lo), 0.5)
     f_range = (rng_atr_v >= p.range_min_atr) & (rng_atr_v <= p.range_max_atr)
-    f_disc_l = rng_pos <= 0.5
-    f_disc_s = rng_pos >= 0.5
 
     score_l = f_sweep_l.astype(int) + f_bos_l.astype(int) + f_fvg_l.astype(int) + f_chok_l.astype(int)
     score_s = f_sweep_s.astype(int) + f_bos_s.astype(int) + f_fvg_s.astype(int) + f_chok_s.astype(int)
@@ -668,10 +695,16 @@ def evaluate(frame: Frame, htf: dict[str, Frame], p: Params) -> dict:
     allow_s = p.side_allow != "Только лонг"
 
     if p.use_sess:
-        sess_ok_v16, no_block_v16 = _v16_sessions(frame.t)
-        sess_mask = sess_ok_v16 & no_block_v16
+        sess_ok, no_block = session_mask(frame.t, p.sess_mode)
+        sess_mask = sess_ok & no_block
     else:
         sess_mask = np.ones(n, dtype=bool)
+
+    if p.adx_min > 0:
+        _, _, adx_v = ta.dmi(h, l, c)
+        adx_ok = (~np.isnan(adx_v)) & (adx_v >= p.adx_min)
+    else:
+        adx_ok = np.ones(n, dtype=bool)
 
     D = htf.get("1D")
     if p.use_day_ctx and D is not None and len(D.c) > 2:
@@ -712,7 +745,7 @@ def evaluate(frame: Frame, htf: dict[str, Frame], p: Params) -> dict:
 
     soft_names = [r4, r9, r10, r11]
     soft_cnt = np.sum([x.astype(int) for x in soft_names], axis=0)
-    core = [r1, r2, r3, r5, r6, r7, r8, r12]
+    core = [r1, r2, r3, r5, r6, r7, r8, r12, adx_ok]
     core_miss = np.sum([(~x).astype(int) for x in core], axis=0)
     strict_miss = core_miss + np.sum([(~x).astype(int) for x in soft_names], axis=0)
 
@@ -752,6 +785,11 @@ def evaluate(frame: Frame, htf: dict[str, Frame], p: Params) -> dict:
         "since_sweep_s": since_sweep_s,
         "ctx_known": ctx_known,
         "atr": atr_chart,
+        # отдельные маски для research-фильтров: cl_gate может требовать их
+        # жёстко (er_hard/filters_hard/adx_min), не меняя live-поведение
+        "er_ok": no_chop,
+        "adx_ok": adx_ok,
+        "filters_ok": r11,
     }
 
 

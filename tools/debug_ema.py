@@ -4,7 +4,7 @@
 мало истории перед стартом, bot.py берёт 2300+ баров)."""
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np

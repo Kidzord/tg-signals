@@ -6,7 +6,6 @@ import sys
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import numpy as np
 from datetime import timezone
 import bot
 import strategy as st

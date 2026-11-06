@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Дебаг 2026.10.22: почему у bot.py нет шортового сетапа уровня, а у EA есть."""
+import datetime as dt_mod
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import numpy as np
 import bot
-import strategy as st
 import ta_core as ta
 
 data = bot.connect()
 chart, htf = bot.load_frames(data, "XAUUSD", bot.TF, 8000)
 t = chart.t
 D = htf.get("1D")
-W = htf.get("1W")
 
 # PDH/PWL вокруг 22.10
 for i in range(len(D.t)):
@@ -34,15 +32,9 @@ hi_cl = ta.rolling_max(chart.c, bot.PARAMS.lv_persist)[idx]
 lo_cl = ta.rolling_min(chart.c, bot.PARAMS.lv_persist)[idx]
 atr_chart = ta.atr(chart.h, chart.l, chart.c, 14)[idx]
 tol = atr_chart * bot.PARAMS.lv_tol
-pdh = float(D.h[np.searchsorted(D.t, t[idx]) - 1]) if False else None
 # PDH = вчерашний хай: D-бар, предшествующий дню бара
 day = datetime.utcfromtimestamp(float(t[idx])).date()
 pdh = pdl = pwh = pwl = None
-for i in range(len(D.t)):
-    d = datetime.utcfromtimestamp(float(D.t[i])).date()
-    if d == day - dt_days(1) if False else False:
-        pass
-import datetime as dt_mod
 for i in range(len(D.t)):
     d = datetime.utcfromtimestamp(float(D.t[i])).date()
     if d == day - dt_mod.timedelta(days=1):

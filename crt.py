@@ -316,10 +316,15 @@ def signal_at(S: dict, i: int) -> dict | None:
     }
 
 
-def backtest(chart: st.Frame, H: st.Frame, p: CrtParams | None = None) -> list[dict]:
-    """Прогон по истории. Частичный выход: половина на EQ, остаток на границе."""
+def backtest(chart: st.Frame, H: st.Frame, p: CrtParams | None = None,
+             entry_delay: int = 0) -> list[dict]:
+    """Прогон по истории. Частичный выход: половина на EQ, остаток на границе.
+
+    entry_delay > 0 — execution stress: вход на N баров позже обычного.
+    """
     p = p or CrtParams()
     n = len(chart.c)
+    delay = max(0, int(entry_delay))
     if n < 30:
         return []
     S = scan(chart, H, p)
@@ -336,12 +341,13 @@ def backtest(chart: st.Frame, H: st.Frame, p: CrtParams | None = None) -> list[d
         if sig is None:
             i += 1
             continue
-        if i + 1 >= n - 1:
+        fill_i = i + 1 + delay
+        if fill_i >= n - 1:
             break
 
         side = sig["side"]
         sgn = 1.0 if side == "LONG" else -1.0
-        entry = float(chart.o[i + 1])
+        entry = float(chart.o[fill_i])
         stop_raw = sig["stop"]
         risk = abs(entry - stop_raw)
         if risk <= 0:
@@ -367,31 +373,39 @@ def backtest(chart: st.Frame, H: st.Frame, p: CrtParams | None = None) -> list[d
 
         acc = 0.0
         hit_a = False
-        exit_i = exit_price = why = None
+        exit_i = why = None
 
-        for j in range(i + 1, min(i + 1 + p.max_bars, n)):
+        for j in range(fill_i, min(fill_i + p.max_bars, n)):
             hi, lo = float(chart.h[j]), float(chart.l[j])
-            if j == i + 1:
+            if j == fill_i:
                 # на баре входа возможен гэп через стоп или цель: разбираем
                 # его отдельно и в этом баре больше ничего не трогаем
                 op = float(chart.o[j])
                 if (op <= stop) if sgn > 0 else (op >= stop):
-                    exit_i, exit_price, why = j, stop, "SL"
+                    # гэп через стоп: R по открытию, а не 0 (старый баг)
+                    acc = sgn * (op - entry) / risk
+                    exit_i, why = j, "SL"
                     break
                 if (op >= tp_a) if sgn > 0 else (op <= tp_a):
                     if not multi:
-                        exit_i, exit_price, why = j, tp_a, "TP"
+                        exit_i, why = j, "TP"
                         break
                     acc, hit_a, stop = frac_a * r_a, True, entry
                     if (op >= tp_b) if sgn > 0 else (op <= tp_b):
                         acc += (1.0 - frac_a) * r_b
-                        exit_i, exit_price, why = j, tp_b, "TP2"
+                        exit_i, why = j, "TP2"
                         break
                     continue
+            o = float(chart.o[j])
+            if (o <= stop) if sgn > 0 else (o >= stop):
+                mtm = sgn * (o - entry) / risk
+                acc = acc + (1.0 - frac_a if hit_a else 1.0) * mtm
+                exit_i, why = j, "BE" if hit_a else "SL"
+                break
             hit_sl = (lo <= stop) if sgn > 0 else (hi >= stop)
             if hit_sl:
                 r = acc if hit_a else -1.0          # после TP1 стоп уже в БУ
-                exit_i, exit_price = j, stop
+                exit_i = j
                 why = "BE" if hit_a else "SL"
                 acc = r
                 break
@@ -399,19 +413,19 @@ def backtest(chart: st.Frame, H: st.Frame, p: CrtParams | None = None) -> list[d
                 hit_a = True
                 acc = frac_a * r_a
                 if not multi:
-                    exit_i, exit_price, why = j, tp_a, "TP"
+                    exit_i, why = j, "TP"
                     break
                 stop = entry                          # стоп в безубыток
             if hit_a and ((hi >= tp_b) if sgn > 0 else (lo <= tp_b)):
                 acc = acc + (1.0 - frac_a) * r_b
-                exit_i, exit_price, why = j, tp_b, "TP2"
+                exit_i, why = j, "TP2"
                 break
 
         if exit_i is None:
-            j = min(i + p.max_bars, n - 1)
+            j = min(fill_i + p.max_bars, n - 1)
             mtm = sgn * (float(chart.c[j]) - entry) / risk
             acc = acc + (1.0 - frac_a if hit_a else 1.0) * mtm
-            exit_i, exit_price, why = j, float(chart.c[j]), "TIME"
+            exit_i, why = j, "TIME"
 
         trades.append({"side": side, "entry_i": i, "exit_i": exit_i,
                        "entry": entry, "stop": stop, "risk": risk,

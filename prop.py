@@ -32,10 +32,13 @@ def get_trades() -> tuple[list[dict], np.ndarray]:
     finally:
         data.close()
     zones = r2.zones_for_chart(chart, htf["240"], touches=2, flips_keep=60)
-    trades = r2.backtest(chart, zones, htf["240"], stop_pts=STOP_PTS)
+    # Те же правила, что у live range: ATR-стоп, TP 3R, без per-level max_stops.
+    trades = r2.backtest(chart, zones, htf["240"], stop_atr=1.0, tp_r=3.0,
+                         max_r=5.0, max_stops=0, trend_filter="off",
+                         side_allow="both")
     er = ta.efficiency_ratio(chart.c)
     er_max = float(os.getenv("RANGE_ER_MAX", "0.15"))
-    trades = [t for t in trades if not np.isnan(er[t["entry_i"]]) and er[t["entry_i"]] <= er_max]
+    trades = [t for t in trades if bot.er_filter_ok(er[t["entry_i"]], er_max)]
     return trades, chart
 
 
@@ -89,6 +92,9 @@ def simulate(trades: list[dict], chart, risk_pct: float) -> dict:
 def main() -> None:
     trades, chart = get_trades()
     rs = [t["r"] for t in trades]
+    if not rs:
+        print("сделок нет — нечего симулировать")
+        return
     wins = sum(1 for r in rs if r > 0)
     span = (chart.t[-1] - chart.t[0]) / 86400.0
     print(f"сделок {len(trades)} · винрейт {wins / len(rs) * 100:.0f}% · "

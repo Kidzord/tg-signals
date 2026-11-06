@@ -97,11 +97,31 @@ def signal_at(state: dict, chart: st.Frame, i: int, atr_i: float,
 
 def backtest(chart: st.Frame, swing_len: int = 20, fvg_window: int = 20,
              retest_look: int = 40, stop_buf_atr: float = 0.25,
-             tp_r: float = 2.0, max_bars: int = 120, atr_len: int = 14) -> list[dict]:
+             tp_r: float = 2.0, max_bars: int = 120, atr_len: int = 14,
+             entry_delay: int = 0, er_min: float = 0.0,
+             adx_min: float = 0.0, session: str = "",
+             htf_frame: st.Frame | None = None,
+             trend_filter: str = "off") -> list[dict]:
+    """Ось фильтров: er_min/adx_min > 0 и session включают жёсткие условия,
+    trend_filter=with требует направления H4 EMA200 в сторону сделки."""
     n = len(chart.c)
+    delay = max(0, int(entry_delay))
     if n < swing_len + fvg_window + retest_look + 10:
         return []
     atr = ta.atr(chart.h, chart.l, chart.c, atr_len)
+    er = ta.efficiency_ratio(chart.c) if er_min > 0 else None
+    adx = ta.dmi(chart.h, chart.l, chart.c)[2] if adx_min > 0 else None
+    trend_up = trend_dn = None
+    if htf_frame is not None and trend_filter != "off":
+        ema_h = ta.ema(htf_frame.c, 200)
+        jh = np.searchsorted(htf_frame.t, chart.t, side="right") - 2
+        trend_up = np.zeros(n, dtype=bool)
+        trend_dn = np.zeros(n, dtype=bool)
+        for k in range(n):
+            j = int(jh[k])
+            if 0 <= j < len(ema_h) and not np.isnan(ema_h[j]):
+                trend_up[k] = htf_frame.c[j] > ema_h[j]
+                trend_dn[k] = htf_frame.c[j] < ema_h[j]
 
     state = {"l": None, "s": None}
     trades: list[dict] = []
@@ -117,9 +137,28 @@ def backtest(chart: st.Frame, swing_len: int = 20, fvg_window: int = 20,
         side, stop_raw = sig
         sgn = 1 if side == "LONG" else -1
 
-        if i + 1 >= n - 1:
+        if session and not st.in_session(float(chart.t[i]), session):
+            i += 1
+            continue
+        if er is not None and (np.isnan(er[i]) or er[i] < er_min):
+            i += 1
+            continue
+        if adx is not None and (np.isnan(adx[i]) or adx[i] < adx_min):
+            i += 1
+            continue
+        if trend_filter == "with" and (
+                (sgn > 0 and not trend_up[i]) or (sgn < 0 and not trend_dn[i])):
+            i += 1
+            continue
+        if trend_filter == "against" and (
+                (sgn > 0 and not trend_dn[i]) or (sgn < 0 and not trend_up[i])):
+            i += 1
+            continue
+
+        fill_i = i + 1 + delay
+        if fill_i >= n - 1:
             break
-        entry = float(chart.o[i + 1])
+        entry = float(chart.o[fill_i])
         risk = abs(entry - stop_raw)
         if risk <= 0:
             i += 1
@@ -128,25 +167,24 @@ def backtest(chart: st.Frame, swing_len: int = 20, fvg_window: int = 20,
         target = entry + sgn * risk * tp_r
 
         exit_i = exit_price = why = None
-        for j in range(i + 1, min(i + 1 + max_bars, n)):
+        for j in range(fill_i, min(fill_i + max_bars, n)):
             hit_sl = chart.l[j] <= stop if sgn > 0 else chart.h[j] >= stop
             hit_tp = chart.h[j] >= target if sgn > 0 else chart.l[j] <= target
-            if j == i + 1:
-                # в баре заполнения стоп/цель могут выбить уже на открытии
-                if sgn > 0:
-                    if chart.o[j] <= stop:
-                        exit_i, exit_price, why = j, stop, "SL"
-                        break
-                    if chart.o[j] >= target:
-                        exit_i, exit_price, why = j, target, "TP"
-                        break
-                else:
-                    if chart.o[j] >= stop:
-                        exit_i, exit_price, why = j, stop, "SL"
-                        break
-                    if chart.o[j] <= target:
-                        exit_i, exit_price, why = j, target, "TP"
-                        break
+            o = float(chart.o[j])
+            if sgn > 0:
+                if o <= stop:
+                    exit_i, exit_price, why = j, o, "SL"
+                    break
+                if o >= target:
+                    exit_i, exit_price, why = j, o, "TP"
+                    break
+            else:
+                if o >= stop:
+                    exit_i, exit_price, why = j, o, "SL"
+                    break
+                if o <= target:
+                    exit_i, exit_price, why = j, o, "TP"
+                    break
             if hit_sl:
                 exit_i, exit_price, why = j, stop, "SL"
                 break
@@ -154,7 +192,7 @@ def backtest(chart: st.Frame, swing_len: int = 20, fvg_window: int = 20,
                 exit_i, exit_price, why = j, target, "TP"
                 break
         if exit_i is None:
-            j = min(i + max_bars, n - 1)
+            j = min(fill_i + max_bars, n - 1)
             exit_i, exit_price, why = j, float(chart.c[j]), "TIME"
 
         r = (exit_price - entry) * sgn / risk

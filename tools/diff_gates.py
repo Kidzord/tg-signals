@@ -22,7 +22,6 @@ ea = load(EA)
 common = sorted(set(bot) & set(ea))
 print(f"баров: bot={len(bot)} ea={len(ea)} общих={len(common)}")
 if not common:
-    sys.exit = None
     raise SystemExit("нет пересечения по времени")
 
 gates = [f"r{i}" for i in range(1, 13)]

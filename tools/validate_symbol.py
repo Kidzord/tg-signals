@@ -18,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import bot  # noqa: E402
+import costs  # noqa: E402
 from tools import walk_forward as wf  # noqa: E402
 
 BY_SYMBOL = {
@@ -54,17 +55,18 @@ def main() -> int:
         return 3
     chart, htf = bot.load_frames(data, args.symbol, bot.TF, args.bars)
     chart, htf = wf.exclude_window(chart, htf, args.exclude)
+    spread = costs.symbol_spread(args.symbol)
     days = (chart.t[-1] - chart.t[0]) / 86400
     wf.BARS_PER_DAY = max(1, int(round(len(chart.c) / days)))
     print(f"{args.feed}/{args.symbol}: {len(chart.c)} баров, {days:.0f} дн., "
-          f"~{wf.BARS_PER_DAY}/день, стратегии: {', '.join(names)}")
+          f"~{wf.BARS_PER_DAY}/день, спред {spread:.5f}, стратегии: {', '.join(names)}")
 
     results = []
     for name in names:
         if name not in wf.STRATEGIES:
             print("нет стратегии", name)
             continue
-        res = wf.wfa(name, wf.STRATEGIES[name], chart, htf)
+        res = wf.wfa(name, wf.STRATEGIES[name], chart, htf, spread)
         res["symbol"] = args.symbol
         res["feed"] = args.feed
         results.append(res)
@@ -75,10 +77,11 @@ def main() -> int:
     out = out_dir / f"{args.feed}_{args.symbol}_{args.bars}.json"
     out.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n{'стратегия':<18} {'вердикт':<12} {'сделок':>7} {'net R':>9} "
-          f"{'фолды+':>8}")
+          f"{'актив.фолды+':>12}")
     for r in results:
         print(f"{r['name']:<18} {r['verdict']:<12} {r['trades']:>7} "
-              f"{r['net_r']:>+9.2f} {r['folds_positive']:>4}/{r['folds']:<3}")
+              f"{r['net_r']:>+9.2f} "
+              f"{r['folds_active_positive']:>5}/{r['folds_active']:<5}")
     print(f"JSON: {out}")
     return 0
 

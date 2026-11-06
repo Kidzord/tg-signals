@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import bot
-import strategy as st
 import ta_core as ta
 
 data = bot.connect()
